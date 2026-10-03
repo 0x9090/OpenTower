@@ -1,3 +1,4 @@
+#[cfg(feature = "bundled-resources")]
 use macroquad::miniquad::conf::Icon;
 use macroquad::miniquad::window;
 use macroquad::prelude::*;
@@ -15,6 +16,9 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+
+mod resources;
+use resources::*;
 
 // The original placement code converts x coordinates in 8-pixel slices and
 // y coordinates in 36-pixel floors. Keeping that ratio is essential to the
@@ -52,244 +56,16 @@ const SUBMENU_WIDTH: f32 = 164.0;
 const SUBMENU_HEADER_HEIGHT: f32 = 19.0;
 const SUBMENU_ROW_HEIGHT: f32 = 28.0;
 
-const SKY_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/352.bmp");
-const GROUND_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/849.bmp");
-const PALETTE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/300.bmp");
-const PALETTE_SELECTED_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/301.bmp");
-const PALETTE_DISABLED_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/302.bmp");
-const PLAY_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/600.bmp");
-const PLAY_SELECTED_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/601.bmp");
-const PAUSE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/602.bmp");
-const PAUSE_SELECTED_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/603.bmp");
-const POINTER_TOOLS_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/604.bmp");
-const POINTER_TOOLS_SELECTED_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/605.bmp");
-const SCAFFOLD_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3624.bmp");
-const FLOOR_STRIP_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/5000.bmp");
-const EMERGENCY_STAIRS_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1069.bmp");
-const ROOF_CRANE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1002.bmp");
-const LOBBY_BACKGROUND_BMP: &[u8] = include_bytes!("../../../assets/original/raw-bitmaps/2536.bmp");
-const LOBBY_SECOND_STORY_BMP: &[u8] =
-    include_bytes!("../../../assets/original/raw-bitmaps/2537.bmp");
-const LOBBY_THIRD_STORY_BMP: &[u8] =
-    include_bytes!("../../../assets/original/raw-bitmaps/2538.bmp");
-const LOBBY_AWNING_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1001.bmp");
-const SANTA_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/904.bmp");
-const TREASURE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10003.bmp");
-const HOTEL_SINGLE_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1192.bmp");
-const HOTEL_SINGLE_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1194.bmp");
-const HOTEL_SINGLE_OCCUPIED_1_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1193.bmp");
-const HOTEL_SINGLE_OCCUPIED_2_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1195.bmp");
 const HOTEL_SINGLE_VARIANT_IDS: [u16; 2] = [1192, 1194];
-const HOTEL_TWIN_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1256.bmp");
-const HOTEL_TWIN_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1258.bmp");
-const HOTEL_TWIN_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1260.bmp");
-const HOTEL_TWIN_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1262.bmp");
-const HOTEL_TWIN_OCCUPIED_1_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1257.bmp");
-const HOTEL_TWIN_OCCUPIED_2_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1259.bmp");
-const HOTEL_TWIN_OCCUPIED_3_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1261.bmp");
-const HOTEL_TWIN_OCCUPIED_4_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1263.bmp");
 const HOTEL_TWIN_VARIANT_IDS: [u16; 4] = [1256, 1258, 1260, 1262];
-const HOTEL_SUITE_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1320.bmp");
-const HOTEL_SUITE_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1322.bmp");
-const HOTEL_SUITE_OCCUPIED_1_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1321.bmp");
-const HOTEL_SUITE_OCCUPIED_2_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1323.bmp");
 const HOTEL_SUITE_VARIANT_IDS: [u16; 2] = [1320, 1322];
-const OFFICE_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1448.bmp");
-const OFFICE_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1449.bmp");
-const OFFICE_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1450.bmp");
-const OFFICE_VACANT_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1451.bmp");
 const OFFICE_VARIANT_IDS: [u16; 6] = [1448, 1448, 1449, 1449, 1450, 1450];
-const CONDO_STATE_BMPS: [&[u8]; 15] = [
-    include_bytes!("../../../assets/original/bitmaps/1576.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1577.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1578.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1579.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1580.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1581.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1582.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1583.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1584.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1585.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1586.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1587.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1588.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1589.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1590.bmp"),
-];
 const CONDO_VARIANT_IDS: [u16; 3] = [1576, 1581, 1586];
-const RESTAURANT_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1384.bmp");
-const RESTAURANT_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1386.bmp");
-const RESTAURANT_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1388.bmp");
-const RESTAURANT_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1390.bmp");
-const RESTAURANT_5_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1392.bmp");
-const RESTAURANT_OCCUPIED_1_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1385.bmp");
-const RESTAURANT_OCCUPIED_2_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1387.bmp");
-const RESTAURANT_OCCUPIED_3_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1389.bmp");
-const RESTAURANT_OCCUPIED_4_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1391.bmp");
-const RESTAURANT_OCCUPIED_5_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/1393.bmp");
 const RESTAURANT_VARIANT_IDS: [u16; 5] = [1384, 1386, 1388, 1390, 1392];
-const FAST_FOOD_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1768.bmp");
-const FAST_FOOD_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1770.bmp");
-const FAST_FOOD_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1772.bmp");
-const FAST_FOOD_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1774.bmp");
-const FAST_FOOD_5_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1776.bmp");
-const FAST_FOOD_OCCUPIED_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1769.bmp");
-const FAST_FOOD_OCCUPIED_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1771.bmp");
-const FAST_FOOD_OCCUPIED_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1773.bmp");
-const FAST_FOOD_OCCUPIED_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1775.bmp");
-const FAST_FOOD_OCCUPIED_5_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1777.bmp");
 const FAST_FOOD_VARIANT_IDS: [u16; 5] = [1768, 1770, 1772, 1774, 1776];
-const SHOP_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1640.bmp");
-const SHOP_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1641.bmp");
-const SHOP_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1642.bmp");
-const SHOP_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1643.bmp");
-const SHOP_5_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1644.bmp");
-const SHOP_6_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1645.bmp");
-const SHOP_7_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1646.bmp");
-const SHOP_8_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1647.bmp");
-const SHOP_9_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1648.bmp");
-const SHOP_10_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1649.bmp");
-const SHOP_11_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1650.bmp");
 const SHOP_VARIANT_IDS: [u16; 11] = [
     1640, 1641, 1642, 1643, 1644, 1645, 1646, 1647, 1648, 1649, 1650,
 ];
-const PARKING_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1704.bmp");
-const MEDICAL_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1832.bmp");
-const SECURITY_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1896.bmp");
-const HOUSEKEEPING_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1960.bmp");
-const ELEVATOR_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1064.bmp");
-const ELEVATOR_CARS_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1065.bmp");
-const SERVICE_ELEVATOR_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1066.bmp");
-const EXPRESS_ELEVATOR_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1067.bmp");
-const ELEVATOR_SHAFT_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1068.bmp");
-const PEOPLE_BMPS: [&[u8]; 7] = [
-    include_bytes!("../../../assets/original/bitmaps/1512.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1513.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1514.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1515.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1516.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1517.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1518.bmp"),
-];
-const PEOPLE_SILHOUETTE_BMPS: [&[u8]; 2] = [
-    include_bytes!("../../../assets/original/bitmaps/1128.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/1129.bmp"),
-];
-const QUEUE_PEOPLE_BMPS: [&[u8]; 4] = [
-    include_bytes!("../../../assets/original/bitmaps/700.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/703.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/701.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/702.bmp"),
-];
-const ELEVATOR_NUMBER_BMPS: [&[u8]; 6] = [
-    include_bytes!("../../../assets/original/bitmaps/2024.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2025.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2026.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2027.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2028.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2029.bmp"),
-];
-const CINEMA_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2152.bmp");
-const CINEMA_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2216.bmp");
-const RECYCLING_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2280.bmp");
-const STAIRS_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2408.bmp");
-const STAIRS_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2472.bmp");
-const ESCALATOR_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2728.bmp");
-const ESCALATOR_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2792.bmp");
-const PARTY_HALL_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2856.bmp");
-const PARTY_HALL_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2920.bmp");
-const METRO_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2984.bmp");
-const METRO_MIDDLE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3048.bmp");
-const METRO_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3112.bmp");
-const METRO_OCCUPIED_UPPER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2985.bmp");
-const METRO_OCCUPIED_MIDDLE_BMP: &[u8] =
-    include_bytes!("../../../assets/original/bitmaps/3049.bmp");
-const METRO_OCCUPIED_LOWER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3113.bmp");
-const CATHEDRAL_1_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3304.bmp");
-const CATHEDRAL_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3368.bmp");
-const CATHEDRAL_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3432.bmp");
-const CATHEDRAL_4_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3496.bmp");
-const CATHEDRAL_5_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3560.bmp");
-const RAMP_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3816.bmp");
-const RAMP_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3817.bmp");
-const RAMP_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3818.bmp");
-const PARKING_OCCUPIED_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1705.bmp");
-const MEDICAL_2_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1833.bmp");
-const MEDICAL_3_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/1834.bmp");
-const RECYCLING_LEVEL_BMPS: [&[u8]; 6] = [
-    include_bytes!("../../../assets/original/bitmaps/2280.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2281.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2282.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2283.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2284.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/2285.bmp"),
-];
-const RECYCLING_TRUCK_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/2350.bmp");
-const RAIN_BMPS: [&[u8]; 10] = [
-    include_bytes!("../../../assets/original/bitmaps/850.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/851.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/852.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/853.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/854.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/855.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/856.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/857.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/858.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/859.bmp"),
-];
-const CLOUD_BMPS: [&[u8]; 4] = [
-    include_bytes!("../../../assets/original/bitmaps/900.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/901.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/902.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/903.bmp"),
-];
-const CITY_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/905.bmp");
-const INTRO_STORE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/256.bmp");
-const INTRO_TITLE_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/257.bmp");
-const INTRO_MAXIS_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/128.bmp");
-const STAR_ON_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/322.bmp");
-const STAR_OFF_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/323.bmp");
-const TOWER_LOGO_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/327.bmp");
-const FINANCE_DIALOG_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/500.bmp");
-const FIRE_LARGE_BMPS: [&[u8]; 4] = [
-    include_bytes!("../../../assets/original/bitmaps/3944.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/3945.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/3946.bmp"),
-    include_bytes!("../../../assets/original/bitmaps/3947.bmp"),
-];
-const FIRE_SMALL_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3948.bmp");
-const FIRE_HELICOPTER_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/3949.bmp");
-const FIRE_ALERT_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10004.bmp");
-const FIRE_AFTERMATH_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10005.bmp");
-const STAR_AWARD_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10006.bmp");
-// Bitmap 10000 is the terrorist/bomb-threat portrait, not promotion art.
-const TERRORIST_PORTRAIT_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10000.bmp");
-const FIRE_DISPATCH_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10001.bmp");
-const VIP_ARRIVAL_BMP: &[u8] = include_bytes!("../../../assets/original/bitmaps/10002.bmp");
-const CONSTRUCTION_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/7000.wav");
-const LOBBY_SEGMENT_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/7001.wav");
-const NO_MONEY_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/7002.wav");
-const DEMOLITION_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/7003.wav");
-const PAYMENT_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/10013.wav");
-const ELEVATOR_MOVE_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/6000.wav");
-const ELEVATOR_OPEN_1_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/6001.wav");
-const ELEVATOR_OPEN_2_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/6002.wav");
-const CROWD_1_WAV: &[u8] = include_bytes!("../../../assets/original/sounds/8000.wav");
-const SIMTOWER_ICON_BMP: &[u8] = include_bytes!("../../../assets/original/icons/1.bmp");
 
 // Facility bitmap groups follow the original executable's `1000 + type * 64`
 // convention. Lobby interiors are the executable's custom raw resource 2536;
@@ -653,18 +429,24 @@ impl FinanceLedger {
 }
 
 fn window_conf() -> Conf {
+    #[cfg(feature = "bundled-resources")]
+    let icon = Some(original_window_icon().expect("the original SimTower icon should decode"));
+    #[cfg(not(feature = "bundled-resources"))]
+    let icon = None;
     Conf {
         window_title: "OpenTower - SimTower compatibility project".to_owned(),
         window_width: 1600,
         window_height: 1000,
         high_dpi: true,
-        icon: Some(original_window_icon().expect("the original SimTower icon should decode")),
+        icon,
         ..Default::default()
     }
 }
 
+#[cfg(feature = "bundled-resources")]
 fn original_window_icon() -> Result<Icon, String> {
-    let image = DibImage::decode_bmp(SIMTOWER_ICON_BMP).map_err(|error| error.to_string())?;
+    let image =
+        DibImage::decode_bmp(SIMTOWER_ICON_BMP.bytes()?).map_err(|error| error.to_string())?;
     Ok(Icon {
         small: resize_icon::<{ 16 * 16 * 4 }>(&image, 16),
         medium: resize_icon::<{ 32 * 32 * 4 }>(&image, 32),
@@ -672,6 +454,7 @@ fn original_window_icon() -> Result<Icon, String> {
     })
 }
 
+#[cfg(feature = "bundled-resources")]
 fn resize_icon<const LEN: usize>(image: &DibImage, side: usize) -> [u8; LEN] {
     assert_eq!(LEN, side * side * 4);
     let mut output = [0_u8; LEN];
@@ -7873,19 +7656,22 @@ impl NativeSounds {
         let elevator_open =
             ELEVATOR_OPEN_SOUND_IDS.map(|id| directory.join(format!("elevator-open-{id}.wav")));
         let crowd = directory.join(format!("crowd-{CROWD_SOUND_ID}.wav"));
-        std::fs::write(&construction, CONSTRUCTION_WAV).map_err(|error| error.to_string())?;
-        std::fs::write(&lobby_segment, LOBBY_SEGMENT_WAV).map_err(|error| error.to_string())?;
-        std::fs::write(&demolition, DEMOLITION_WAV).map_err(|error| error.to_string())?;
-        std::fs::write(&no_money, NO_MONEY_WAV).map_err(|error| error.to_string())?;
-        std::fs::write(&payment, PAYMENT_WAV).map_err(|error| error.to_string())?;
-        std::fs::write(&elevator_move, ELEVATOR_MOVE_WAV).map_err(|error| error.to_string())?;
+        std::fs::write(&construction, CONSTRUCTION_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&lobby_segment, LOBBY_SEGMENT_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&demolition, DEMOLITION_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&no_money, NO_MONEY_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&payment, PAYMENT_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&elevator_move, ELEVATOR_MOVE_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
         for (path, bytes) in elevator_open
             .iter()
             .zip([ELEVATOR_OPEN_1_WAV, ELEVATOR_OPEN_2_WAV])
         {
-            std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+            std::fs::write(path, bytes.bytes()?).map_err(|error| error.to_string())?;
         }
-        std::fs::write(&crowd, CROWD_1_WAV).map_err(|error| error.to_string())?;
+        std::fs::write(&crowd, CROWD_1_WAV.bytes()?).map_err(|error| error.to_string())?;
         Ok(Self {
             construction,
             lobby_segment,
@@ -8006,26 +7792,27 @@ fn play_native_sound(path: PathBuf) {
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn play_native_sound(_path: PathBuf) {}
 
-fn facility_sprite_from_bmp(kind: FacilityKind, bytes: &[u8]) -> Result<Sprite, String> {
+fn facility_sprite_from_bmp(kind: FacilityKind, asset: AssetRef) -> Result<Sprite, String> {
     let resources = facility_resource_ids(kind);
-    facility_sprite_from_bmp_with_id(kind, resources.bitmap, bytes)
+    facility_sprite_from_bmp_with_id(kind, resources.bitmap, asset)
 }
 
 fn facility_sprite_from_bmp_with_id(
     kind: FacilityKind,
     resource_id: u16,
-    bytes: &[u8],
+    asset: AssetRef,
 ) -> Result<Sprite, String> {
-    facility_sprite_from_bmp_with_source(kind, resource_id, 0.0, bytes)
+    facility_sprite_from_bmp_with_source(kind, resource_id, 0.0, asset)
 }
 
 fn facility_sprite_from_bmp_with_source(
     kind: FacilityKind,
     resource_id: u16,
     source_x: f32,
-    bytes: &[u8],
+    asset: AssetRef,
 ) -> Result<Sprite, String> {
     let resources = facility_resource_ids(kind);
+    let bytes = asset.bytes()?;
     let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
     let alpha = AlphaMask::from_rgba(image.width(), image.height(), image.rgba())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
@@ -8048,7 +7835,7 @@ fn facility_sprite_from_bmp_with_source(
 fn facility_sprite_array<const N: usize>(
     kind: FacilityKind,
     first_resource_id: u16,
-    sources: [&[u8]; N],
+    sources: [AssetRef; N],
 ) -> Result<[Sprite; N], String> {
     let sprites = sources
         .into_iter()
@@ -8085,7 +7872,7 @@ fn emergency_events_unlocked(star_rating: u8) -> bool {
 
 fn facility_sprite_from_vertical_bmps(
     kind: FacilityKind,
-    parts: &[&[u8]],
+    parts: &[AssetRef],
     white_is_transparent: bool,
 ) -> Result<Sprite, String> {
     facility_sprite_from_vertical_bmps_with_source(kind, parts, white_is_transparent, 0.0)
@@ -8093,7 +7880,7 @@ fn facility_sprite_from_vertical_bmps(
 
 fn facility_sprite_from_vertical_bmps_with_source(
     kind: FacilityKind,
-    parts: &[&[u8]],
+    parts: &[AssetRef],
     white_is_transparent: bool,
     source_x: f32,
 ) -> Result<Sprite, String> {
@@ -8113,12 +7900,12 @@ fn facility_sprite_from_vertical_bmps_with_source(
 }
 
 fn texture_and_alpha_from_vertical_bmps(
-    parts: &[&[u8]],
+    parts: &[AssetRef],
     white_is_transparent: bool,
 ) -> Result<(Texture2D, AlphaMask), String> {
     let images = parts
         .iter()
-        .map(|bytes| DibImage::decode_bmp(bytes).map_err(|error| error.to_string()))
+        .map(|asset| DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     let Some(first) = images.first() else {
         return Err("vertical sprite has no source images".to_owned());
@@ -8161,8 +7948,8 @@ fn texture_and_alpha_from_vertical_bmps(
     Ok((texture, alpha))
 }
 
-fn texture_from_bmp_with_white_transparency(bytes: &[u8]) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+fn texture_from_bmp_with_white_transparency(asset: AssetRef) -> Result<Texture2D, String> {
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let mut rgba = image.rgba().to_vec();
@@ -8177,10 +7964,10 @@ fn texture_from_bmp_with_white_transparency(bytes: &[u8]) -> Result<Texture2D, S
 }
 
 fn texture_from_bmp_with_color_transparency(
-    bytes: &[u8],
+    asset: AssetRef,
     transparent_rgb: [u8; 3],
 ) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let mut rgba = image.rgba().to_vec();
@@ -8194,8 +7981,8 @@ fn texture_from_bmp_with_color_transparency(
     Ok(texture)
 }
 
-fn texture_from_star_bmp(bytes: &[u8], earned: bool) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+fn texture_from_star_bmp(asset: AssetRef, earned: bool) -> Result<Texture2D, String> {
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let mut rgba = image.rgba().to_vec();
@@ -8219,10 +8006,10 @@ fn apply_star_transparency(rgba: &mut [u8], earned: bool) {
 }
 
 fn texture_from_queue_bmp(
-    bytes: &[u8],
+    asset: AssetRef,
     replacement_color: Option<[u8; 3]>,
 ) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let mut rgba = image.rgba().to_vec();
@@ -8244,22 +8031,22 @@ fn apply_queue_sprite_palette(rgba: &mut [u8], replacement_color: Option<[u8; 3]
     }
 }
 
-fn texture_from_hand_cursor(bytes: &[u8]) -> Result<Texture2D, String> {
-    texture_from_pointer_cursor(bytes, 21, "hand")
+fn texture_from_hand_cursor(asset: AssetRef) -> Result<Texture2D, String> {
+    texture_from_pointer_cursor(asset, 21, "hand")
 }
 
-fn texture_from_magnifier_cursor(bytes: &[u8]) -> Result<Texture2D, String> {
-    texture_from_pointer_cursor(bytes, 42, "magnifier")
+fn texture_from_magnifier_cursor(asset: AssetRef) -> Result<Texture2D, String> {
+    texture_from_pointer_cursor(asset, 42, "magnifier")
 }
 
 fn texture_from_pointer_cursor(
-    bytes: &[u8],
+    asset: AssetRef,
     source_x: usize,
     cursor_name: &str,
 ) -> Result<Texture2D, String> {
     const CURSOR_WIDTH: usize = 22;
     const CURSOR_HEIGHT: usize = 21;
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     if image.width() < (source_x + CURSOR_WIDTH) as u32 || image.height() < CURSOR_HEIGHT as u32 {
         return Err(format!(
             "pointer bitmap is too small for the {cursor_name} cursor"
@@ -8288,8 +8075,8 @@ fn texture_from_pointer_cursor(
     Ok(texture)
 }
 
-fn texture_from_bmp(bytes: &[u8]) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(bytes).map_err(|error| error.to_string())?;
+fn texture_from_bmp(asset: AssetRef) -> Result<Texture2D, String> {
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
     let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let texture = Texture2D::from_rgba8(width, height, image.rgba());
@@ -8355,8 +8142,10 @@ fn maximize_window() {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let assets =
-        OriginalAssets::load().expect("the bundled original SimTower resources should decode");
+    initialize_resources().expect(
+        "OpenTower could not load the original SimTower resources; select a valid SimTower.exe",
+    );
+    let assets = OriginalAssets::load().expect("the original SimTower resources should decode");
     let mut app = App::new(assets);
     set_fullscreen(false);
     app.draw();
@@ -9065,7 +8854,7 @@ mod tests {
 
     #[test]
     fn embedded_facility_bitmaps_cover_the_registered_source_rectangles() {
-        let resources: [(FacilityKind, &[u8], u32, u32); 7] = [
+        let resources: [(FacilityKind, AssetRef, u32, u32); 7] = [
             (FacilityKind::Lobby, LOBBY_BACKGROUND_BMP, 992, 36),
             (FacilityKind::Lobby, LOBBY_SECOND_STORY_BMP, 992, 36),
             (FacilityKind::Lobby, LOBBY_THIRD_STORY_BMP, 992, 36),
@@ -9076,7 +8865,8 @@ mod tests {
         ];
 
         for (kind, bytes, expected_width, expected_height) in resources {
-            let image = DibImage::decode_bmp(bytes).expect("registered bitmap must decode");
+            let image = DibImage::decode_bmp(bytes.bytes().unwrap())
+                .expect("registered bitmap must decode");
             let mapping = facility_resource_ids(kind);
             assert_eq!(image.width(), expected_width, "wrong bitmap for {kind:?}");
             assert_eq!(image.height(), expected_height, "wrong bitmap for {kind:?}");
@@ -9093,23 +8883,24 @@ mod tests {
             ("occupied restaurant", RESTAURANT_OCCUPIED_1_BMP, 384),
             ("occupied fast food", FAST_FOOD_OCCUPIED_1_BMP, 256),
         ] {
-            let image = DibImage::decode_bmp(bytes).expect("tenant state bitmap must decode");
+            let image = DibImage::decode_bmp(bytes.bytes().unwrap())
+                .expect("tenant state bitmap must decode");
             assert_eq!((image.width(), image.height()), (width, 24), "{name}");
         }
 
-        let sound = simtower_formats::inspect_wave(CONSTRUCTION_WAV)
+        let sound = simtower_formats::inspect_wave(CONSTRUCTION_WAV.bytes().unwrap())
             .expect("construction sound resource must be a valid WAVE file");
         assert_eq!(sound.channels, 1);
-        let lobby_sound = simtower_formats::inspect_wave(LOBBY_SEGMENT_WAV)
+        let lobby_sound = simtower_formats::inspect_wave(LOBBY_SEGMENT_WAV.bytes().unwrap())
             .expect("lobby segment sound resource must be a valid WAVE file");
         assert_eq!(lobby_sound.channels, 1);
-        let no_money_sound = simtower_formats::inspect_wave(NO_MONEY_WAV)
+        let no_money_sound = simtower_formats::inspect_wave(NO_MONEY_WAV.bytes().unwrap())
             .expect("no-money sound resource must be a valid WAVE file");
         assert_eq!(no_money_sound.channels, 1);
-        let demolition_sound = simtower_formats::inspect_wave(DEMOLITION_WAV)
+        let demolition_sound = simtower_formats::inspect_wave(DEMOLITION_WAV.bytes().unwrap())
             .expect("demolition sound resource must be a valid WAVE file");
         assert_eq!(demolition_sound.channels, 1);
-        let payment_sound = simtower_formats::inspect_wave(PAYMENT_WAV)
+        let payment_sound = simtower_formats::inspect_wave(PAYMENT_WAV.bytes().unwrap())
             .expect("payment sound resource must be a valid WAVE file");
         assert_eq!(payment_sound.channels, 1);
         for bytes in [
@@ -9118,37 +8909,45 @@ mod tests {
             ELEVATOR_OPEN_2_WAV,
             CROWD_1_WAV,
         ] {
-            let sound = simtower_formats::inspect_wave(bytes)
+            let sound = simtower_formats::inspect_wave(bytes.bytes().unwrap())
                 .expect("traffic sound resource must be a valid WAVE file");
             assert_eq!(sound.channels, 1);
         }
 
-        let floor_strip = DibImage::decode_bmp(FLOOR_STRIP_BMP).expect("floor strip must decode");
+        let floor_strip = DibImage::decode_bmp(FLOOR_STRIP_BMP.bytes().unwrap())
+            .expect("floor strip must decode");
         assert_eq!((floor_strip.width(), floor_strip.height()), (128, 12));
-        let sky = DibImage::decode_bmp(SKY_BMP).expect("sky and dirt tile must decode");
+        let sky =
+            DibImage::decode_bmp(SKY_BMP.bytes().unwrap()).expect("sky and dirt tile must decode");
         assert_eq!((sky.width(), sky.height()), (200, 288));
         assert_eq!(SKY_HORIZON, 264.0);
-        let ground = DibImage::decode_bmp(GROUND_BMP).expect("ground gradient must decode");
+        let ground =
+            DibImage::decode_bmp(GROUND_BMP.bytes().unwrap()).expect("ground gradient must decode");
         assert_eq!((ground.width(), ground.height()), (32, 360));
-        let stairs =
-            DibImage::decode_bmp(EMERGENCY_STAIRS_BMP).expect("emergency stair bitmap must decode");
+        let stairs = DibImage::decode_bmp(EMERGENCY_STAIRS_BMP.bytes().unwrap())
+            .expect("emergency stair bitmap must decode");
         assert_eq!((stairs.width(), stairs.height()), (48, 36));
-        let crane = DibImage::decode_bmp(ROOF_CRANE_BMP).expect("roof crane bitmap must decode");
+        let crane = DibImage::decode_bmp(ROOF_CRANE_BMP.bytes().unwrap())
+            .expect("roof crane bitmap must decode");
         assert_eq!((crane.width(), crane.height()), (36, 36));
-        let awning = DibImage::decode_bmp(LOBBY_AWNING_BMP).expect("awning must decode");
+        let awning =
+            DibImage::decode_bmp(LOBBY_AWNING_BMP.bytes().unwrap()).expect("awning must decode");
         assert_eq!((awning.width(), awning.height()), (112, 36));
-        let scaffolding = DibImage::decode_bmp(SCAFFOLD_BMP).expect("scaffolding must decode");
+        let scaffolding =
+            DibImage::decode_bmp(SCAFFOLD_BMP.bytes().unwrap()).expect("scaffolding must decode");
         assert_eq!((scaffolding.width(), scaffolding.height()), (328, 36));
-        let santa = DibImage::decode_bmp(SANTA_BMP).expect("Santa event bitmap must decode");
+        let santa = DibImage::decode_bmp(SANTA_BMP.bytes().unwrap())
+            .expect("Santa event bitmap must decode");
         assert_eq!((santa.width(), santa.height()), (140, 48));
-        let treasure =
-            DibImage::decode_bmp(TREASURE_BMP).expect("treasure event bitmap must decode");
+        let treasure = DibImage::decode_bmp(TREASURE_BMP.bytes().unwrap())
+            .expect("treasure event bitmap must decode");
         assert_eq!((treasure.width(), treasure.height()), (84, 80));
-        let shaft = DibImage::decode_bmp(ELEVATOR_SHAFT_BMP)
+        let shaft = DibImage::decode_bmp(ELEVATOR_SHAFT_BMP.bytes().unwrap())
             .expect("empty elevator shaft infrastructure must decode");
         assert_eq!((shaft.width(), shaft.height()), (16, 36));
         for palette in [PALETTE_BMP, PALETTE_SELECTED_BMP, PALETTE_DISABLED_BMP] {
-            let palette = DibImage::decode_bmp(palette).expect("toolbox state bitmap must decode");
+            let palette = DibImage::decode_bmp(palette.bytes().unwrap())
+                .expect("toolbox state bitmap must decode");
             assert_eq!((palette.width(), palette.height()), (256, 128));
         }
     }
@@ -9220,7 +9019,8 @@ mod tests {
 
     #[test]
     fn rating_stars_remove_the_button_cell_but_keep_unearned_gray_art() {
-        let earned = DibImage::decode_bmp(STAR_ON_BMP).expect("earned star should decode");
+        let earned =
+            DibImage::decode_bmp(STAR_ON_BMP.bytes().unwrap()).expect("earned star should decode");
         let mut earned_rgba = earned.rgba().to_vec();
         apply_star_transparency(&mut earned_rgba, true);
         assert_eq!(
@@ -9231,7 +9031,8 @@ mod tests {
             148
         );
 
-        let unearned = DibImage::decode_bmp(STAR_OFF_BMP).expect("unearned star should decode");
+        let unearned = DibImage::decode_bmp(STAR_OFF_BMP.bytes().unwrap())
+            .expect("unearned star should decode");
         let mut unearned_rgba = unearned.rgba().to_vec();
         apply_star_transparency(&mut unearned_rgba, false);
         let opaque = unearned_rgba
@@ -9364,7 +9165,7 @@ mod tests {
             ]
         );
 
-        let families: [(&str, &[&[u8]], u32, u32); 8] = [
+        let families: [(&str, &[AssetRef], u32, u32); 8] = [
             (
                 "single hotel",
                 &[HOTEL_SINGLE_1_BMP, HOTEL_SINGLE_2_BMP],
@@ -9444,7 +9245,7 @@ mod tests {
         ];
         for (name, family, expected_width, expected_height) in families {
             for bytes in family {
-                let image = DibImage::decode_bmp(bytes)
+                let image = DibImage::decode_bmp(bytes.bytes().unwrap())
                     .unwrap_or_else(|_| panic!("{name} variant must decode"));
                 assert_eq!(
                     (image.width(), image.height()),

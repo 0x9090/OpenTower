@@ -61,7 +61,7 @@ jobs:
           sudo apt-get install --yes libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev
 
       - name: Build OpenTower
-        run: cargo build --locked --release --package simtower-desktop
+        run: cargo build --locked --release --package simtower-desktop --no-default-features
 
       - name: Package Linux or macOS binary
         if: runner.os != 'Windows'

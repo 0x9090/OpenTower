@@ -6,13 +6,28 @@ and Linux.
 
 This repository contains the portable Rust rewrite: a tower grid with
 construction, funds, placement validation, simulation, and a native desktop UI
-using the original authorized pixel art and sounds. It is not yet a complete
+using the original pixel art and sounds. It is not yet a complete
 game.
 
 ## Run
 
 ```sh
 cargo run -p simtower-desktop
+```
+
+The default Cargo feature is intended for local development and continues to
+use the extracted resources already present in the development workspace.
+
+Public release binaries do not contain the original game resources. On first
+launch, a release build asks you to select your own original `SimTower.exe` and
+loads its graphics, icons, and sounds directly. You can also put
+`SIMTOWER.EXE` beside the OpenTower binary, set the `SIMTOWER_EXE` environment
+variable, or launch it with `--simtower-exe /path/to/SimTower.exe`.
+
+To build the same resource-free mode used for public releases:
+
+```sh
+cargo build --release -p simtower-desktop --no-default-features
 ```
 
 - Click a category in the compact tool palette to open its construction submenu
@@ -73,7 +88,7 @@ cargo run -p simtower-inspect -- analysis/input/SIMTOWER.EXE
 The parser is pure Rust and bounds-checks every NE resource entry before
 exposing its bytes.
 
-To reproduce the authorized assets from the expanded executable:
+To reproduce the assets from the expanded executable for local development:
 
 ```sh
 cargo run -p simtower-inspect -- \
@@ -95,5 +110,6 @@ are deliberately excluded from this repository.
 The **Build release binaries** workflow is manual-only. From the repository's
 Actions tab, choose the workflow, select **Run workflow**, and provide the
 release tag and title. It builds packaged Windows, macOS, and Linux binaries
-and attaches them to a GitHub Release. The workflow has no push, tag,
-pull-request, or scheduled trigger.
+without bundled game resources and attaches them to a GitHub Release. Players
+must provide an original `SimTower.exe` when running those builds. The workflow
+has no push, tag, pull-request, or scheduled trigger.
