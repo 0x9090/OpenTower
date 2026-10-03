@@ -1,0 +1,148 @@
+name: Build release binaries
+
+# Deliberately manual-only: this workflow never runs for pushes, tags, pull
+# requests, or on a schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag for the release (for example, v0.1.0)
+        required: true
+        default: v0.1.0
+        type: string
+      release_name:
+        description: Title shown on the GitHub Release
+        required: true
+        default: OpenTower v0.1.0
+        type: string
+      prerelease:
+        description: Mark the release as a prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            runner: ubuntu-latest
+          - platform: macOS
+            runner: macos-latest
+          - platform: Windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libasound2-dev libgl1-mesa-dev libx11-dev libxi-dev
+
+      - name: Build OpenTower
+        run: cargo build --locked --release --package simtower-desktop
+
+      - name: Package Linux or macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) platform="linux" ;;
+            macOS) platform="macos" ;;
+            *) echo "Unsupported runner: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          architecture="$(uname -m)"
+          package="OpenTower-${platform}-${architecture}"
+          mkdir -p "packages/${package}"
+          install -m 755 target/release/simtower "packages/${package}/OpenTower"
+          tar -C packages -czf "packages/${package}.tar.gz" "${package}"
+          rm -rf "packages/${package}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = 'OpenTower-windows-x86_64'
+          New-Item -ItemType Directory -Force -Path "packages/$package" | Out-Null
+          Copy-Item 'target/release/simtower.exe' "packages/$package/OpenTower.exe"
+          Compress-Archive -Path "packages/$package" -DestinationPath "packages/$package.zip"
+          Remove-Item -Recurse -Force "packages/$package"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.platform }}
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(dist/*)
+          if (( ${#packages[@]} == 0 )); then
+            echo "No release packages were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${packages[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            prerelease_args=()
+            if [[ "$PRERELEASE" == "true" ]]; then
+              prerelease_args+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${packages[@]}" \
+              --title "$RELEASE_NAME" \
+              --target "$GITHUB_SHA" \
+              --generate-notes \
+              "${prerelease_args[@]}" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

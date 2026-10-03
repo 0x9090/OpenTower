@@ -89,3 +89,11 @@ See [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) for binary hashes,
 verified findings, asset mappings, and the compatibility roadmap. Original
 binaries, disc images, decompiler installations/databases, and local tooling
 are deliberately excluded from this repository.
+
+## Manual releases
+
+The **Build release binaries** workflow is manual-only. From the repository's
+Actions tab, choose the workflow, select **Run workflow**, and provide the
+release tag and title. It builds packaged Windows, macOS, and Linux binaries
+and attaches them to a GitHub Release. The workflow has no push, tag,
+pull-request, or scheduled trigger.
