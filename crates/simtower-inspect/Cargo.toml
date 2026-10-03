@@ -1,0 +1,12 @@
+[package]
+name = "simtower-inspect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "simtower-inspect"
+path = "src/main.rs"
+
+[dependencies]
+simtower-formats = { path = "../simtower-formats" }

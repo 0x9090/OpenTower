@@ -1,0 +1,31 @@
+/target/
+.DS_Store
+/.ghidra-profile/
+/.mcp.json
+
+# Reverse-engineering inputs and local tooling are intentionally not published.
+/SimTower ISO/
+/analysis/
+/ghidra-mcp/
+/ghidra_*/
+/third_party/
+/tools/
+/Play SimTower.command
+/assets/reference/
+
+# Never track source binaries, disc images, Ghidra databases, or local secrets.
+*.[Ee][Xx][Ee]
+*.[Ii][Ss][Oo]
+*.[Ii][Mm][Gg]
+*.[Cc][Cc][Dd]
+*.[Cc][Uu][Ee]
+*.[Ss][Uu][Bb]
+*.[Hh][Ll][Pp]
+*.[Mm][Ss][Tt]
+*.gzf
+*.gpr
+*.rep
+.env
+.env.*
+*.pem
+*.key

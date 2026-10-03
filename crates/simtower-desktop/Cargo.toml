@@ -1,0 +1,19 @@
+[package]
+name = "simtower-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "simtower"
+path = "src/main.rs"
+
+[dependencies]
+macroquad = "0.4.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simtower-core = { path = "../simtower-core" }
+simtower-formats = { path = "../simtower-formats" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc-rs = "0.2.8"

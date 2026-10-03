@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/simtower-core",
+    "crates/simtower-desktop",
+    "crates/simtower-formats",
+    "crates/simtower-inspect",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
