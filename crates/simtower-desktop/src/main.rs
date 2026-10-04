@@ -3591,15 +3591,27 @@ impl App {
         let target_center =
             f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
         let start_x = event.security_start_x.unwrap_or(target_center);
+        let direction = if start_x <= target_center { 1.0 } else { -1.0 };
+        // The responders work from the corridor at the tenant boundary. If
+        // they enter the unit center they overlap the flame frames and read as
+        // corrupted pixels instead of a separate team.
+        let destination_x = if direction > 0.0 {
+            f32::from(target.position.x) - 0.5
+        } else {
+            f32::from(target.end_x()) + 0.5
+        };
         let travel_seconds = (event.duration - 6.0).max(0.1);
         let progress = (event.elapsed / travel_seconds).clamp(0.0, 1.0);
-        let team_world_x = start_x + (target_center - start_x) * progress;
+        let team_world_x = start_x + (destination_x - start_x) * progress;
         let screen_x = (team_world_x - self.camera_x) * CELL_WIDTH;
         let y = tenant_room_top_y(self.ground_y(), target.position.floor);
-        let direction = (target_center - start_x).signum();
-        let frame = ((event.elapsed * 6.0) as u64) % 2;
+        let arrived = progress >= 1.0;
         for member in 0..3 {
             let trailing_offset = member as f32 * 7.0 * -direction;
+            // The first pair is the equipment-carrying walk cycle. At the
+            // scene, freeze on the original clean working pose; alternating
+            // substantially different poses while stationary caused flashing.
+            let frame = security_team_animation_frame(event.elapsed, arrived, member);
             self.draw_person_frame(2, frame, screen_x - 4.0 + trailing_offset, y, WHITE);
         }
     }
@@ -8354,6 +8366,14 @@ fn fire_response_timeout_remaining(elapsed: f32) -> u32 {
     (FIRE_RESPONSE_DECISION_SECONDS - elapsed).max(0.0).ceil() as u32
 }
 
+fn security_team_animation_frame(elapsed: f32, arrived: bool, member: usize) -> u64 {
+    if arrived {
+        4
+    } else {
+        (((elapsed * 6.0) as u64) + member as u64) % 2
+    }
+}
+
 fn fire_strip_segments(
     x: f32,
     y: f32,
@@ -8808,6 +8828,19 @@ mod tests {
         assert_eq!(fire_response_timeout_remaining(7.1), 1);
         assert_eq!(fire_response_timeout_remaining(8.0), 0);
         assert_eq!(fire_response_timeout_remaining(20.0), 0);
+    }
+
+    #[test]
+    fn security_team_holds_one_clean_frame_after_arrival() {
+        assert_ne!(
+            security_team_animation_frame(0.0, false, 0),
+            security_team_animation_frame(0.2, false, 0)
+        );
+        for elapsed in [0.0, 0.2, 1.0, 20.0] {
+            for member in 0..3 {
+                assert_eq!(security_team_animation_frame(elapsed, true, member), 4);
+            }
+        }
     }
 
     #[test]
