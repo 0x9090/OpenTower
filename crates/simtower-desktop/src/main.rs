@@ -246,6 +246,7 @@ const fn facility_resource_ids(kind: FacilityKind) -> FacilityResourceIds {
 
 const CLASSIC_FACE: Color = Color::new(0.75, 0.75, 0.75, 1.0);
 const PROMOTION_FACE: Color = Color::new(0.8, 0.8, 0.8, 1.0);
+const FINANCE_TABLE_FACE: Color = Color::new(0.9, 0.9, 0.9, 1.0);
 const CLASSIC_LIGHT: Color = Color::new(0.96, 0.96, 0.96, 1.0);
 const CLASSIC_SHADOW: Color = Color::new(0.32, 0.32, 0.32, 1.0);
 const CLASSIC_DARK: Color = Color::new(0.12, 0.12, 0.12, 1.0);
@@ -4808,37 +4809,56 @@ impl App {
             // it keeps this replacement heading from looking pasted on.
             PROMOTION_FACE,
         );
-        draw_centered_text(&period, rect.x + rect.w * 0.5, rect.y + 20.0, 15, BLACK);
+        draw_centered_text(&period, rect.x + rect.w * 0.5, rect.y + 20.0, 16, BLACK);
         draw_right_aligned_text(
             &format_currency(income),
             rect.x + 166.0,
             rect.y + 53.0,
-            12,
+            13,
             BLACK,
         );
         draw_right_aligned_text(
             &format_currency(maintenance),
             rect.x + 319.0,
             rect.y + 53.0,
-            12,
+            13,
             BLACK,
         );
-        for (index, kind) in [
-            FacilityKind::Office,
-            FacilityKind::HotelSingle,
-            FacilityKind::HotelTwin,
-            FacilityKind::HotelSuite,
-            FacilityKind::Shop,
-            FacilityKind::FastFood,
-            FacilityKind::Restaurant,
-            FacilityKind::PartyHall,
-            FacilityKind::Cinema,
-            FacilityKind::Condo,
+
+        // The row labels are baked into bitmap 500 at a very small size.
+        // Clear only their cells, preserving the original table geometry,
+        // then redraw them alongside the live values at a readable size.
+        draw_rectangle(
+            rect.x + 20.0,
+            rect.y + 80.0,
+            65.0,
+            130.0,
+            FINANCE_TABLE_FACE,
+        );
+        draw_rectangle(
+            rect.x + 191.0,
+            rect.y + 80.0,
+            75.0,
+            130.0,
+            FINANCE_TABLE_FACE,
+        );
+        for (index, (kind, label)) in [
+            (FacilityKind::Office, "Office"),
+            (FacilityKind::HotelSingle, "Single Room"),
+            (FacilityKind::HotelTwin, "Twin Room"),
+            (FacilityKind::HotelSuite, "Hotel Suite"),
+            (FacilityKind::Shop, "Shops"),
+            (FacilityKind::FastFood, "Fast Food"),
+            (FacilityKind::Restaurant, "Restaurant"),
+            (FacilityKind::PartyHall, "Party Hall"),
+            (FacilityKind::Cinema, "Theater"),
+            (FacilityKind::Condo, "Condo"),
         ]
         .into_iter()
         .enumerate()
         {
             let y = rect.y + 91.0 + index as f32 * 12.4;
+            draw_text(label, rect.x + 24.0, y, 10.0, BLACK);
             draw_right_aligned_text(
                 &population_by_kind
                     .get(&kind)
@@ -4847,37 +4867,39 @@ impl App {
                     .to_string(),
                 rect.x + 116.0,
                 y,
-                9,
+                10,
                 BLACK,
             );
             draw_right_aligned_text(
                 &format_number(income_by_kind.get(&kind).copied().unwrap_or(0)),
                 rect.x + 177.0,
                 y,
-                9,
+                10,
                 BLACK,
             );
         }
-        for (index, kind) in [
-            FacilityKind::Lobby,
-            FacilityKind::Elevator,
-            FacilityKind::ExpressElevator,
-            FacilityKind::ServiceElevator,
-            FacilityKind::Escalator,
-            FacilityKind::Ramp,
-            FacilityKind::Recycling,
-            FacilityKind::Metro,
-            FacilityKind::Housekeeping,
-            FacilityKind::Security,
+        for (index, (kind, label)) in [
+            (FacilityKind::Lobby, "Lobby"),
+            (FacilityKind::Elevator, "Elevator"),
+            (FacilityKind::ExpressElevator, "Exp Elevator"),
+            (FacilityKind::ServiceElevator, "Ser Elevator"),
+            (FacilityKind::Escalator, "Escalator"),
+            (FacilityKind::Ramp, "Parking Ramp"),
+            (FacilityKind::Recycling, "Recycling Center"),
+            (FacilityKind::Metro, "Metro Station"),
+            (FacilityKind::Housekeeping, "Housekeeping"),
+            (FacilityKind::Security, "Security"),
         ]
         .into_iter()
         .enumerate()
         {
+            let y = rect.y + 91.0 + index as f32 * 12.4;
+            draw_fitted_text(label, rect.x + 195.0, y, 69.0, 10, BLACK);
             draw_right_aligned_text(
                 &format_number(maintenance_by_kind.get(&kind).copied().unwrap_or(0)),
                 rect.x + 319.0,
-                rect.y + 91.0 + index as f32 * 12.4,
-                9,
+                y,
+                10,
                 BLACK,
             );
         }
@@ -4891,8 +4913,25 @@ impl App {
             (format_currency(starting_balance), 291.0),
             (format_currency(ending_balance), 309.0),
         ] {
-            draw_right_aligned_text(&value, rect.x + 319.0, rect.y + y, 12, BLACK);
+            draw_right_aligned_text(&value, rect.x + 319.0, rect.y + y, 13, BLACK);
         }
+        draw_rectangle(
+            rect.x + 20.0,
+            rect.y + 214.0,
+            rect.w - 40.0,
+            13.0,
+            PROMOTION_FACE,
+        );
+        draw_centered_text(
+            "(Items with no income or expenses are not displayed)",
+            rect.x + rect.w * 0.5,
+            rect.y + 224.0,
+            10,
+            BLACK,
+        );
+        let ok = finance_ok_rect();
+        draw_classic_button(ok, false);
+        draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 17.0, 14, BLACK);
     }
 
     fn handle_elevator_panel_click(&mut self, point: Vec2) {
@@ -6409,6 +6448,27 @@ fn draw_right_aligned_text(
     draw_text(
         text,
         (right_x - width).round(),
+        baseline_y.round(),
+        f32::from(font_size),
+        color,
+    );
+}
+
+fn draw_fitted_text(
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    maximum_width: f32,
+    preferred_size: u16,
+    color: Color,
+) {
+    let font_size = (8..=preferred_size)
+        .rev()
+        .find(|size| measure_text(text, None, *size, 1.0).width <= maximum_width)
+        .unwrap_or(8);
+    draw_text(
+        text,
+        x.round(),
         baseline_y.round(),
         f32::from(font_size),
         color,
