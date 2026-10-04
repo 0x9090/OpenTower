@@ -3467,43 +3467,43 @@ impl App {
         );
         draw_texture_ex(
             &self.assets.star_award,
-            rect.x + 20.0,
-            rect.y + 25.0,
+            rect.x + 17.0,
+            rect.y + 20.0,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(vec2(100.0, 100.0)),
+                dest_size: Some(vec2(110.0, 110.0)),
                 ..Default::default()
             },
         );
         draw_text(
             "Congratulations!",
-            rect.x + 142.0,
-            rect.y + 54.0,
-            16.0,
+            rect.x + 139.0,
+            rect.y + 51.0,
+            19.0,
             BLACK,
         );
         draw_text(
             "Your tower has been given a",
-            rect.x + 142.0,
-            rect.y + 76.0,
-            14.0,
+            rect.x + 139.0,
+            rect.y + 79.0,
+            16.0,
             BLACK,
         );
         draw_text(
             promotion_rating_label(self.promotion_rating),
-            rect.x + 142.0,
-            rect.y + 97.0,
-            14.0,
+            rect.x + 139.0,
+            rect.y + 105.0,
+            16.0,
             BLACK,
         );
         let ok = promotion_ok_rect();
         draw_classic_button(ok, false);
-        let label = measure_text("OK", None, 13, 1.0);
+        let label = measure_text("OK", None, 15, 1.0);
         draw_text(
             "OK",
             (ok.x + (ok.w - label.width) * 0.5).round(),
             (ok.y + (ok.h + label.height) * 0.5 - 2.0).round(),
-            13.0,
+            15.0,
             BLACK,
         );
     }
@@ -6543,7 +6543,7 @@ fn finance_ok_rect() -> Rect {
 
 fn promotion_dialog_rect() -> Rect {
     let width = 390.0;
-    let height = 180.0;
+    let height = 166.0;
     Rect::new(
         (screen_width() - width) * 0.5,
         ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
@@ -6557,10 +6557,10 @@ fn promotion_ok_rect() -> Rect {
     // Offset one pixel left to compensate for the classic button's dark
     // right-hand shadow, keeping its visual mass centered in the panel.
     Rect::new(
-        panel.x + (panel.w - 88.0) * 0.5 - 1.0,
-        panel.y + 143.0,
-        88.0,
-        24.0,
+        panel.x + (panel.w - 96.0) * 0.5 - 1.0,
+        panel.y + 128.0,
+        96.0,
+        26.0,
     )
 }
 
