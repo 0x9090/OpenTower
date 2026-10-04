@@ -4,8 +4,8 @@ use macroquad::miniquad::window;
 use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 use simtower_core::{
-    ElevatorDirection, ElevatorMode, FLOOR_CONSTRUCTION_COST, Facility, FacilityKind, GridPosition,
-    IncomeEvent, MAX_ELEVATOR_QUEUE_PER_FLOOR, MIN_FLOOR, PersonActivity, PersonMood,
+    Clock, ElevatorDirection, ElevatorMode, FLOOR_CONSTRUCTION_COST, Facility, FacilityKind,
+    GridPosition, IncomeEvent, MAX_ELEVATOR_QUEUE_PER_FLOOR, MIN_FLOOR, PersonActivity, PersonMood,
     PlacementError, SimulationSpeed, Tower, TrafficSimulation, elevator_car_cost, facility_is_open,
 };
 use simtower_formats::DibImage;
@@ -1590,6 +1590,8 @@ impl App {
                 .any(|facility| facility.kind == FacilityKind::Medical);
         let facility_id = candidates[index];
         self.traffic.evacuate_facility(facility_id);
+        apply_emergency_speed(&mut self.tower.clock, &mut self.last_running_speed);
+        self.speed_menu_open = false;
         self.fire_event = Some(FireEventState {
             facility_id,
             elapsed: 0.0,
@@ -1597,7 +1599,7 @@ impl App {
             helicopter_x: -110.0,
         });
         self.status = format!(
-            "Fire reported in tenant #{facility_id}; occupants are evacuating{}",
+            "Fire reported in tenant #{facility_id}; occupants are evacuating{} — speed set to 1x",
             if protected {
                 " and emergency services are responding"
             } else {
@@ -8000,6 +8002,13 @@ fn emergency_events_unlocked(star_rating: u8) -> bool {
     star_rating >= FacilityKind::Security.unlock_stars()
 }
 
+fn apply_emergency_speed(clock: &mut Clock, last_running_speed: &mut SimulationSpeed) {
+    // All emergency entry points (fire, terrorist, and future incidents) use
+    // this shared control so a high simulation rate cannot hide the response.
+    clock.speed = SimulationSpeed::Normal;
+    *last_running_speed = SimulationSpeed::Normal;
+}
+
 fn facility_sprite_from_vertical_bmps(
     kind: FacilityKind,
     parts: &[AssetRef],
@@ -8376,6 +8385,24 @@ mod tests {
         assert!(!emergency_events_unlocked(security_stars - 1));
         assert!(emergency_events_unlocked(security_stars));
         assert!(emergency_events_unlocked(5));
+    }
+
+    #[test]
+    fn every_emergency_forces_the_clock_and_resume_speed_to_one_x() {
+        for starting_speed in [
+            SimulationSpeed::Paused,
+            SimulationSpeed::Fast,
+            SimulationSpeed::Triple,
+            SimulationSpeed::Quintuple,
+            SimulationSpeed::Tenfold,
+        ] {
+            let mut clock = Clock::default();
+            clock.speed = starting_speed;
+            let mut resume_speed = starting_speed;
+            apply_emergency_speed(&mut clock, &mut resume_speed);
+            assert_eq!(clock.speed, SimulationSpeed::Normal);
+            assert_eq!(resume_speed, SimulationSpeed::Normal);
+        }
     }
 
     #[test]
