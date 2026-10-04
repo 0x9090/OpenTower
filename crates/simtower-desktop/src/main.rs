@@ -4794,13 +4794,15 @@ impl App {
         let population_by_kind =
             report.map_or(&current_population, |report| &report.population_by_kind);
         let net = income.saturating_sub(maintenance);
-        let period = format!("Year {year}  •  Quarter {quarter}");
+        let period = finance_period_label(year, quarter);
         draw_rectangle(
             rect.x + 20.0,
             rect.y + 4.0,
             rect.w - 40.0,
             21.0,
-            CLASSIC_FACE,
+            // Bitmap 500 uses #cccccc throughout its report face. Matching
+            // it keeps this replacement heading from looking pasted on.
+            PROMOTION_FACE,
         );
         draw_centered_text(&period, rect.x + rect.w * 0.5, rect.y + 20.0, 15, BLACK);
         draw_right_aligned_text(
@@ -6373,6 +6375,12 @@ fn format_currency(value: i64) -> String {
     } else {
         format!("${}", format_number(value))
     }
+}
+
+fn finance_period_label(year: u32, quarter: u8) -> String {
+    // The built-in pixel-like font lacks the bullet glyph. An ASCII-only gap
+    // keeps the two halves balanced without rendering a fallback rectangle.
+    format!("Year {year}     Quarter {quarter}")
 }
 
 fn draw_centered_text(text: &str, center_x: f32, baseline_y: f32, font_size: u16, color: Color) {
@@ -8638,6 +8646,13 @@ mod tests {
         assert_eq!(format_number(2_000_000), "2,000,000");
         assert_eq!(format_currency(2_000_000), "$2,000,000");
         assert_eq!(format_currency(-12_345), "-$12,345");
+    }
+
+    #[test]
+    fn report_period_heading_uses_only_supported_ascii_glyphs() {
+        let heading = finance_period_label(2, 3);
+        assert_eq!(heading, "Year 2     Quarter 3");
+        assert!(heading.is_ascii());
     }
 
     #[test]
