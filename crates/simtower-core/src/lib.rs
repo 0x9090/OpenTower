@@ -197,6 +197,9 @@ pub enum FacilityOccupancy {
     NotApplicable,
     VacantUntil(u64),
     Occupied,
+    /// The room was destroyed by an emergency and remains unusable until it
+    /// is demolished and rebuilt.
+    Burned,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -219,6 +222,10 @@ impl Facility {
 
     pub const fn is_occupied(&self) -> bool {
         matches!(self.occupancy, FacilityOccupancy::Occupied)
+    }
+
+    pub const fn is_burned(&self) -> bool {
+        matches!(self.occupancy, FacilityOccupancy::Burned)
     }
 
     pub fn height(&self) -> u16 {
@@ -345,6 +352,34 @@ impl Tower {
         self.cash
     }
 
+    /// Pays a one-off emergency or service charge without allowing the tower
+    /// balance to go below zero.
+    pub fn try_spend(&mut self, amount: i64) -> bool {
+        if amount < 0 || self.cash < amount {
+            return false;
+        }
+        self.cash -= amount;
+        true
+    }
+
+    /// Permanently disables a tenant after destructive fire damage. The
+    /// facility remains in place so the bulldozer is required before a
+    /// replacement can be built.
+    pub fn mark_facility_burned(&mut self, facility_id: u64) -> bool {
+        let Some(facility) = self
+            .facilities
+            .iter_mut()
+            .find(|item| item.id == facility_id)
+        else {
+            return false;
+        };
+        if !facility.kind.has_tenant_occupancy() {
+            return false;
+        }
+        facility.occupancy = FacilityOccupancy::Burned;
+        true
+    }
+
     pub fn facilities(&self) -> &[Facility] {
         &self.facilities
     }
@@ -380,6 +415,7 @@ impl Tower {
                 || (facility.kind == FacilityKind::Lobby && !(1..=3).contains(&facility.stories))
                 || (facility.kind != FacilityKind::Lobby
                     && facility.stories != facility.kind.spec().height as u8)
+                || (facility.is_burned() && !facility.kind.has_tenant_occupancy())
             {
                 return Err("save contains invalid facility data".to_owned());
             }
@@ -2052,6 +2088,36 @@ mod tests {
                 .place(FacilityKind::Stairs, GridPosition { x: 0, floor: -1 })
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn burned_tenant_stays_unusable_until_demolished() {
+        let mut tower = Tower::new(16, 1_000_000);
+        build_supported_floor(&mut tower, 1, 0..9);
+        let office = tower
+            .place(FacilityKind::Office, GridPosition { x: 0, floor: 1 })
+            .unwrap();
+        tower.facilities[0].occupancy = FacilityOccupancy::Occupied;
+        assert_eq!(tower.population(), 6);
+
+        assert!(tower.mark_facility_burned(office));
+        assert!(tower.facilities()[0].is_burned());
+        assert_eq!(tower.population(), 0);
+        tower.advance_time(100.0);
+        assert!(tower.facilities()[0].is_burned());
+
+        tower.demolish(office).unwrap();
+        assert!(tower.facilities().is_empty());
+    }
+
+    #[test]
+    fn emergency_charge_never_overdraws_the_tower() {
+        let mut tower = Tower::new(8, 300_000);
+        assert!(tower.try_spend(300_000));
+        assert_eq!(tower.cash(), 0);
+        assert!(!tower.try_spend(1));
+        assert!(!tower.try_spend(-1));
+        assert_eq!(tower.cash(), 0);
     }
 
     #[test]

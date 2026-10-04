@@ -81,6 +81,9 @@ const ELEVATOR_OPEN_SOUND_IDS: [u16; 2] = [6001, 6002];
 const ELEVATOR_BELL_DIVISOR: u8 = 5;
 const MAX_PAYMENT_SOUND_QUEUE: u8 = 30;
 const PAYMENT_SOUND_INTERVAL: f32 = 0.5;
+const FIRE_RESCUE_COST: i64 = 300_000;
+const FIRE_QUICK_RESPONSE_SECONDS: f32 = 22.0;
+const FIRE_HELICOPTER_DURATION_SECONDS: f32 = 12.0;
 const QUEUE_CONCERNED_PINK: [u8; 3] = [255, 92, 152];
 const CROWD_SOUND_ID: u16 = 8000;
 const RESTAURANT_AMBIENCE_IDS: &[u16] = &[1384, 1385];
@@ -281,7 +284,15 @@ struct FireEventState {
     facility_id: u64,
     elapsed: f32,
     duration: f32,
-    helicopter_x: f32,
+    response: FireResponse,
+    saves_unit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FireResponse {
+    AwaitingDecision,
+    Security,
+    Helicopter,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -406,6 +417,16 @@ impl FinanceLedger {
                 *total = total.saturating_add(event.amount.saturating_abs());
             }
         }
+    }
+
+    fn record_emergency_charge(&mut self, amount: i64, current_cash: i64) {
+        self.maintenance = self.maintenance.saturating_add(amount);
+        let security = self
+            .maintenance_by_kind
+            .entry(FacilityKind::Security)
+            .or_default();
+        *security = security.saturating_add(amount);
+        self.last_observed_cash = current_cash;
     }
 
     fn close_quarter(
@@ -946,7 +967,6 @@ struct App {
     seasonal_event: Option<SeasonalEventState>,
     treasure_popup: Option<TreasurePopup>,
     fire_event: Option<FireEventState>,
-    fire_aftermath: Option<(u64, f32)>,
     next_fire_minute: u64,
     last_star_rating: u8,
     promotion_dialog_open: bool,
@@ -992,7 +1012,6 @@ impl App {
                 .map(|kind| SeasonalEventState { kind, x: -180.0 }),
             treasure_popup: None,
             fire_event: None,
-            fire_aftermath: None,
             next_fire_minute: 11 * 60,
             last_star_rating: 1,
             promotion_dialog_open: false,
@@ -1034,7 +1053,6 @@ impl App {
             seasonal_event_for_system_date().map(|kind| SeasonalEventState { kind, x: -180.0 });
         self.treasure_popup = None;
         self.fire_event = None;
-        self.fire_aftermath = None;
         self.next_fire_minute = 11 * 60;
         self.last_star_rating = 1;
         self.promotion_dialog_open = false;
@@ -1259,7 +1277,6 @@ impl App {
         self.simulation_sounds = SimulationSoundState::default();
         self.treasure_popup = None;
         self.fire_event = None;
-        self.fire_aftermath = None;
         self.promotion_dialog_open = false;
         self.promotion_resume_speed = None;
         self.last_star_rating = self.star_rating();
@@ -1305,6 +1322,13 @@ impl App {
                     self.tower.clock.speed = speed;
                 }
             }
+            return;
+        }
+        if self
+            .fire_event
+            .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
+        {
+            self.update_fire_response_dialog();
             return;
         }
         self.finance_ledger.ensure_initialized(self.tower.cash());
@@ -1376,15 +1400,6 @@ impl App {
         }
         self.traffic.advance_after_sync(&self.tower, simulation_dt);
         self.update_fire_event(simulation_dt);
-        if let Some((_, remaining)) = &mut self.fire_aftermath {
-            *remaining -= simulation_dt;
-        }
-        if self
-            .fire_aftermath
-            .is_some_and(|(_, remaining)| remaining <= 0.0)
-        {
-            self.fire_aftermath = None;
-        }
         let current_rating = self.star_rating();
         if current_rating > self.last_star_rating {
             self.promotion_rating = current_rating;
@@ -1528,13 +1543,25 @@ impl App {
 
     fn update_fire_event(&mut self, dt: f32) {
         if let Some(event) = &mut self.fire_event {
+            if event.response == FireResponse::AwaitingDecision {
+                return;
+            }
             event.elapsed += dt;
-            event.helicopter_x += dt * 92.0;
             self.traffic.evacuate_facility(event.facility_id);
             if event.elapsed >= event.duration {
-                self.fire_aftermath = Some((event.facility_id, 16.0));
-                self.status = "The fire has been extinguished; the tenant may reopen".to_owned();
+                let facility_id = event.facility_id;
+                let saves_unit = event.saves_unit;
                 self.fire_event = None;
+                if saves_unit {
+                    self.status =
+                        "The fire is out. The quick response saved the tenant space.".to_owned();
+                } else {
+                    self.tower.mark_facility_burned(facility_id);
+                    self.traffic.evacuate_facility(facility_id);
+                    self.status =
+                        "The fire is out, but the tenant burned out. Bulldoze and rebuild it."
+                            .to_owned();
+                }
             }
             return;
         }
@@ -1546,6 +1573,17 @@ impl App {
             // event forward so unlocking Security starts a fresh grace period
             // instead of immediately releasing an overdue fire.
             self.next_fire_minute = now + 3 * 24 * 60;
+            return;
+        }
+        if !self
+            .tower
+            .facilities()
+            .iter()
+            .any(|facility| facility.kind == FacilityKind::Security)
+        {
+            // The original manual states that fire and terrorist events begin
+            // only after security personnel are present in the building.
+            self.next_fire_minute = now + 24 * 60;
             return;
         }
         if now < self.next_fire_minute {
@@ -1578,16 +1616,6 @@ impl App {
             return;
         }
         let index = (u64::from(self.tower.clock.day).wrapping_mul(17) as usize) % candidates.len();
-        let protected = self
-            .tower
-            .facilities()
-            .iter()
-            .any(|facility| facility.kind == FacilityKind::Security)
-            && self
-                .tower
-                .facilities()
-                .iter()
-                .any(|facility| facility.kind == FacilityKind::Medical);
         let facility_id = candidates[index];
         self.traffic.evacuate_facility(facility_id);
         apply_emergency_speed(&mut self.tower.clock, &mut self.last_running_speed);
@@ -1595,17 +1623,81 @@ impl App {
         self.fire_event = Some(FireEventState {
             facility_id,
             elapsed: 0.0,
-            duration: if protected { 24.0 } else { 42.0 },
-            helicopter_x: -110.0,
+            duration: 0.0,
+            response: FireResponse::AwaitingDecision,
+            saves_unit: false,
         });
         self.status = format!(
-            "Fire reported in tenant #{facility_id}; occupants are evacuating{} — speed set to 1x",
-            if protected {
-                " and emergency services are responding"
-            } else {
-                ""
-            }
+            "Fire reported in tenant #{facility_id}; choose emergency response — speed set to 1x"
         );
+    }
+
+    fn update_fire_response_dialog(&mut self) {
+        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let choose_helicopter = is_key_pressed(KeyCode::H)
+            || (is_mouse_button_pressed(MouseButton::Left)
+                && fire_helicopter_button_rect().contains(mouse));
+        let choose_security = is_key_pressed(KeyCode::S)
+            || is_key_pressed(KeyCode::Escape)
+            || (is_mouse_button_pressed(MouseButton::Left)
+                && fire_security_button_rect().contains(mouse));
+
+        if choose_helicopter {
+            if !self.tower.try_spend(FIRE_RESCUE_COST) {
+                self.assets.play_no_money();
+                self.status = format!(
+                    "The fire rescue helicopter costs ${FIRE_RESCUE_COST}; insufficient funds"
+                );
+                return;
+            }
+            self.finance_ledger
+                .record_emergency_charge(FIRE_RESCUE_COST, self.tower.cash());
+            if let Some(event) = &mut self.fire_event {
+                event.response = FireResponse::Helicopter;
+                event.elapsed = 0.0;
+                event.duration = FIRE_HELICOPTER_DURATION_SECONDS;
+                event.saves_unit = true;
+            }
+            self.status = "Fire rescue helicopter dispatched; the tenant can be saved".to_owned();
+            return;
+        }
+
+        if choose_security {
+            let Some(event) = self.fire_event else {
+                return;
+            };
+            let Some(target) = self
+                .tower
+                .facilities()
+                .iter()
+                .find(|facility| facility.id == event.facility_id)
+            else {
+                self.fire_event = None;
+                return;
+            };
+            let Some(response_seconds) = security_fire_response_seconds(
+                target,
+                self.tower
+                    .facilities()
+                    .iter()
+                    .filter(|facility| facility.kind == FacilityKind::Security),
+            ) else {
+                self.status =
+                    "No Security Office can respond; call the fire rescue helicopter".to_owned();
+                return;
+            };
+            if let Some(event) = &mut self.fire_event {
+                event.response = FireResponse::Security;
+                event.elapsed = 0.0;
+                event.duration = response_seconds + 6.0;
+                event.saves_unit = response_seconds <= FIRE_QUICK_RESPONSE_SECONDS;
+            }
+            self.status = if response_seconds <= FIRE_QUICK_RESPONSE_SECONDS {
+                "Security is close enough to save the tenant".to_owned()
+            } else {
+                "Security is responding, but the fire has already caused severe damage".to_owned()
+            };
+        }
     }
 
     fn update_camera(&mut self) {
@@ -2597,12 +2689,13 @@ impl App {
 
     fn handle_mode_click(&mut self, point: Vec2, price_step: i8) {
         let position = self.grid_position(point);
-        let Some((id, kind, occupied, current_price)) =
+        let Some((id, kind, occupied, burned, current_price)) =
             self.facility_at_screen_point(point).map(|facility| {
                 (
                     facility.id,
                     facility.kind,
                     facility.is_occupied(),
+                    facility.is_burned(),
                     facility.price_level,
                 )
             })
@@ -2613,6 +2706,14 @@ impl App {
             );
             return;
         };
+        if burned {
+            self.status = format!(
+                "{} #{} was destroyed by fire — bulldoze and rebuild it",
+                kind.spec().name,
+                id
+            );
+            return;
+        }
         match self.view_mode {
             ViewMode::Edit => {}
             ViewMode::Evaluation => {
@@ -2976,6 +3077,9 @@ impl App {
         self.save_name_dialog.is_some()
             || self.elevator_panel.is_some()
             || self.promotion_dialog_open
+            || self
+                .fire_event
+                .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             || point.y < TOPBAR_HEIGHT
             || palette_rect().contains(point)
             || (self.game_menu_open && game_menu_rect().contains(point))
@@ -2993,6 +3097,9 @@ impl App {
             && self.elevator_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
+            && !self
+                .fire_event
+                .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             && self.intro_remaining <= 0.0
             && !self.point_is_ui(mouse);
         let inspect_cursor = self.tool == ToolMode::Inspect
@@ -3000,6 +3107,9 @@ impl App {
             && self.elevator_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
+            && !self
+                .fire_event
+                .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             && self.intro_remaining <= 0.0
             && !self.point_is_ui(mouse);
         let resize_handle =
@@ -3046,6 +3156,12 @@ impl App {
         }
         if self.promotion_dialog_open {
             self.draw_promotion_dialog();
+        }
+        if self
+            .fire_event
+            .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
+        {
+            self.draw_fire_response_dialog();
         }
     }
 
@@ -3412,40 +3528,109 @@ impl App {
     }
 
     fn draw_fire_response(&self) {
-        if let Some(event) = self.fire_event {
-            draw_texture_ex(
-                &self.assets.fire_helicopter,
-                event.helicopter_x,
-                TOPBAR_HEIGHT + 42.0,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(vec2(100.0, 41.0)),
-                    ..Default::default()
-                },
-            );
-            if event.elapsed < 6.0 {
-                draw_texture_ex(
-                    &self.assets.fire_dispatch,
-                    screen_width() - 220.0,
-                    TOPBAR_HEIGHT + 8.0,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(124.0, 67.0)),
-                        ..Default::default()
-                    },
-                );
-                draw_texture_ex(
-                    &self.assets.fire_alert,
-                    screen_width() - 86.0,
-                    TOPBAR_HEIGHT + 12.0,
-                    WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(76.0, 60.0)),
-                        ..Default::default()
-                    },
-                );
-            }
-        }
+        let Some(event) = self
+            .fire_event
+            .filter(|event| event.response == FireResponse::Helicopter)
+        else {
+            return;
+        };
+        let Some(target) = self
+            .tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == event.facility_id)
+        else {
+            return;
+        };
+        let target_x = (f32::from(target.position.x) - self.camera_x) * CELL_WIDTH;
+        let target_width = f32::from(target.kind.spec().width) * CELL_WIDTH;
+        let destination_x = target_x + target_width * 0.5 - 48.0;
+        let approach = (event.elapsed / 5.0).clamp(0.0, 1.0);
+        let helicopter_x = -110.0 + (destination_x + 110.0) * approach;
+        let helicopter_y = floor_top_y(self.ground_y(), target.position.floor) - 43.0;
+        draw_texture_ex(
+            &self.assets.fire_helicopter,
+            helicopter_x,
+            helicopter_y,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(96.0, 36.0)),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn draw_fire_response_dialog(&self) {
+        let panel = fire_response_dialog_rect();
+        draw_classic_panel(panel);
+        draw_rectangle(
+            panel.x + 4.0,
+            panel.y + 4.0,
+            panel.w - 8.0,
+            panel.h - 8.0,
+            CLASSIC_FACE,
+        );
+        draw_texture_ex(
+            &self.assets.fire_alert,
+            panel.x + 18.0,
+            panel.y + 26.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(76.0, 60.0)),
+                ..Default::default()
+            },
+        );
+        draw_texture_ex(
+            &self.assets.fire_dispatch,
+            panel.x + 10.0,
+            panel.y + 92.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(92.0, 50.0)),
+                ..Default::default()
+            },
+        );
+        draw_text("Fire!", panel.x + 116.0, panel.y + 34.0, 24.0, BLACK);
+        draw_text(
+            "Call the fire rescue helicopter?",
+            panel.x + 116.0,
+            panel.y + 66.0,
+            18.0,
+            BLACK,
+        );
+        draw_text(
+            "A helicopter guarantees the unit is saved.",
+            panel.x + 116.0,
+            panel.y + 91.0,
+            15.0,
+            BLACK,
+        );
+        draw_text(
+            "Security is free, but a distant response may be too late.",
+            panel.x + 116.0,
+            panel.y + 113.0,
+            15.0,
+            BLACK,
+        );
+
+        let helicopter = fire_helicopter_button_rect();
+        draw_classic_button(helicopter, false);
+        draw_centered_text(
+            "Call Rescue  $300,000",
+            helicopter.x + helicopter.w * 0.5,
+            helicopter.y + 21.0,
+            15,
+            BLACK,
+        );
+        let security = fire_security_button_rect();
+        draw_classic_button(security, false);
+        draw_centered_text(
+            "Use Security",
+            security.x + security.w * 0.5,
+            security.y + 21.0,
+            15,
+            BLACK,
+        );
     }
 
     fn draw_promotion_dialog(&self) {
@@ -3650,7 +3835,11 @@ impl App {
             &sprite.texture,
             x,
             draw_y,
-            facility_light_tint(facility.kind, crowd),
+            if facility.is_burned() {
+                Color::new(0.28, 0.24, 0.22, 1.0)
+            } else {
+                facility_light_tint(facility.kind, crowd)
+            },
             DrawTextureParams {
                 dest_size: Some(vec2(width, draw_height)),
                 source: Some(sprite_source),
@@ -3662,7 +3851,7 @@ impl App {
         } else {
             y
         };
-        self.draw_facility_state_overlay(facility, x, overlay_base_y, width, draw_y);
+        self.draw_facility_state_overlay(facility, x, overlay_base_y, width);
     }
 
     fn facility_crowd(&self, facility: &Facility) -> FacilityCrowd {
@@ -3739,14 +3928,28 @@ impl App {
         }
     }
 
-    fn draw_facility_state_overlay(
-        &self,
-        facility: &Facility,
-        x: f32,
-        base_y: f32,
-        width: f32,
-        draw_y: f32,
-    ) {
+    fn draw_facility_state_overlay(&self, facility: &Facility, x: f32, base_y: f32, width: f32) {
+        if facility.is_burned() {
+            let room_y = tenant_room_top_y(self.ground_y(), facility.position.floor);
+            draw_rectangle(
+                x,
+                room_y,
+                width,
+                ROOM_HEIGHT,
+                Color::new(0.08, 0.06, 0.05, 0.48),
+            );
+            let scorch_count = (width / 24.0).ceil() as usize;
+            for scorch in 0..scorch_count {
+                let center_x = x + 10.0 + scorch as f32 * 24.0;
+                draw_circle(
+                    center_x.min(x + width - 5.0),
+                    room_y + 15.0 + (scorch % 2) as f32 * 3.0,
+                    5.0 + (scorch % 3) as f32,
+                    Color::new(0.03, 0.025, 0.02, 0.7),
+                );
+            }
+        }
+
         if facility.kind == FacilityKind::Office {
             let worker_count = office_visible_worker_count(self.traffic.visitors_at(facility.id));
             if worker_count > 0 {
@@ -3791,52 +3994,54 @@ impl App {
             }
         }
 
-        if self
-            .fire_aftermath
-            .is_some_and(|(facility_id, _)| facility_id == facility.id)
-        {
-            draw_texture_ex(
-                &self.assets.fire_aftermath,
-                x + (width - 76.0) * 0.5,
-                draw_y + FLOOR_HEIGHT - 40.0,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(vec2(76.0, 40.0)),
-                    ..Default::default()
-                },
-            );
-        }
-
         let Some(event) = self
             .fire_event
             .filter(|event| event.facility_id == facility.id)
         else {
             return;
         };
-        let phase = ((event.elapsed * 5.0) as usize) % self.assets.fire_large.len();
-        let flame_width = width.min(96.0);
-        draw_texture_ex(
-            &self.assets.fire_large[phase],
-            x + (width - flame_width) * 0.5,
-            draw_y + FLOOR_HEIGHT - 36.0,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(flame_width, 36.0)),
-                ..Default::default()
-            },
-        );
-        let ember_frame = ((event.elapsed * 8.0) as usize) % 4;
-        draw_texture_ex(
-            &self.assets.fire_small,
-            x + width * 0.25 - 12.0,
-            draw_y + FLOOR_HEIGHT - 24.0,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(24.0, 24.0)),
-                source: Some(Rect::new(ember_frame as f32 * 96.0, 0.0, 96.0, 36.0)),
-                ..Default::default()
-            },
-        );
+        let fire_y = floor_top_y(self.ground_y(), facility.position.floor);
+        if event.elapsed < 5.0 {
+            let frame = ((event.elapsed * 8.0) as usize) % 4;
+            self.draw_fire_strip(
+                &self.assets.fire_small,
+                Some(Rect::new(frame as f32 * 96.0, 0.0, 96.0, 36.0)),
+                x,
+                fire_y,
+                width,
+            );
+        } else {
+            let phase = ((event.elapsed * 5.0) as usize) % self.assets.fire_large.len();
+            self.draw_fire_strip(&self.assets.fire_large[phase], None, x, fire_y, width);
+        }
+    }
+
+    fn draw_fire_strip(
+        &self,
+        texture: &Texture2D,
+        source: Option<Rect>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) {
+        let tile_width = source.map_or(texture.width(), |rect| rect.w).min(96.0);
+        let source_x = source.map_or(0.0, |rect| rect.x);
+        let source_y = source.map_or(0.0, |rect| rect.y);
+        for (destination, source_segment) in
+            fire_strip_segments(x, y, width, tile_width, source_x, source_y)
+        {
+            draw_texture_ex(
+                texture,
+                destination.x,
+                destination.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(destination.w, destination.h)),
+                    source: Some(source_segment),
+                    ..Default::default()
+                },
+            );
+        }
     }
 
     fn draw_empty_elevator_shaft(&self, x: f32, y: f32, width: f32, floor: i16) {
@@ -6638,6 +6843,27 @@ fn promotion_ok_rect() -> Rect {
     )
 }
 
+fn fire_response_dialog_rect() -> Rect {
+    let width = 540.0;
+    let height = 190.0;
+    Rect::new(
+        (screen_width() - width) * 0.5,
+        ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        width,
+        height,
+    )
+}
+
+fn fire_helicopter_button_rect() -> Rect {
+    let panel = fire_response_dialog_rect();
+    Rect::new(panel.x + 116.0, panel.y + 140.0, 190.0, 30.0)
+}
+
+fn fire_security_button_rect() -> Rect {
+    let panel = fire_response_dialog_rect();
+    Rect::new(panel.x + 322.0, panel.y + 140.0, 190.0, 30.0)
+}
+
 const fn promotion_rating_label(star_rating: u8) -> &'static str {
     match star_rating {
         2 => "Two Star Rating!",
@@ -6840,7 +7066,7 @@ struct OriginalAssets {
     fire_small: Texture2D,
     fire_helicopter: Texture2D,
     fire_alert: Texture2D,
-    fire_aftermath: Texture2D,
+    _fire_aftermath: Texture2D,
     star_award: Texture2D,
     _terrorist_portrait: Texture2D,
     fire_dispatch: Texture2D,
@@ -6968,7 +7194,7 @@ impl OriginalAssets {
             fire_small: texture_from_bmp_with_white_transparency(FIRE_SMALL_BMP)?,
             fire_helicopter: texture_from_bmp_with_white_transparency(FIRE_HELICOPTER_BMP)?,
             fire_alert: texture_from_bmp_with_white_transparency(FIRE_ALERT_BMP)?,
-            fire_aftermath: texture_from_bmp_with_white_transparency(FIRE_AFTERMATH_BMP)?,
+            _fire_aftermath: texture_from_bmp_with_white_transparency(FIRE_AFTERMATH_BMP)?,
             star_award: texture_from_bmp_with_white_transparency(STAR_AWARD_BMP)?,
             _terrorist_portrait: texture_from_bmp_with_white_transparency(TERRORIST_PORTRAIT_BMP)?,
             fire_dispatch: texture_from_bmp_with_white_transparency(FIRE_DISPATCH_BMP)?,
@@ -8009,6 +8235,44 @@ fn apply_emergency_speed(clock: &mut Clock, last_running_speed: &mut SimulationS
     *last_running_speed = SimulationSpeed::Normal;
 }
 
+fn security_fire_response_seconds<'a>(
+    target: &Facility,
+    security_offices: impl Iterator<Item = &'a Facility>,
+) -> Option<f32> {
+    security_offices
+        .map(|security| {
+            let floor_distance = (security.position.floor - target.position.floor).unsigned_abs();
+            let target_center =
+                f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
+            let security_center =
+                f32::from(security.position.x) + f32::from(security.kind.spec().width) * 0.5;
+            let horizontal_distance = (security_center - target_center).abs();
+            8.0 + f32::from(floor_distance) * 3.0 + horizontal_distance * 0.05
+        })
+        .min_by(|left, right| left.total_cmp(right))
+}
+
+fn fire_strip_segments(
+    x: f32,
+    y: f32,
+    width: f32,
+    tile_width: f32,
+    source_x: f32,
+    source_y: f32,
+) -> Vec<(Rect, Rect)> {
+    let mut segments = Vec::new();
+    let mut offset = 0.0;
+    while offset < width {
+        let segment_width = (width - offset).min(tile_width);
+        segments.push((
+            Rect::new(x + offset, y, segment_width, FLOOR_HEIGHT),
+            Rect::new(source_x, source_y, segment_width, FLOOR_HEIGHT),
+        ));
+        offset += segment_width;
+    }
+    segments
+}
+
 fn facility_sprite_from_vertical_bmps(
     kind: FacilityKind,
     parts: &[AssetRef],
@@ -8403,6 +8667,57 @@ mod tests {
             assert_eq!(clock.speed, SimulationSpeed::Normal);
             assert_eq!(resume_speed, SimulationSpeed::Normal);
         }
+    }
+
+    #[test]
+    fn nearby_security_saves_a_unit_while_a_distant_team_arrives_too_late() {
+        let target = Facility {
+            id: 1,
+            kind: FacilityKind::Shop,
+            position: GridPosition { x: 40, floor: 8 },
+            occupancy: simtower_core::FacilityOccupancy::Occupied,
+            price_level: 1,
+            stories: 1,
+        };
+        let nearby = Facility {
+            id: 2,
+            kind: FacilityKind::Security,
+            position: GridPosition { x: 44, floor: 7 },
+            occupancy: simtower_core::FacilityOccupancy::NotApplicable,
+            price_level: 1,
+            stories: 1,
+        };
+        let distant = Facility {
+            position: GridPosition { x: 180, floor: 1 },
+            ..nearby.clone()
+        };
+        let nearby_seconds =
+            security_fire_response_seconds(&target, std::iter::once(&nearby)).unwrap();
+        let distant_seconds =
+            security_fire_response_seconds(&target, std::iter::once(&distant)).unwrap();
+        assert!(nearby_seconds <= FIRE_QUICK_RESPONSE_SECONDS);
+        assert!(distant_seconds > FIRE_QUICK_RESPONSE_SECONDS);
+    }
+
+    #[test]
+    fn fire_strip_starts_at_the_unit_and_covers_its_exact_width() {
+        let segments = fire_strip_segments(120.0, 244.0, 192.0, 96.0, 0.0, 0.0);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].0, Rect::new(120.0, 244.0, 96.0, FLOOR_HEIGHT));
+        assert_eq!(segments[1].0, Rect::new(216.0, 244.0, 96.0, FLOOR_HEIGHT));
+        assert_eq!(
+            segments.last().unwrap().0.x + segments.last().unwrap().0.w,
+            312.0
+        );
+
+        let cropped = fire_strip_segments(80.0, 100.0, 72.0, 96.0, 192.0, 0.0);
+        assert_eq!(
+            cropped,
+            vec![(
+                Rect::new(80.0, 100.0, 72.0, FLOOR_HEIGHT),
+                Rect::new(192.0, 0.0, 72.0, FLOOR_HEIGHT),
+            )]
+        );
     }
 
     #[test]
