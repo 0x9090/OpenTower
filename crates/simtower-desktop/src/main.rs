@@ -46,6 +46,7 @@ const SPEED_CHOICES: [SimulationSpeed; 6] = [
 ];
 const SKY_TILE_WIDTH: f32 = 200.0;
 const SKY_HORIZON: f32 = 264.0;
+const VERTICAL_WHEEL_FLOORS_PER_STEP: f32 = 1.0;
 const PALETTE_X: f32 = 12.0;
 const PALETTE_Y: f32 = 78.0;
 const PALETTE_TITLE_HEIGHT: f32 = 20.0;
@@ -1761,7 +1762,8 @@ impl App {
                 self.camera_x =
                     (self.camera_x - horizontal_delta * 8.0).clamp(0.0, maximum_camera_x);
             } else {
-                self.camera_floor = (self.camera_floor + wheel.1 * 2.0).clamp(-8.0, 99.0);
+                self.camera_floor = (self.camera_floor + wheel.1 * VERTICAL_WHEEL_FLOORS_PER_STEP)
+                    .clamp(-8.0, 99.0);
             }
         }
     }
@@ -9342,6 +9344,7 @@ mod tests {
         let origin = sky_tile_origin_x(0.0);
         let shifted = sky_tile_origin_x(1.0);
         assert_eq!(shifted - origin, -CELL_WIDTH);
+        assert_eq!(VERTICAL_WHEEL_FLOORS_PER_STEP, 1.0);
     }
 
     #[test]
