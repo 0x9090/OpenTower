@@ -328,6 +328,8 @@ struct SaveGame {
     last_running_speed: SimulationSpeed,
     next_fire_minute: u64,
     finance_ledger: FinanceLedger,
+    #[serde(default = "default_true")]
+    automatic_finance_reports: bool,
     #[serde(default)]
     tenant_variants: HashMap<u64, usize>,
     #[serde(default)]
@@ -345,15 +347,21 @@ enum GameMenuAction {
     New,
     Save,
     Load,
+    AutomaticReports,
     Quit,
 }
 
-const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 4] = [
+const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 5] = [
     (GameMenuAction::New, "New"),
     (GameMenuAction::Save, "Save"),
     (GameMenuAction::Load, "Load"),
+    (GameMenuAction::AutomaticReports, "Automatic reports"),
     (GameMenuAction::Quit, "Quit"),
 ];
+
+const fn default_true() -> bool {
+    true
+}
 
 impl FinanceLedger {
     fn new(starting_balance: i64) -> Self {
@@ -945,6 +953,8 @@ struct App {
     promotion_rating: u8,
     finance_ledger: FinanceLedger,
     finance_panel_open: bool,
+    finance_resume_speed: Option<SimulationSpeed>,
+    automatic_finance_reports: bool,
     intro_remaining: f32,
     game_menu_open: bool,
     mode_menu_open: bool,
@@ -989,6 +999,8 @@ impl App {
             promotion_rating: 1,
             finance_ledger,
             finance_panel_open: false,
+            finance_resume_speed: None,
+            automatic_finance_reports: true,
             intro_remaining: 2.4,
             game_menu_open: false,
             mode_menu_open: false,
@@ -1029,6 +1041,7 @@ impl App {
         self.promotion_rating = 1;
         self.finance_ledger = FinanceLedger::new(self.tower.cash());
         self.finance_panel_open = false;
+        self.finance_resume_speed = None;
         self.intro_remaining = 0.0;
         self.game_menu_open = false;
         self.mode_menu_open = false;
@@ -1042,6 +1055,13 @@ impl App {
             overwrite_path: None,
         });
         self.status = "Enter a save-game name".to_owned();
+    }
+
+    fn close_finance_panel(&mut self) {
+        self.finance_panel_open = false;
+        if let Some(speed) = self.finance_resume_speed.take() {
+            self.tower.clock.speed = speed;
+        }
     }
 
     fn update_save_name_dialog(&mut self) {
@@ -1161,6 +1181,7 @@ impl App {
             last_running_speed: self.last_running_speed,
             next_fire_minute: self.next_fire_minute,
             finance_ledger: self.finance_ledger.clone(),
+            automatic_finance_reports: self.automatic_finance_reports,
             tenant_variants: self.tenant_variants.clone(),
             tenant_variant_bags: self.tenant_variant_bags.clone(),
         };
@@ -1217,6 +1238,7 @@ impl App {
         };
         self.next_fire_minute = save.next_fire_minute;
         self.finance_ledger = save.finance_ledger;
+        self.automatic_finance_reports = save.automatic_finance_reports;
         self.finance_ledger.ensure_initialized(self.tower.cash());
         self.tool = ToolMode::Inspect;
         self.view_mode = ViewMode::Edit;
@@ -1229,6 +1251,7 @@ impl App {
         self.elevator_drag = None;
         self.elevator_panel = None;
         self.finance_panel_open = false;
+        self.finance_resume_speed = None;
         self.visual_people_x.clear();
         self.tenant_variants = save.tenant_variants;
         self.tenant_variant_bags = save.tenant_variant_bags;
@@ -1266,7 +1289,7 @@ impl App {
                 || (is_mouse_button_pressed(MouseButton::Left)
                     && finance_ok_rect().contains(vec2(mouse_position().0, mouse_position().1)))
             {
-                self.finance_panel_open = false;
+                self.close_finance_panel();
             }
             return;
         }
@@ -1341,11 +1364,14 @@ impl App {
             let population_by_kind = self.population_by_kind();
             self.finance_ledger
                 .close_quarter(year, quarter, self.tower.cash(), population_by_kind);
-            if self.tower.clock.speed != SimulationSpeed::Paused {
-                self.last_running_speed = self.tower.clock.speed;
-                self.tower.clock.speed = SimulationSpeed::Paused;
+            if self.automatic_finance_reports {
+                if self.tower.clock.speed != SimulationSpeed::Paused {
+                    self.last_running_speed = self.tower.clock.speed;
+                    self.finance_resume_speed = Some(self.tower.clock.speed);
+                    self.tower.clock.speed = SimulationSpeed::Paused;
+                }
+                self.finance_panel_open = true;
             }
-            self.finance_panel_open = true;
         }
         self.traffic.advance(&self.tower, simulation_dt);
         self.update_fire_event(simulation_dt);
@@ -1410,7 +1436,11 @@ impl App {
             };
         }
         if let Some((year, quarter)) = closed_quarter {
-            self.status = format!("Year {year}, Quarter {quarter} financial report");
+            self.status = if self.automatic_finance_reports {
+                format!("Year {year}, Quarter {quarter} financial report")
+            } else {
+                format!("Year {year}, Quarter {quarter} financial report is available")
+            };
             return;
         }
         if self.elevator_panel.is_some() {
@@ -1721,6 +1751,15 @@ impl App {
                 Some(GameMenuAction::New) => self.start_new_tower(),
                 Some(GameMenuAction::Save) => self.begin_save_name_dialog(),
                 Some(GameMenuAction::Load) => self.load_from_picker(),
+                Some(GameMenuAction::AutomaticReports) => {
+                    self.automatic_finance_reports = !self.automatic_finance_reports;
+                    self.status = if self.automatic_finance_reports {
+                        "Automatic financial reports enabled"
+                    } else {
+                        "Automatic financial reports disabled"
+                    }
+                    .to_owned();
+                }
                 Some(GameMenuAction::Quit) => std::process::exit(0),
                 None => {}
             }
@@ -4724,16 +4763,6 @@ impl App {
                 ..Default::default()
             },
         );
-        draw_texture_ex(
-            &self.assets.tower_logo,
-            rect.x + rect.w - 114.0,
-            rect.y + 4.0,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(108.0, 22.0)),
-                ..Default::default()
-            },
-        );
         let current_population = self.population_by_kind();
         let current_period = self.tower.clock.day.saturating_sub(1) / 3;
         let report = self.finance_ledger.last_report.as_ref();
@@ -4765,32 +4794,27 @@ impl App {
         let population_by_kind =
             report.map_or(&current_population, |report| &report.population_by_kind);
         let net = income.saturating_sub(maintenance);
-        draw_text(
-            &year.to_string(),
-            rect.x + 143.0,
-            rect.y + 19.0,
-            11.0,
-            BLACK,
+        let period = format!("Year {year}  •  Quarter {quarter}");
+        draw_rectangle(
+            rect.x + 20.0,
+            rect.y + 4.0,
+            rect.w - 40.0,
+            21.0,
+            CLASSIC_FACE,
         );
-        draw_text(
-            &quarter.to_string(),
-            rect.x + 249.0,
-            rect.y + 19.0,
-            11.0,
-            BLACK,
-        );
-        draw_text(
-            &format!("${income}"),
-            rect.x + 83.0,
+        draw_centered_text(&period, rect.x + rect.w * 0.5, rect.y + 20.0, 15, BLACK);
+        draw_right_aligned_text(
+            &format_currency(income),
+            rect.x + 166.0,
             rect.y + 53.0,
-            12.0,
+            12,
             BLACK,
         );
-        draw_text(
-            &format!("${maintenance}"),
-            rect.x + 250.0,
+        draw_right_aligned_text(
+            &format_currency(maintenance),
+            rect.x + 319.0,
             rect.y + 53.0,
-            12.0,
+            12,
             BLACK,
         );
         for (index, kind) in [
@@ -4809,22 +4833,22 @@ impl App {
         .enumerate()
         {
             let y = rect.y + 91.0 + index as f32 * 12.4;
-            draw_text(
+            draw_right_aligned_text(
                 &population_by_kind
                     .get(&kind)
                     .copied()
                     .unwrap_or(0)
                     .to_string(),
-                rect.x + 93.0,
+                rect.x + 116.0,
                 y,
-                9.0,
+                9,
                 BLACK,
             );
-            draw_text(
-                &income_by_kind.get(&kind).copied().unwrap_or(0).to_string(),
-                rect.x + 145.0,
+            draw_right_aligned_text(
+                &format_number(income_by_kind.get(&kind).copied().unwrap_or(0)),
+                rect.x + 177.0,
                 y,
-                9.0,
+                9,
                 BLACK,
             );
         }
@@ -4843,53 +4867,26 @@ impl App {
         .into_iter()
         .enumerate()
         {
-            draw_text(
-                &maintenance_by_kind
-                    .get(&kind)
-                    .copied()
-                    .unwrap_or(0)
-                    .to_string(),
-                rect.x + 273.0,
+            draw_right_aligned_text(
+                &format_number(maintenance_by_kind.get(&kind).copied().unwrap_or(0)),
+                rect.x + 319.0,
                 rect.y + 91.0 + index as f32 * 12.4,
-                9.0,
+                9,
                 BLACK,
             );
         }
-        draw_text(
-            &format!("${net}"),
-            rect.x + 183.0,
-            rect.y + 268.0,
-            12.0,
-            BLACK,
-        );
-        draw_text(
-            &format!("${other_income}"),
-            rect.x + 183.0,
-            rect.y + 284.0,
-            12.0,
-            BLACK,
-        );
-        draw_text(
-            &format!("-${construction}"),
-            rect.x + 183.0,
-            rect.y + 300.0,
-            12.0,
-            BLACK,
-        );
-        draw_text(
-            &format!("${starting_balance}"),
-            rect.x + 183.0,
-            rect.y + 316.0,
-            12.0,
-            BLACK,
-        );
-        draw_text(
-            &format!("${ending_balance}"),
-            rect.x + 183.0,
-            rect.y + 332.0,
-            12.0,
-            BLACK,
-        );
+        for (value, y) in [
+            (format_currency(net), 243.0),
+            (format_currency(other_income), 259.0),
+            (
+                format_currency(construction.saturating_abs().saturating_neg()),
+                275.0,
+            ),
+            (format_currency(starting_balance), 291.0),
+            (format_currency(ending_balance), 309.0),
+        ] {
+            draw_right_aligned_text(&value, rect.x + 319.0, rect.y + y, 12, BLACK);
+        }
     }
 
     fn handle_elevator_panel_click(&mut self, point: Vec2) {
@@ -5064,15 +5061,23 @@ impl App {
         let menu = game_menu_rect();
         draw_classic_panel(menu);
         let mouse = vec2(mouse_position().0, mouse_position().1);
-        for (index, (_, label)) in GAME_MENU_ACTIONS.iter().enumerate() {
+        for (index, (action, label)) in GAME_MENU_ACTIONS.iter().enumerate() {
             let row = game_menu_entry_rect(index);
             let hovered = row.contains(mouse);
             if hovered {
                 draw_rectangle(row.x, row.y, row.w, row.h, TITLE_BLUE);
             }
+            if *action == GameMenuAction::AutomaticReports && self.automatic_finance_reports {
+                draw_menu_checkmark(row, if hovered { WHITE } else { BLACK });
+            }
             draw_text(
                 label,
-                row.x + 8.0,
+                row.x
+                    + if *action == GameMenuAction::AutomaticReports {
+                        25.0
+                    } else {
+                        8.0
+                    },
                 row.y + 17.0,
                 14.0,
                 if hovered { WHITE } else { BLACK },
@@ -6113,7 +6118,7 @@ fn game_menu_rect() -> Rect {
     Rect::new(
         6.0,
         31.0,
-        112.0,
+        158.0,
         7.0 + GAME_MENU_ACTIONS.len() as f32 * 24.0,
     )
 }
@@ -6345,6 +6350,59 @@ fn submenu_entry_rect(index: usize) -> Rect {
     )
 }
 
+fn format_number(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.saturating_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    if negative {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+fn format_currency(value: i64) -> String {
+    if value < 0 {
+        format!("-${}", format_number(value.saturating_abs()))
+    } else {
+        format!("${}", format_number(value))
+    }
+}
+
+fn draw_centered_text(text: &str, center_x: f32, baseline_y: f32, font_size: u16, color: Color) {
+    let width = measure_text(text, None, font_size, 1.0).width;
+    draw_text(
+        text,
+        (center_x - width * 0.5).round(),
+        baseline_y.round(),
+        f32::from(font_size),
+        color,
+    );
+}
+
+fn draw_right_aligned_text(
+    text: &str,
+    right_x: f32,
+    baseline_y: f32,
+    font_size: u16,
+    color: Color,
+) {
+    let width = measure_text(text, None, font_size, 1.0).width;
+    draw_text(
+        text,
+        (right_x - width).round(),
+        baseline_y.round(),
+        f32::from(font_size),
+        color,
+    );
+}
+
 fn draw_classic_panel(rect: Rect) {
     draw_rectangle(rect.x, rect.y, rect.w, rect.h, CLASSIC_FACE);
     draw_line(rect.x, rect.y, rect.x + rect.w, rect.y, 2.0, CLASSIC_LIGHT);
@@ -6480,7 +6538,7 @@ fn finance_panel_rect() -> Rect {
 
 fn finance_ok_rect() -> Rect {
     let panel = finance_panel_rect();
-    Rect::new(panel.x + 130.0, panel.y + 334.0, 96.0, 24.0)
+    Rect::new(panel.x + 130.0, panel.y + 326.0, 94.0, 23.0)
 }
 
 fn promotion_dialog_rect() -> Rect {
@@ -6702,7 +6760,7 @@ struct OriginalAssets {
     elevator_numbers: [Texture2D; 6],
     star_on: Texture2D,
     star_off: Texture2D,
-    tower_logo: Texture2D,
+    _tower_logo: Texture2D,
     finance_dialog: Texture2D,
     fire_large: [Texture2D; 4],
     fire_small: Texture2D,
@@ -6825,7 +6883,7 @@ impl OriginalAssets {
                 .map_err(|_| "elevator number texture count mismatch".to_owned())?,
             star_on: texture_from_star_bmp(STAR_ON_BMP, true)?,
             star_off: texture_from_star_bmp(STAR_OFF_BMP, false)?,
-            tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
+            _tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
             finance_dialog: texture_from_bmp(FINANCE_DIALOG_BMP)?,
             fire_large: FIRE_LARGE_BMPS
                 .map(texture_from_bmp_with_white_transparency)
@@ -8502,11 +8560,11 @@ mod tests {
     }
 
     #[test]
-    fn game_menu_exposes_wired_new_save_load_and_quit_rows() {
-        assert_eq!(GAME_MENU_ACTIONS.len(), 4);
+    fn game_menu_exposes_file_actions_and_automatic_report_toggle() {
+        assert_eq!(GAME_MENU_ACTIONS.len(), 5);
         assert_eq!(
             GAME_MENU_ACTIONS.map(|(_, label)| label),
-            ["New", "Save", "Load", "Quit"]
+            ["New", "Save", "Load", "Automatic reports", "Quit"]
         );
         for (index, (action, _)) in GAME_MENU_ACTIONS.iter().enumerate() {
             assert_eq!(
@@ -8559,6 +8617,7 @@ mod tests {
                 maintenance: 4_000,
                 ..FinanceLedger::default()
             },
+            automatic_finance_reports: false,
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
         };
@@ -8569,8 +8628,16 @@ mod tests {
         assert_eq!(decoded.traffic, traffic);
         assert_eq!(decoded.last_running_speed, SimulationSpeed::Triple);
         assert_eq!(decoded.finance_ledger.tenant_income, 25_000);
+        assert!(!decoded.automatic_finance_reports);
         decoded.tower.validate_save_state().unwrap();
         decoded.traffic.validate_save_state(&decoded.tower).unwrap();
+    }
+
+    #[test]
+    fn report_currency_is_grouped_and_keeps_the_sign_before_the_dollar() {
+        assert_eq!(format_number(2_000_000), "2,000,000");
+        assert_eq!(format_currency(2_000_000), "$2,000,000");
+        assert_eq!(format_currency(-12_345), "-$12,345");
     }
 
     #[test]
