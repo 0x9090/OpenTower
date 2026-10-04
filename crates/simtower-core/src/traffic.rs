@@ -164,6 +164,8 @@ pub struct TrafficSimulation {
     #[serde(default)]
     reachable_facilities: HashSet<u64>,
     #[serde(default)]
+    routes_from_lobby: HashMap<u64, TravelMode>,
+    #[serde(default)]
     topology_signature: u64,
     #[serde(default)]
     current_visitors: HashMap<u64, usize>,
@@ -183,6 +185,7 @@ impl Default for TrafficSimulation {
             elevators: Vec::new(),
             arrived_facilities: HashSet::new(),
             reachable_facilities: HashSet::new(),
+            routes_from_lobby: HashMap::new(),
             topology_signature: 0,
             current_visitors: HashMap::new(),
             daily_visits: HashMap::new(),
@@ -357,6 +360,16 @@ impl TrafficSimulation {
     }
 
     pub fn sync_with_tower(&mut self, tower: &Tower) {
+        let signature = tower_topology_signature(tower);
+        let route_cache_complete = self.routes_from_lobby.len() == self.reachable_facilities.len()
+            && self
+                .reachable_facilities
+                .iter()
+                .all(|facility_id| self.routes_from_lobby.contains_key(facility_id));
+        if self.topology_signature == signature && route_cache_complete {
+            return;
+        }
+
         let mut groups: Vec<(FacilityKind, u16, u64, Vec<i16>)> = Vec::new();
         for facility in tower.facilities().iter().filter(|facility| {
             matches!(
@@ -423,25 +436,22 @@ impl TrafficSimulation {
         }
         self.elevators = synchronized;
 
-        let signature = tower_topology_signature(tower);
-        if self.topology_signature != signature {
-            self.reachable_facilities = tower
-                .facilities()
-                .iter()
-                .filter(|facility| facility.kind.has_tenant_occupancy())
-                .filter(|facility| {
-                    route_from_first_floor_lobby(
-                        endpoint(facility),
-                        &self.elevators,
-                        tower.facilities(),
-                        tower.floors(),
-                    )
-                    .is_some()
-                })
-                .map(|facility| facility.id)
-                .collect();
-            self.topology_signature = signature;
-        }
+        self.routes_from_lobby = tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind.has_tenant_occupancy())
+            .filter_map(|facility| {
+                route_from_first_floor_lobby(
+                    endpoint(facility),
+                    &self.elevators,
+                    tower.facilities(),
+                    tower.floors(),
+                )
+                .map(|route| (facility.id, route))
+            })
+            .collect();
+        self.reachable_facilities = self.routes_from_lobby.keys().copied().collect();
+        self.topology_signature = signature;
 
         let live_facilities: HashSet<u64> = tower
             .facilities()
@@ -464,6 +474,16 @@ impl TrafficSimulation {
             return;
         }
         self.sync_with_tower(tower);
+        self.advance_after_sync(tower, elapsed_seconds);
+    }
+
+    /// Advances traffic after the caller has already synchronized tower
+    /// topology for this frame. The desktop needs reachability before its
+    /// economy tick, so this avoids hashing and checking the same tower twice.
+    pub fn advance_after_sync(&mut self, tower: &Tower, elapsed_seconds: f32) {
+        if elapsed_seconds <= 0.0 {
+            return;
+        }
         if self.patronage_day != tower.clock.day {
             self.patronage_day = tower.clock.day;
             self.daily_visits.clear();
@@ -542,13 +562,10 @@ impl TrafficSimulation {
                 {
                     return None;
                 }
-                route_from_first_floor_lobby(
-                    endpoint(facility),
-                    &self.elevators,
-                    tower.facilities(),
-                    tower.floors(),
-                )
-                .map(|route| (facility, route))
+                self.routes_from_lobby
+                    .get(&facility.id)
+                    .copied()
+                    .map(|route| (facility, route))
             })
             .collect();
         if destinations.is_empty() {
@@ -559,16 +576,16 @@ impl TrafficSimulation {
         // Balance arrivals by each tenant's assigned/capacity ratio. The old
         // weighted lottery could send several people to one office while an
         // equally reachable office stayed empty throughout the workday.
+        let mut assigned_by_facility = HashMap::new();
+        for person in self.people.iter().filter(|person| !person.going_home) {
+            *assigned_by_facility
+                .entry(person.destination_facility_id)
+                .or_insert(0_usize) += 1;
+        }
         let mut least_loaded = Vec::new();
         let mut best_load = None::<(usize, usize)>;
         for &(facility, route) in &destinations {
-            let assigned = self
-                .people
-                .iter()
-                .filter(|person| {
-                    !person.going_home && person.destination_facility_id == facility.id
-                })
-                .count();
+            let assigned = assigned_by_facility.get(&facility.id).copied().unwrap_or(0);
             let capacity = facility.kind.population_capacity().max(1) as usize;
             if assigned >= capacity {
                 continue;
@@ -1522,6 +1539,41 @@ mod tests {
         assert_eq!(traffic.elevators[0].served_floors, vec![1, 2]);
         assert_eq!(traffic.elevators[0].cars.len(), 1);
         assert_eq!(traffic.elevators[0].cars[0].home_floor, 1);
+    }
+
+    #[test]
+    fn lobby_routes_are_cached_until_tower_topology_changes() {
+        let mut tower = traffic_tower(true);
+        let office_id = tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.kind == FacilityKind::Office)
+            .unwrap()
+            .id;
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        assert!(matches!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(TravelMode::Elevator { .. })
+        ));
+
+        // A sentinel route survives a no-op sync, demonstrating that the
+        // costly path search is not repeated on every simulation frame.
+        traffic
+            .routes_from_lobby
+            .insert(office_id, TravelMode::SameFloor);
+        traffic.sync_with_tower(&tower);
+        assert_eq!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(&TravelMode::SameFloor)
+        );
+
+        tower.place_floor(GridPosition { x: 63, floor: 3 }).unwrap();
+        traffic.sync_with_tower(&tower);
+        assert!(matches!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(TravelMode::Elevator { .. })
+        ));
     }
 
     #[test]

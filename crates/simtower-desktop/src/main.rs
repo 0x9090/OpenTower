@@ -1373,7 +1373,7 @@ impl App {
                 self.finance_panel_open = true;
             }
         }
-        self.traffic.advance(&self.tower, simulation_dt);
+        self.traffic.advance_after_sync(&self.tower, simulation_dt);
         self.update_fire_event(simulation_dt);
         if let Some((_, remaining)) = &mut self.fire_aftermath {
             *remaining -= simulation_dt;
@@ -4241,6 +4241,23 @@ impl App {
             .iter()
             .map(|facility| (facility.id, facility.kind))
             .collect::<HashMap<_, _>>();
+        let mut queued_per_stop = HashMap::<(u64, i16), usize>::new();
+        let queue_ranks = self
+            .traffic
+            .people()
+            .iter()
+            .filter_map(|person| {
+                let PersonActivity::WaitingForElevator { shaft_id } = person.activity else {
+                    return None;
+                };
+                let rank = queued_per_stop
+                    .entry((shaft_id, person.current_floor))
+                    .or_default();
+                let result = (person.id, *rank);
+                *rank += 1;
+                Some(result)
+            })
+            .collect::<HashMap<_, _>>();
         for person in self.traffic.people() {
             if matches!(
                 person.activity,
@@ -4257,7 +4274,7 @@ impl App {
                 .unwrap_or(person.x);
             let x = match person.activity {
                 PersonActivity::WaitingForElevator { shaft_id } => self
-                    .elevator_queue_draw_x(shaft_id, person.current_floor, person.id)
+                    .elevator_queue_draw_x(shaft_id, *queue_ranks.get(&person.id).unwrap_or(&0))
                     .unwrap_or((visual_x - self.camera_x) * CELL_WIDTH - 4.0),
                 _ => (visual_x - self.camera_x) * CELL_WIDTH - 4.0,
             };
@@ -4311,26 +4328,13 @@ impl App {
         }
     }
 
-    fn elevator_queue_draw_x(&self, shaft_id: u64, floor: i16, person_id: u64) -> Option<f32> {
+    fn elevator_queue_draw_x(&self, shaft_id: u64, rank: usize) -> Option<f32> {
         let shaft = self
             .traffic
             .elevators()
             .iter()
             .find(|shaft| shaft.id == shaft_id)?;
-        let rank = self
-            .traffic
-            .people()
-            .iter()
-            .filter(|queued| {
-                queued.current_floor == floor
-                    && matches!(
-                        queued.activity,
-                        PersonActivity::WaitingForElevator { shaft_id: queued_shaft }
-                            if queued_shaft == shaft_id
-                    )
-            })
-            .position(|queued| queued.id == person_id)?
-            .min(MAX_ELEVATOR_QUEUE_PER_FLOOR.saturating_sub(1));
+        let rank = rank.min(MAX_ELEVATOR_QUEUE_PER_FLOOR.saturating_sub(1));
         let shaft_left = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
         let shaft_right = shaft_left + f32::from(shaft.kind.spec().width) * CELL_WIDTH;
         let left_cells = usize::from(shaft.x);
