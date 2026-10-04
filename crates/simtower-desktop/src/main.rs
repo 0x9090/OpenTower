@@ -76,6 +76,7 @@ const LOBBY_SEGMENT_SOUND_ID: u16 = 7001;
 const NO_MONEY_SOUND_ID: u16 = 7002;
 const DEMOLITION_SOUND_ID: u16 = 7003;
 const PAYMENT_SOUND_ID: u16 = 10013;
+const FIRE_RESPONSE_SOUND_ID: u16 = 10004;
 const ELEVATOR_MOVE_SOUND_ID: u16 = 6000;
 const ELEVATOR_OPEN_SOUND_IDS: [u16; 2] = [6001, 6002];
 const ELEVATOR_BELL_DIVISOR: u8 = 5;
@@ -84,6 +85,7 @@ const PAYMENT_SOUND_INTERVAL: f32 = 0.5;
 const FIRE_RESCUE_COST: i64 = 300_000;
 const FIRE_QUICK_RESPONSE_SECONDS: f32 = 22.0;
 const FIRE_HELICOPTER_DURATION_SECONDS: f32 = 12.0;
+const FIRE_RESPONSE_DECISION_SECONDS: f32 = 8.0;
 const QUEUE_CONCERNED_PINK: [u8; 3] = [255, 92, 152];
 const CROWD_SOUND_ID: u16 = 8000;
 const RESTAURANT_AMBIENCE_IDS: &[u16] = &[1384, 1385];
@@ -283,9 +285,11 @@ struct TreasurePopup {
 struct FireEventState {
     facility_id: u64,
     elapsed: f32,
+    decision_elapsed: f32,
     duration: f32,
     response: FireResponse,
     saves_unit: bool,
+    security_start_x: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1328,7 +1332,7 @@ impl App {
             .fire_event
             .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
         {
-            self.update_fire_response_dialog();
+            self.update_fire_response_dialog(dt);
             return;
         }
         self.finance_ledger.ensure_initialized(self.tower.cash());
@@ -1623,22 +1627,31 @@ impl App {
         self.fire_event = Some(FireEventState {
             facility_id,
             elapsed: 0.0,
+            decision_elapsed: 0.0,
             duration: 0.0,
             response: FireResponse::AwaitingDecision,
             saves_unit: false,
+            security_start_x: None,
         });
         self.status = format!(
             "Fire reported in tenant #{facility_id}; choose emergency response — speed set to 1x"
         );
     }
 
-    fn update_fire_response_dialog(&mut self) {
+    fn update_fire_response_dialog(&mut self, dt: f32) {
+        if let Some(event) = &mut self.fire_event {
+            event.decision_elapsed =
+                (event.decision_elapsed + dt).min(FIRE_RESPONSE_DECISION_SECONDS);
+        }
         let mouse = vec2(mouse_position().0, mouse_position().1);
         let choose_helicopter = is_key_pressed(KeyCode::H)
             || (is_mouse_button_pressed(MouseButton::Left)
                 && fire_helicopter_button_rect().contains(mouse));
         let choose_security = is_key_pressed(KeyCode::S)
             || is_key_pressed(KeyCode::Escape)
+            || self
+                .fire_event
+                .is_some_and(|event| event.decision_elapsed >= FIRE_RESPONSE_DECISION_SECONDS)
             || (is_mouse_button_pressed(MouseButton::Left)
                 && fire_security_button_rect().contains(mouse));
 
@@ -1675,7 +1688,7 @@ impl App {
                 self.fire_event = None;
                 return;
             };
-            let Some(response_seconds) = security_fire_response_seconds(
+            let Some((security_id, response_seconds)) = nearest_security_fire_response(
                 target,
                 self.tower
                     .facilities()
@@ -1686,12 +1699,23 @@ impl App {
                     "No Security Office can respond; call the fire rescue helicopter".to_owned();
                 return;
             };
+            let security_start_x = self
+                .tower
+                .facilities()
+                .iter()
+                .find(|facility| facility.id == security_id)
+                .map(|security| {
+                    security_team_start_x(target, security, self.tower.floors(), self.tower.width())
+                })
+                .unwrap_or(f32::from(target.position.x));
             if let Some(event) = &mut self.fire_event {
                 event.response = FireResponse::Security;
                 event.elapsed = 0.0;
                 event.duration = response_seconds + 6.0;
                 event.saves_unit = response_seconds <= FIRE_QUICK_RESPONSE_SECONDS;
+                event.security_start_x = Some(security_start_x);
             }
+            self.assets.sounds.play_fire_response();
             self.status = if response_seconds <= FIRE_QUICK_RESPONSE_SECONDS {
                 "Security is close enough to save the tenant".to_owned()
             } else {
@@ -3528,10 +3552,7 @@ impl App {
     }
 
     fn draw_fire_response(&self) {
-        let Some(event) = self
-            .fire_event
-            .filter(|event| event.response == FireResponse::Helicopter)
-        else {
+        let Some(event) = self.fire_event else {
             return;
         };
         let Some(target) = self
@@ -3542,22 +3563,45 @@ impl App {
         else {
             return;
         };
-        let target_x = (f32::from(target.position.x) - self.camera_x) * CELL_WIDTH;
-        let target_width = f32::from(target.kind.spec().width) * CELL_WIDTH;
-        let destination_x = target_x + target_width * 0.5 - 48.0;
-        let approach = (event.elapsed / 5.0).clamp(0.0, 1.0);
-        let helicopter_x = -110.0 + (destination_x + 110.0) * approach;
-        let helicopter_y = floor_top_y(self.ground_y(), target.position.floor) - 43.0;
-        draw_texture_ex(
-            &self.assets.fire_helicopter,
-            helicopter_x,
-            helicopter_y,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(96.0, 36.0)),
-                ..Default::default()
-            },
-        );
+        match event.response {
+            FireResponse::Helicopter => {
+                let target_x = (f32::from(target.position.x) - self.camera_x) * CELL_WIDTH;
+                let target_width = f32::from(target.kind.spec().width) * CELL_WIDTH;
+                let destination_x = target_x + target_width * 0.5 - 48.0;
+                let approach = (event.elapsed / 5.0).clamp(0.0, 1.0);
+                let helicopter_x = -110.0 + (destination_x + 110.0) * approach;
+                let helicopter_y = floor_top_y(self.ground_y(), target.position.floor) - 43.0;
+                draw_texture_ex(
+                    &self.assets.fire_helicopter,
+                    helicopter_x,
+                    helicopter_y,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(96.0, 36.0)),
+                        ..Default::default()
+                    },
+                );
+            }
+            FireResponse::Security => self.draw_security_response_team(event, target),
+            FireResponse::AwaitingDecision => {}
+        }
+    }
+
+    fn draw_security_response_team(&self, event: FireEventState, target: &Facility) {
+        let target_center =
+            f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
+        let start_x = event.security_start_x.unwrap_or(target_center);
+        let travel_seconds = (event.duration - 6.0).max(0.1);
+        let progress = (event.elapsed / travel_seconds).clamp(0.0, 1.0);
+        let team_world_x = start_x + (target_center - start_x) * progress;
+        let screen_x = (team_world_x - self.camera_x) * CELL_WIDTH;
+        let y = tenant_room_top_y(self.ground_y(), target.position.floor);
+        let direction = (target_center - start_x).signum();
+        let frame = ((event.elapsed * 6.0) as u64) % 2;
+        for member in 0..3 {
+            let trailing_offset = member as f32 * 7.0 * -direction;
+            self.draw_person_frame(2, frame, screen_x - 4.0 + trailing_offset, y, WHITE);
+        }
     }
 
     fn draw_fire_response_dialog(&self) {
@@ -3609,6 +3653,16 @@ impl App {
             "Security is free, but a distant response may be too late.",
             panel.x + 116.0,
             panel.y + 113.0,
+            15.0,
+            BLACK,
+        );
+        let remaining = self.fire_event.map_or(0, |event| {
+            fire_response_timeout_remaining(event.decision_elapsed)
+        });
+        draw_text(
+            &format!("Security dispatches automatically in {remaining} seconds."),
+            panel.x + 116.0,
+            panel.y + 137.0,
             15.0,
             BLACK,
         );
@@ -6845,7 +6899,7 @@ fn promotion_ok_rect() -> Rect {
 
 fn fire_response_dialog_rect() -> Rect {
     let width = 540.0;
-    let height = 190.0;
+    let height = 210.0;
     Rect::new(
         (screen_width() - width) * 0.5,
         ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
@@ -6856,12 +6910,12 @@ fn fire_response_dialog_rect() -> Rect {
 
 fn fire_helicopter_button_rect() -> Rect {
     let panel = fire_response_dialog_rect();
-    Rect::new(panel.x + 116.0, panel.y + 140.0, 190.0, 30.0)
+    Rect::new(panel.x + 116.0, panel.y + 160.0, 190.0, 30.0)
 }
 
 fn fire_security_button_rect() -> Rect {
     let panel = fire_response_dialog_rect();
-    Rect::new(panel.x + 322.0, panel.y + 140.0, 190.0, 30.0)
+    Rect::new(panel.x + 322.0, panel.y + 160.0, 190.0, 30.0)
 }
 
 const fn promotion_rating_label(star_rating: u8) -> &'static str {
@@ -7994,6 +8048,7 @@ struct NativeSounds {
     demolition: PathBuf,
     no_money: PathBuf,
     payment: PathBuf,
+    fire_response: PathBuf,
     elevator_move: PathBuf,
     elevator_open: [PathBuf; 2],
     crowd: PathBuf,
@@ -8010,6 +8065,7 @@ impl NativeSounds {
         let demolition = directory.join(format!("demolition-{DEMOLITION_SOUND_ID}.wav"));
         let no_money = directory.join(format!("no-money-{NO_MONEY_SOUND_ID}.wav"));
         let payment = directory.join(format!("payment-{PAYMENT_SOUND_ID}.wav"));
+        let fire_response = directory.join(format!("fire-response-{FIRE_RESPONSE_SOUND_ID}.wav"));
         let elevator_move = directory.join(format!("elevator-move-{ELEVATOR_MOVE_SOUND_ID}.wav"));
         let elevator_open =
             ELEVATOR_OPEN_SOUND_IDS.map(|id| directory.join(format!("elevator-open-{id}.wav")));
@@ -8021,6 +8077,8 @@ impl NativeSounds {
         std::fs::write(&demolition, DEMOLITION_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&no_money, NO_MONEY_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&payment, PAYMENT_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&fire_response, FIRE_RESPONSE_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
         std::fs::write(&elevator_move, ELEVATOR_MOVE_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
         for (path, bytes) in elevator_open
@@ -8036,6 +8094,7 @@ impl NativeSounds {
             demolition,
             no_money,
             payment,
+            fire_response,
             elevator_move,
             elevator_open,
             crowd,
@@ -8089,6 +8148,13 @@ impl NativeSounds {
             return;
         }
         play_native_sound_async(self.payment.clone());
+    }
+
+    fn play_fire_response(&self) {
+        if self.is_muted() {
+            return;
+        }
+        play_native_sound_async(self.fire_response.clone());
     }
 
     fn play_elevator_move(&self) {
@@ -8235,10 +8301,10 @@ fn apply_emergency_speed(clock: &mut Clock, last_running_speed: &mut SimulationS
     *last_running_speed = SimulationSpeed::Normal;
 }
 
-fn security_fire_response_seconds<'a>(
+fn nearest_security_fire_response<'a>(
     target: &Facility,
     security_offices: impl Iterator<Item = &'a Facility>,
-) -> Option<f32> {
+) -> Option<(u64, f32)> {
     security_offices
         .map(|security| {
             let floor_distance = (security.position.floor - target.position.floor).unsigned_abs();
@@ -8247,9 +8313,45 @@ fn security_fire_response_seconds<'a>(
             let security_center =
                 f32::from(security.position.x) + f32::from(security.kind.spec().width) * 0.5;
             let horizontal_distance = (security_center - target_center).abs();
-            8.0 + f32::from(floor_distance) * 3.0 + horizontal_distance * 0.05
+            (
+                security.id,
+                8.0 + f32::from(floor_distance) * 3.0 + horizontal_distance * 0.05,
+            )
         })
-        .min_by(|left, right| left.total_cmp(right))
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+fn security_team_start_x(
+    target: &Facility,
+    security: &Facility,
+    floors: &[GridPosition],
+    tower_width: u16,
+) -> f32 {
+    if target.position.floor == security.position.floor {
+        return f32::from(security.position.x) + f32::from(security.kind.spec().width) * 0.5;
+    }
+    let left = floors
+        .iter()
+        .filter(|position| position.floor == target.position.floor)
+        .map(|position| position.x)
+        .min()
+        .unwrap_or(0);
+    let right = floors
+        .iter()
+        .filter(|position| position.floor == target.position.floor)
+        .map(|position| position.x.saturating_add(1))
+        .max()
+        .unwrap_or(tower_width);
+    let target_center = f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
+    if (target_center - f32::from(left)).abs() <= (f32::from(right) - target_center).abs() {
+        f32::from(left)
+    } else {
+        f32::from(right)
+    }
+}
+
+fn fire_response_timeout_remaining(elapsed: f32) -> u32 {
+    (FIRE_RESPONSE_DECISION_SECONDS - elapsed).max(0.0).ceil() as u32
 }
 
 fn fire_strip_segments(
@@ -8691,12 +8793,54 @@ mod tests {
             position: GridPosition { x: 180, floor: 1 },
             ..nearby.clone()
         };
-        let nearby_seconds =
-            security_fire_response_seconds(&target, std::iter::once(&nearby)).unwrap();
-        let distant_seconds =
-            security_fire_response_seconds(&target, std::iter::once(&distant)).unwrap();
+        let (_, nearby_seconds) =
+            nearest_security_fire_response(&target, std::iter::once(&nearby)).unwrap();
+        let (_, distant_seconds) =
+            nearest_security_fire_response(&target, std::iter::once(&distant)).unwrap();
         assert!(nearby_seconds <= FIRE_QUICK_RESPONSE_SECONDS);
         assert!(distant_seconds > FIRE_QUICK_RESPONSE_SECONDS);
+    }
+
+    #[test]
+    fn fire_dialog_counts_down_before_automatic_security_dispatch() {
+        assert_eq!(fire_response_timeout_remaining(0.0), 8);
+        assert_eq!(fire_response_timeout_remaining(0.1), 8);
+        assert_eq!(fire_response_timeout_remaining(7.1), 1);
+        assert_eq!(fire_response_timeout_remaining(8.0), 0);
+        assert_eq!(fire_response_timeout_remaining(20.0), 0);
+    }
+
+    #[test]
+    fn security_team_enters_from_the_nearest_outside_stair_on_other_floors() {
+        let target = Facility {
+            id: 1,
+            kind: FacilityKind::Shop,
+            position: GridPosition { x: 10, floor: 6 },
+            occupancy: simtower_core::FacilityOccupancy::Occupied,
+            price_level: 1,
+            stories: 1,
+        };
+        let security = Facility {
+            id: 2,
+            kind: FacilityKind::Security,
+            position: GridPosition { x: 100, floor: 2 },
+            occupancy: simtower_core::FacilityOccupancy::NotApplicable,
+            price_level: 1,
+            stories: 1,
+        };
+        let floors = (4..80)
+            .map(|x| GridPosition { x, floor: 6 })
+            .collect::<Vec<_>>();
+        assert_eq!(security_team_start_x(&target, &security, &floors, 256), 4.0);
+
+        let same_floor_security = Facility {
+            position: GridPosition { x: 52, floor: 6 },
+            ..security
+        };
+        assert_eq!(
+            security_team_start_x(&target, &same_floor_security, &floors, 256),
+            60.0
+        );
     }
 
     #[test]
@@ -8882,6 +9026,7 @@ mod tests {
             demolition: PathBuf::new(),
             no_money: PathBuf::new(),
             payment: PathBuf::new(),
+            fire_response: PathBuf::new(),
             elevator_move: PathBuf::new(),
             elevator_open: [PathBuf::new(), PathBuf::new()],
             crowd: PathBuf::new(),
@@ -9335,6 +9480,7 @@ mod tests {
         assert_eq!(NO_MONEY_SOUND_ID, 7002);
         assert_eq!(DEMOLITION_SOUND_ID, 7003);
         assert_eq!(PAYMENT_SOUND_ID, 10013);
+        assert_eq!(FIRE_RESPONSE_SOUND_ID, 10004);
         assert_eq!(ELEVATOR_MOVE_SOUND_ID, 6000);
         assert_eq!(ELEVATOR_OPEN_SOUND_IDS, [6001, 6002]);
         assert_eq!(CROWD_SOUND_ID, 8000);
@@ -9391,6 +9537,10 @@ mod tests {
         let payment_sound = simtower_formats::inspect_wave(PAYMENT_WAV.bytes().unwrap())
             .expect("payment sound resource must be a valid WAVE file");
         assert_eq!(payment_sound.channels, 1);
+        let fire_response_sound =
+            simtower_formats::inspect_wave(FIRE_RESPONSE_WAV.bytes().unwrap())
+                .expect("fire response sound resource must be a valid WAVE file");
+        assert_eq!(fire_response_sound.channels, 1);
         for bytes in [
             ELEVATOR_MOVE_WAV,
             ELEVATOR_OPEN_1_WAV,

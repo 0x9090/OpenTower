@@ -351,6 +351,7 @@ pub(crate) const LOBBY_SEGMENT_WAV: AssetRef = sound_asset!(7001);
 pub(crate) const NO_MONEY_WAV: AssetRef = sound_asset!(7002);
 pub(crate) const DEMOLITION_WAV: AssetRef = sound_asset!(7003);
 pub(crate) const PAYMENT_WAV: AssetRef = sound_asset!(10013);
+pub(crate) const FIRE_RESPONSE_WAV: AssetRef = sound_asset!(10004);
 pub(crate) const ELEVATOR_MOVE_WAV: AssetRef = sound_asset!(6000);
 pub(crate) const ELEVATOR_OPEN_1_WAV: AssetRef = sound_asset!(6001);
 pub(crate) const ELEVATOR_OPEN_2_WAV: AssetRef = sound_asset!(6002);
