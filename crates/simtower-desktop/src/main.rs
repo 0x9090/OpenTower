@@ -1414,7 +1414,12 @@ impl App {
             self.status = format!("Tower promoted to {current_rating} stars");
         }
         self.last_star_rating = current_rating;
-        self.people_animation_seconds += f64::from(simulation_dt);
+        // Visual interpolation uses wall-clock frame time, not accelerated
+        // simulation time. At 5x/10x the old code advanced a two-frame walk
+        // cycle dozens of times per second and snapped visual positions to
+        // every simulation step, which looked like flicker and stutter.
+        let visual_dt = visual_animation_delta(dt, self.tower.clock.speed);
+        self.people_animation_seconds += f64::from(visual_dt);
         self.simulation_sounds.queue_payments(&income_events);
         self.simulation_sounds.update(
             dt,
@@ -1422,7 +1427,7 @@ impl App {
             &self.assets.sounds,
             self.tower.clock.speed == SimulationSpeed::Paused,
         );
-        self.update_people_visuals(simulation_dt);
+        self.update_people_visuals(visual_dt);
         for animation in &mut self.construction {
             animation.remaining -= dt;
         }
@@ -1770,7 +1775,7 @@ impl App {
             .collect::<HashSet<_>>();
         self.visual_people_x
             .retain(|id, _| live_people.contains(id));
-        let blend = 1.0 - (-12.0 * dt).exp();
+        let blend = 1.0 - (-10.0 * dt).exp();
         for person in self.traffic.people() {
             let visual_x = self.visual_people_x.entry(person.id).or_insert(person.x);
             *visual_x += (person.x - *visual_x) * blend;
@@ -3611,8 +3616,17 @@ impl App {
             // The first pair is the equipment-carrying walk cycle. At the
             // scene, freeze on the original clean working pose; alternating
             // substantially different poses while stationary caused flashing.
-            let frame = security_team_animation_frame(event.elapsed, arrived, member);
-            self.draw_person_frame(2, frame, screen_x - 4.0 + trailing_offset, y, WHITE);
+            for (frame, weight) in security_team_animation_frames(event.elapsed, arrived, member) {
+                if weight > 0.01 {
+                    self.draw_person_frame(
+                        2,
+                        frame,
+                        screen_x - 4.0 + trailing_offset,
+                        y,
+                        with_alpha(WHITE, weight),
+                    );
+                }
+            }
         }
     }
 
@@ -5783,8 +5797,11 @@ impl App {
 }
 
 fn person_walk_frame_weights(animation_seconds: f64, person_id: u64, paused: bool) -> (f32, f32) {
+    // A deliberately modest cadence keeps the original two-cel sprites
+    // readable. Rendering time is independent of game speed, so 10x affects
+    // travel distance without turning this into a high-frequency flicker.
     let phase =
-        ((animation_seconds * 3.5 + person_id as f64 * 0.37) * std::f64::consts::TAU).cos() as f32;
+        ((animation_seconds * 2.2 + person_id as f64 * 0.37) * std::f64::consts::TAU).cos() as f32;
     let next_weight = phase.mul_add(-0.5, 0.5);
     if paused {
         if next_weight < 0.5 {
@@ -5794,6 +5811,14 @@ fn person_walk_frame_weights(animation_seconds: f64, person_id: u64, paused: boo
         }
     } else {
         (1.0 - next_weight, next_weight)
+    }
+}
+
+fn visual_animation_delta(frame_dt: f32, speed: SimulationSpeed) -> f32 {
+    if speed == SimulationSpeed::Paused {
+        0.0
+    } else {
+        frame_dt
     }
 }
 
@@ -8366,11 +8391,12 @@ fn fire_response_timeout_remaining(elapsed: f32) -> u32 {
     (FIRE_RESPONSE_DECISION_SECONDS - elapsed).max(0.0).ceil() as u32
 }
 
-fn security_team_animation_frame(elapsed: f32, arrived: bool, member: usize) -> u64 {
+fn security_team_animation_frames(elapsed: f32, arrived: bool, member: usize) -> [(u64, f32); 2] {
     if arrived {
-        4
+        [(4, 1.0), (4, 0.0)]
     } else {
-        (((elapsed * 6.0) as u64) + member as u64) % 2
+        let (first, second) = person_walk_frame_weights(f64::from(elapsed), member as u64, false);
+        [(0, first), (1, second)]
     }
 }
 
@@ -8832,13 +8858,16 @@ mod tests {
 
     #[test]
     fn security_team_holds_one_clean_frame_after_arrival() {
-        assert_ne!(
-            security_team_animation_frame(0.0, false, 0),
-            security_team_animation_frame(0.2, false, 0)
-        );
+        let walking = security_team_animation_frames(0.1, false, 0);
+        assert_eq!(walking[0].0, 0);
+        assert_eq!(walking[1].0, 1);
+        assert!((walking[0].1 + walking[1].1 - 1.0).abs() < f32::EPSILON);
         for elapsed in [0.0, 0.2, 1.0, 20.0] {
             for member in 0..3 {
-                assert_eq!(security_team_animation_frame(elapsed, true, member), 4);
+                assert_eq!(
+                    security_team_animation_frames(elapsed, true, member),
+                    [(4, 1.0), (4, 0.0)]
+                );
             }
         }
     }
@@ -9343,6 +9372,23 @@ mod tests {
 
         let (current, next) = person_walk_frame_weights(0.125, 17, false);
         assert!((current + next - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn person_animation_cadence_is_independent_of_game_speed() {
+        let frame_dt = 1.0 / 60.0;
+        assert_eq!(
+            visual_animation_delta(frame_dt, SimulationSpeed::Normal),
+            frame_dt
+        );
+        assert_eq!(
+            visual_animation_delta(frame_dt, SimulationSpeed::Tenfold),
+            frame_dt
+        );
+        assert_eq!(
+            visual_animation_delta(frame_dt, SimulationSpeed::Paused),
+            0.0
+        );
     }
 
     #[test]
