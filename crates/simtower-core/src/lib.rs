@@ -90,7 +90,7 @@ impl FacilityKind {
         match self {
             // Lobbies are variable-length structural strips in the original.
             // Each placement is one slice so click-dragging can extend them.
-            Self::Lobby => FacilitySpec::new("Lobby", 1, 1, 5_000),
+            Self::Lobby => FacilitySpec::new("Lobby", 1, 1, 1_250),
             Self::Office => FacilitySpec::new("Office", 9, 1, 40_000),
             Self::Condo => FacilitySpec::new("Condominium", 16, 1, 80_000),
             Self::HotelSingle => FacilitySpec::new("Single hotel room", 4, 1, 20_000),
@@ -1088,6 +1088,9 @@ impl Tower {
             .iter()
             .position(|facility| facility.id == id)
             .ok_or(DemolitionError::UnknownFacility(id))?;
+        if self.facilities[index].kind == FacilityKind::Lobby {
+            return Err(DemolitionError::LobbyIsPermanent);
+        }
         Ok(self.facilities.remove(index))
     }
 
@@ -1392,6 +1395,7 @@ impl std::error::Error for PlacementError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DemolitionError {
     UnknownFacility(u64),
+    LobbyIsPermanent,
     UnknownFloor(GridPosition),
     FloorOccupied(GridPosition),
     FloorSupportsAbove { position: GridPosition, above: i16 },
@@ -1401,6 +1405,7 @@ impl fmt::Display for DemolitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownFacility(id) => write!(f, "facility {id} does not exist"),
+            Self::LobbyIsPermanent => write!(f, "lobbies cannot be demolished"),
             Self::UnknownFloor(position) => write!(
                 f,
                 "there is no floor at level {}, column {}",
@@ -1825,6 +1830,21 @@ mod tests {
     }
 
     #[test]
+    fn original_lobby_segments_cost_1250_and_cannot_be_demolished() {
+        let mut tower = Tower::new(16, 10_000);
+        tower.place_floor(GridPosition { x: 4, floor: 1 }).unwrap();
+        let before = tower.cash();
+        let lobby = tower
+            .place(FacilityKind::Lobby, GridPosition { x: 4, floor: 1 })
+            .unwrap();
+        assert_eq!(tower.cash(), before - 1_250);
+        assert_eq!(
+            tower.demolish(lobby),
+            Err(DemolitionError::LobbyIsPermanent)
+        );
+    }
+
+    #[test]
     fn control_lobbies_use_two_or_three_original_story_layers() {
         let mut tower = Tower::new(32, 1_000_000);
         build_supported_floor(&mut tower, 3, 0..9);
@@ -1843,7 +1863,7 @@ mod tests {
         assert_eq!(lobby.stories, 3);
         assert_eq!(
             tower.cash(),
-            1_000_000 - 27 * FLOOR_CONSTRUCTION_COST - 30_000
+            1_000_000 - 27 * FLOOR_CONSTRUCTION_COST - 7_500
         );
         assert_eq!(
             tower.place(FacilityKind::Office, GridPosition { x: 0, floor: 2 }),

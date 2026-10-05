@@ -961,6 +961,23 @@ fn assign_waiting_calls(
                     }
                 })?;
 
+            // Keep a car committed to a hall call once it starts travelling
+            // toward that floor. Without this, the assignment can jump to a
+            // different car every frame as their relative distances change.
+            // A high-floor car then moves down a fraction of a floor, loses
+            // the call, and immediately returns to its default waiting floor.
+            let committed = shaft
+                .cars
+                .iter()
+                .enumerate()
+                .filter(|(_, car)| car.target_floor == Some(floor))
+                .min_by(|left, right| {
+                    (left.1.floor_position - floor_position)
+                        .abs()
+                        .total_cmp(&(right.1.floor_position - floor_position).abs())
+                })
+                .map(|(index, _)| index);
+
             let moving = shaft
                 .cars
                 .iter()
@@ -1001,7 +1018,11 @@ fn assign_waiting_calls(
                         .total_cmp(&(right.1.floor_position - floor_position).abs())
                 })
                 .map(|(index, _)| index);
-            moving.or(waiting).or(nearest).map(|index| (floor, index))
+            committed
+                .or(moving)
+                .or(waiting)
+                .or(nearest)
+                .map(|index| (floor, index))
         })
         .collect()
 }
@@ -1123,8 +1144,10 @@ fn choose_route_scored(
     for shaft in elevators.iter().filter(|shaft| {
         let x = shaft_center(shaft);
         shaft.kind != FacilityKind::ServiceElevator
-            && shaft_stops_at(shaft, origin.floor)
-            && shaft_stops_at(shaft, destination.floor)
+            && shaft_stops_at(shaft, origin.floor, facilities)
+            && shaft_stops_at(shaft, destination.floor, facilities)
+            && lobby_endpoint_connects_to_shaft(origin, shaft, facilities)
+            && lobby_endpoint_connects_to_shaft(destination, shaft, facilities)
             && horizontal_floor_path(origin.floor, origin.x, x, floors)
             && horizontal_floor_path(destination.floor, x, destination.x, floors)
     }) {
@@ -1138,53 +1161,57 @@ fn choose_route_scored(
         ));
     }
 
-    let lobby_floors: Vec<i16> = facilities
+    let mut lobby_floors: Vec<i16> = facilities
         .iter()
         .filter(|facility| facility.kind == FacilityKind::Lobby)
         .map(|facility| facility.position.floor)
         .collect();
+    lobby_floors.sort_unstable();
+    lobby_floors.dedup();
     for first in elevators.iter().filter(|shaft| {
         let x = shaft_center(shaft);
         shaft.kind != FacilityKind::ServiceElevator
-            && shaft_stops_at(shaft, origin.floor)
+            && shaft_stops_at(shaft, origin.floor, facilities)
+            && lobby_endpoint_connects_to_shaft(origin, shaft, facilities)
             && horizontal_floor_path(origin.floor, origin.x, x, floors)
     }) {
         for second in elevators.iter().filter(|second| {
             let x = shaft_center(second);
             first.id != second.id
                 && second.kind != FacilityKind::ServiceElevator
-                && shaft_stops_at(second, destination.floor)
+                && shaft_stops_at(second, destination.floor, facilities)
+                && lobby_endpoint_connects_to_shaft(destination, second, facilities)
                 && horizontal_floor_path(destination.floor, x, destination.x, floors)
         }) {
-            let Some(transfer_floor) = lobby_floors.iter().copied().find(|floor| {
-                shaft_stops_at(first, *floor)
-                    && shaft_stops_at(second, *floor)
-                    && horizontal_floor_path(
-                        *floor,
-                        shaft_center(first),
-                        shaft_center(second),
-                        floors,
-                    )
-            }) else {
-                continue;
-            };
             let first_x = shaft_center(first);
             let second_x = shaft_center(second);
-            let score = (origin.x - first_x).abs()
-                + (first_x - second_x).abs()
-                + (destination.x - second_x).abs()
-                + 30.0
-                + flights as f32 * 0.5;
-            candidates.push((
-                TravelMode::ElevatorTransfer {
-                    first_id: first.id,
-                    first_x,
-                    transfer_floor,
-                    second_id: second.id,
-                    second_x,
-                },
-                score,
-            ));
+            for transfer_floor in lobby_floors.iter().copied().filter(|floor| {
+                shaft_stops_at(first, *floor, facilities)
+                    && shaft_stops_at(second, *floor, facilities)
+                    && lobby_connects_shafts(*floor, first, second, facilities)
+            }) {
+                let first_flights =
+                    (floor_ordinal(transfer_floor) - floor_ordinal(origin.floor)).unsigned_abs();
+                let second_flights = (floor_ordinal(destination.floor)
+                    - floor_ordinal(transfer_floor))
+                .unsigned_abs();
+                let score = (origin.x - first_x).abs()
+                    + (first_x - second_x).abs()
+                    + (destination.x - second_x).abs()
+                    + 30.0
+                    + (first_flights + second_flights) as f32 * 0.5
+                    + second_flights as f32 * 0.01;
+                candidates.push((
+                    TravelMode::ElevatorTransfer {
+                        first_id: first.id,
+                        first_x,
+                        transfer_floor,
+                        second_id: second.id,
+                        second_x,
+                    },
+                    score,
+                ));
+            }
         }
     }
 
@@ -1213,12 +1240,89 @@ fn shaft_distance(shaft: &ElevatorShaft, origin: Endpoint, destination: Endpoint
     (origin.x - x).abs() + (destination.x - x).abs()
 }
 
-fn shaft_stops_at(shaft: &ElevatorShaft, floor: i16) -> bool {
-    shaft.served_floors.contains(&floor)
-        && (shaft.kind != FacilityKind::ExpressElevator
-            || floor < 1
-            || floor == 1
-            || floor.rem_euclid(15) == 0)
+fn shaft_stops_at(shaft: &ElevatorShaft, floor: i16, facilities: &[Facility]) -> bool {
+    if !shaft.served_floors.contains(&floor) {
+        return false;
+    }
+    if shaft.kind != FacilityKind::ExpressElevator || floor < 1 {
+        return true;
+    }
+
+    // Express cars stop above ground only at a real ground/sky lobby that
+    // physically touches the shaft. A bare floor at a fifteenth-storey mark
+    // is not a stop in the original game.
+    (floor == 1 || floor.rem_euclid(15) == 0)
+        && lobby_components(floor, facilities)
+            .into_iter()
+            .any(|component| component_touches_shaft(component, shaft))
+}
+
+fn lobby_endpoint_connects_to_shaft(
+    endpoint: Endpoint,
+    shaft: &ElevatorShaft,
+    facilities: &[Facility],
+) -> bool {
+    let Some(lobby) = facilities.iter().find(|facility| {
+        facility.id == endpoint.facility_id && facility.kind == FacilityKind::Lobby
+    }) else {
+        return true;
+    };
+    lobby_components(endpoint.floor, facilities)
+        .into_iter()
+        .any(|component| {
+            component.0 <= lobby.position.x
+                && lobby.position.x < component.1
+                && component_touches_shaft(component, shaft)
+        })
+}
+
+fn lobby_connects_shafts(
+    floor: i16,
+    first: &ElevatorShaft,
+    second: &ElevatorShaft,
+    facilities: &[Facility],
+) -> bool {
+    lobby_components(floor, facilities)
+        .into_iter()
+        .any(|component| {
+            component_touches_shaft(component, first) && component_touches_shaft(component, second)
+        })
+}
+
+/// Returns half-open horizontal runs of contiguous lobby slices. Elevator
+/// shafts may be painted over lobby artwork, so touching or overlapping a run
+/// both count as a connection.
+fn lobby_components(floor: i16, facilities: &[Facility]) -> Vec<(u16, u16)> {
+    let mut columns = facilities
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Lobby && facility.position.floor == floor)
+        .map(|facility| facility.position.x)
+        .collect::<Vec<_>>();
+    columns.sort_unstable();
+    columns.dedup();
+
+    let mut components = Vec::new();
+    let Some(mut start) = columns.first().copied() else {
+        return components;
+    };
+    let mut end = start + 1;
+    for column in columns.into_iter().skip(1) {
+        if column == end {
+            end += 1;
+        } else {
+            components.push((start, end));
+            start = column;
+            end = column + 1;
+        }
+    }
+    components.push((start, end));
+    components
+}
+
+fn component_touches_shaft(component: (u16, u16), shaft: &ElevatorShaft) -> bool {
+    let shaft_start = shaft.x;
+    let shaft_end = shaft.x.saturating_add(shaft.kind.spec().width);
+    component.0 <= shaft_end && component.1 >= shaft_start
 }
 
 fn connected_vertical_walkways(
@@ -1699,10 +1803,15 @@ mod tests {
     #[test]
     fn express_elevators_only_stop_at_basements_ground_and_sky_lobbies() {
         let shaft = test_shaft(1, FacilityKind::ExpressElevator, 8, &[-2, -1, 1, 2, 15, 30]);
-        assert!(shaft_stops_at(&shaft, -2));
-        assert!(shaft_stops_at(&shaft, 1));
-        assert!(shaft_stops_at(&shaft, 15));
-        assert!(!shaft_stops_at(&shaft, 2));
+        let facilities = [
+            test_facility(1, FacilityKind::Lobby, 8, 1),
+            test_facility(2, FacilityKind::Lobby, 8, 15),
+        ];
+        assert!(shaft_stops_at(&shaft, -2, &facilities));
+        assert!(shaft_stops_at(&shaft, 1, &facilities));
+        assert!(shaft_stops_at(&shaft, 15, &facilities));
+        assert!(!shaft_stops_at(&shaft, 2, &facilities));
+        assert!(!shaft_stops_at(&shaft, 30, &facilities));
     }
 
     #[test]
@@ -1738,7 +1847,10 @@ mod tests {
             test_shaft(1, FacilityKind::ExpressElevator, 8, &[1, 15]),
             test_shaft(2, FacilityKind::Elevator, 24, &[15, 16, 17]),
         ];
-        let lobby = test_facility(3, FacilityKind::Lobby, 0, 15);
+        let mut lobbies = vec![test_facility(3, FacilityKind::Lobby, 8, 1)];
+        lobbies.extend(
+            (12..=24).map(|x| test_facility(100 + u64::from(x), FacilityKind::Lobby, x, 15)),
+        );
         let route = choose_route(
             Endpoint {
                 facility_id: 0,
@@ -1751,7 +1863,7 @@ mod tests {
                 floor: 17,
             },
             &elevators,
-            &[lobby],
+            &lobbies,
             &[],
         );
         assert!(matches!(
@@ -1763,6 +1875,53 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn disconnected_sky_lobby_does_not_enable_an_elevator_transfer() {
+        let elevators = [
+            test_shaft(1, FacilityKind::ExpressElevator, 8, &[1, 15]),
+            test_shaft(2, FacilityKind::Elevator, 24, &[15, 16, 17]),
+        ];
+        let lobbies = [
+            test_facility(3, FacilityKind::Lobby, 8, 1),
+            test_facility(4, FacilityKind::Lobby, 8, 15),
+            test_facility(5, FacilityKind::Lobby, 24, 15),
+        ];
+        let route = choose_route(
+            Endpoint {
+                facility_id: 3,
+                x: 8.5,
+                floor: 1,
+            },
+            Endpoint {
+                facility_id: 9,
+                x: 40.0,
+                floor: 17,
+            },
+            &elevators,
+            &lobbies,
+            &[],
+        );
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn express_elevator_needs_a_real_lobby_at_each_above_ground_stop() {
+        let elevators = [test_shaft(1, FacilityKind::ExpressElevator, 8, &[1, 15])];
+        let ground_lobby = test_facility(3, FacilityKind::Lobby, 8, 1);
+        let route = choose_route(
+            endpoint(&ground_lobby),
+            Endpoint {
+                facility_id: 9,
+                x: 20.0,
+                floor: 15,
+            },
+            &elevators,
+            &[ground_lobby],
+            &[],
+        );
+        assert!(route.is_none());
     }
 
     #[test]
@@ -1894,9 +2053,11 @@ mod tests {
         traffic.sync_with_tower(&tower);
         assert!(!traffic.reachable_facility_ids(&tower).contains(&office_id));
 
-        tower
-            .place(FacilityKind::Lobby, GridPosition { x: 24, floor: 1 })
-            .unwrap();
+        for x in 24..=32 {
+            tower
+                .place(FacilityKind::Lobby, GridPosition { x, floor: 1 })
+                .unwrap();
+        }
         traffic.sync_with_tower(&tower);
         assert!(traffic.reachable_facility_ids(&tower).contains(&office_id));
 
@@ -1958,6 +2119,35 @@ mod tests {
         assert_eq!(traffic.elevators[0].cars[0].home_floor, 1);
         assert_eq!(traffic.elevators[0].cars[1].home_floor, 2);
         assert!(!traffic.add_elevator_car(shaft_id, 3));
+    }
+
+    #[test]
+    fn a_car_keeps_its_assigned_hall_call_while_approaching() {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let shaft_id = traffic.elevators[0].id;
+        assert!(traffic.add_elevator_car(shaft_id, 2));
+        assert!(traffic.spawn_person(&tower));
+
+        let person = &mut traffic.people[0];
+        person.current_floor = 1;
+        person.floor_position = f32::from(floor_ordinal(1));
+        person.destination.floor = 2;
+        person.route = TravelMode::Elevator {
+            shaft_id,
+            x: f32::from(traffic.elevators[0].x),
+        };
+        person.activity = PersonActivity::WaitingForElevator { shaft_id };
+
+        let cars = &mut traffic.elevators[0].cars;
+        cars[0].direction = ElevatorDirection::Up;
+        cars[0].target_floor = Some(2);
+        cars[1].direction = ElevatorDirection::Down;
+        cars[1].target_floor = Some(1);
+
+        let assignments = assign_waiting_calls(&traffic.elevators[0], &traffic.people, 5);
+        assert_eq!(assignments, vec![(1, 1)]);
     }
 
     #[test]

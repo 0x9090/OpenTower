@@ -199,13 +199,17 @@ requires staged milestones rather than a single mechanical decompilation.
   the transparent 36×36 construction crane anchored to the highest floor; it
   is an indicator above that edge, not a buildable roof layer. Special
   top-floor structures such as the cathedral remain facilities.
-- The first-floor lobby's custom resources are a vertical family rather than
-  animation alternates: raw resources `2536`, `2537`, and `2538` are the
-  ground, second, and third stories of the hidden super lobby. Contemporary
-  instructions agree that Control builds two stories and Control+Shift builds
-  three, only for the tower's first lobby, with construction cost multiplied
-  per story. The lower-left fresh-tower lobby attempt raises the initial fund
-  from $2,000,000 to $4,000,000.
+- The lobby resources form a three-by-three family. Raw resources
+  `2536`-`2538` are the first-story art for the 1-2 star, 3-star, and 4+-star
+  lobby styles. Each first-story sheet is split into 328-pixel chunks: ground
+  lobby at x=0, the blue-window sky lobby at x=328, and a grand-lobby bottom
+  row at x=656. Resources `2600`-`2602` supply the grand-lobby middle row from
+  x=328, while `2664`-`2666` supply its top row from x=0. Every chunk contains
+  a 256-pixel body and a 56-pixel left facade at chunk+272. Contemporary
+  instructions agree that Control builds two
+  stories and Control+Shift builds three, only for the tower's first lobby,
+  with construction cost multiplied per story. The lower-left fresh-tower
+  lobby attempt raises the initial fund from $2,000,000 to $4,000,000.
 - Hidden-event resource tracing identifies bitmap `904` as Santa's sleigh and
   bitmap `10003` as the ancient buried treasure. The treasure routine is gated
   to grades two through four and chooses grade-dependent payout table entries;
@@ -215,6 +219,20 @@ requires staged milestones rather than a single mechanical decompilation.
   renderer while December 25 uses the original Santa art. `OPENTOWER_DATE` can
   supply an `MM-DD` date for deterministic cross-platform verification without
   changing the host clock.
+- Emergency guards use bitmap `1129`, not the ordinary tenant-person sheets.
+  The guard walk frames are the 16×36 cels at x=80 and x=96, with the action
+  pose at x=112; sound `10014` is their search-footstep cue. Decompiled
+  `SetAllGuards`/`FireGuardTick` behavior gives every Security Office six
+  guards. They travel between floors invisibly through the exterior emergency
+  stairs, enter a floor at its right extent minus two cells, and sweep left.
+  Fire mode assigns each guard one of six interleaved floor partitions; a guard
+  pauses for five ticks when it reaches a flame front and then extinguishes the
+  whole front. Bomb mode starts guards 0-2 on the office floor and 3-5 one floor
+  below, then expands those two search frontiers outward one built floor at a
+  time. The bomb hunt is deterministic after the bomb's random position is
+  chosen. Fire Rescue costs `$500,000`; sounds `10006`, `10009`, `10003`,
+  `10000`, and `10004` are respectively the fire alert, fire loop, bomb threat,
+  armed-bomb cue, and explosion—not guard footsteps.
 - The contemporary CheatCodes FAQ is now a behavioral specification for the
   economy and rating engine. Cumulative ratings require 300 people for two
   stars, 1,000 plus security for three, 5,000 plus parking, two occupied

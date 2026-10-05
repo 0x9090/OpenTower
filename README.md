@@ -1,115 +1,93 @@
 # OpenTower
 
-OpenTower is an evidence-driven Rust reimplementation of the 1995 Windows
-release of SimTower. The long-term target is one codebase for Windows, macOS,
-and Linux.
+OpenTower brings the classic SimTower experience to modern Windows, macOS,
+and Linux computers. Build upward and underground, attract tenants, manage
+elevator traffic, and grow a one-star building into a five-star tower.
 
-This repository contains the portable Rust rewrite: a tower grid with
-construction, funds, placement validation, simulation, and a native desktop UI
-using the original pixel art and sounds. It is not yet a complete
-game.
+OpenTower is a work in progress. Save files and game balance may change while
+the remaining original mechanics are completed.
 
-## Run
+## What you need
+
+OpenTower does not distribute the original game's artwork or sounds. Keep a
+copy of your original Windows `SimTower.exe`; OpenTower reads the resources it
+needs from that file.
+
+## Install and start playing
+
+1. Download the package for your operating system from the project's
+   [Releases page](https://github.com/0x9090/OpenTower/releases).
+2. Extract the package and launch `simtower` (`simtower.exe` on Windows).
+3. The first time OpenTower starts, select your original `SimTower.exe` when
+   prompted.
+
+You can alternatively place `SIMTOWER.EXE` beside the OpenTower application.
+On Linux, sound playback currently requires either `paplay` or `aplay`.
+
+## Building your first tower
+
+1. Open the Structure tools and build empty floor space.
+2. Paint a lobby onto the first floor.
+3. Add stairs or an elevator, then place offices, shops, restaurants, hotels,
+   condominiums, and services on the empty floors.
+4. Keep elevator waits short and ensure every occupied tenant has a route back
+   to the ground-floor lobby.
+
+Tenants take time to move in. Occupied tenants pay rent, attract visitors, and
+increase the tower population. New facilities unlock as the tower earns stars.
+
+For tall towers, build sky lobbies on floors 15, 30, 45, 60, 75, and 90. A
+continuous sky lobby must physically connect an express elevator with a local
+elevator before people can transfer between them. Express elevators stop at
+basement levels, the ground-floor lobby, and connected sky lobbies.
+
+## Controls
+
+- Left click: use the selected tool
+- Left click and drag: paint floors or lobby slices
+- Shift + left click: fill the available floor, lobby, or tenant space
+- Right click empty sky or ground, or press Escape: return to the selection
+  cursor
+- Right click an elevator: open its controls
+- Drag an elevator's arrow: extend its shaft
+- Mouse wheel: scroll vertically
+- Shift + mouse wheel: scroll horizontally
+- Arrow keys or WASD: pan the view
+- `~`: pause
+- `1`: 1x speed
+- `2`: 2x speed
+- `3`: 3x speed
+- `4`: 5x speed
+- `5`: 10x speed
+- Space: pause or resume
+
+The Menu button contains New, Save, Load, automatic report, and Quit options.
+The speaker button on the top bar mutes or restores game audio. Saved towers
+are stored in the `SimTower` folder in your user home directory.
+
+## Sky lobbies and elevator transfers
+
+People may change elevators once during a trip. A sky lobby therefore needs to
+be a single uninterrupted painted run touching both elevator shafts. Merely
+building empty floor between the shafts does not connect them. Local elevators
+serve the nearby floors; express elevators provide the long-distance trip from
+the ground lobby to the appropriate sky lobby.
+
+## Build from source
+
+If a packaged build is not available for your platform, install the current
+Rust toolchain and run:
+
+```sh
+cargo run -p simtower-desktop --no-default-features
+```
+
+The app will ask for your original `SimTower.exe`. Contributors working from a
+checkout with locally extracted resources can use the default Cargo features:
 
 ```sh
 cargo run -p simtower-desktop
 ```
 
-The default Cargo feature is intended for local development and continues to
-use the extracted resources already present in the development workspace.
-
-Public release binaries do not contain the original game resources. On first
-launch, a release build asks you to select your own original `SimTower.exe` and
-loads its graphics, icons, and sounds directly. You can also put
-`SIMTOWER.EXE` beside the OpenTower binary, set the `SIMTOWER_EXE` environment
-variable, or launch it with `--simtower-exe /path/to/SimTower.exe`.
-
-To build the same resource-free mode used for public releases:
-
-```sh
-cargo build --release -p simtower-desktop --no-default-features
-```
-
-- Click a category in the compact tool palette to open its construction submenu
-- Start with Structure → Floor, then click or drag horizontally to create empty
-  floor space one slice at a time
-- Select Lobby or a tenant/business and paint it onto existing floor; Lobby can
-  also be dragged one slice at a time, while wider facilities require empty
-  floor under their complete footprint
-- Grey submenu items document facilities that are visible but not yet ported
-- `1`–`5`: quick-select the five currently implemented construction tools
-- Inspect and bulldoze are selectable directly from the palette
-- Arrow keys or `WASD`: pan
-- Mouse wheel: move between floors
-- Space: pause
-- Hold Tab: fast-forward
-
-The palette and top status strip follow the original game's compact layout,
-while remaining inside a single application window. The tower view uses the
-original 8-pixel horizontal construction slice and 36-pixel floor pitch. The
-mouse wheel scrolls vertically, while holding either Shift key changes the
-wheel to horizontal tower scrolling on macOS, Windows, and Linux. The build
-menus expose the executable-backed artwork for the complete placeable facility
-set, including hotel rooms, shops, transports, services, entertainment, and
-multi-floor tenants. The original sky tile is drawn at native scale and
-anchored to floor zero. Original
-bitmap `849` supplies the 360-pixel-deep soil gradient, tiled horizontally but
-never stacked by floor. The app starts maximized in a normal decorated window,
-and the buildable site spans 256 columns. Empty floor is an independent
-structural layer, rendered as the original dark buildable bay and repeating
-12-pixel slab, with bitmap `1069` split into emergency-stair overhangs at both
-ends. Above the first floor, every new structural slice requires a floor slice
-directly below it, matching the original game's zero-overhang rule. Lobby construction first displays the recovered scaffolding art, then
-resolves to the dedicated 36-pixel-tall lobby background from raw resource
-`2536`. The red `OPEN` awning halves from bitmap `1001` hang beyond the complete
-floor run rather than covering its interior. Lobby placement uses its segment sound `7001` together with
-the general construction effect `7000`.
-
-The desktop layer uses Macroquad, while all game state and rules live in
-`simtower-core`. Original graphics are decoded to RGBA by the Rust format crate
-and rendered with nearest-neighbor filtering; original RIFF/WAVE resources are
-played through the platform sound player. macOS and Windows use built-in system
-players; Linux currently requires `paplay` or `aplay`. This separation keeps the
-simulation deterministic and makes the same core usable on all three desktop
-platforms.
-
-Facility resources are registered by name instead of array position. The
-verified mappings include lobby background `2536`, lobby entrance awning
-`1001`, structural strip `5000`, office `1448`, condominium `1576`, restaurant
-`1384`, security `1896`, and housekeeping `1960`. Multi-floor facilities are
-assembled vertically from their original per-floor bitmap strips.
-
-To inspect an original expanded Windows executable without Ghidra or Wine:
-
-```sh
-cargo run -p simtower-inspect -- analysis/input/SIMTOWER.EXE
-```
-
-The parser is pure Rust and bounds-checks every NE resource entry before
-exposing its bytes.
-
-To reproduce the assets from the expanded executable for local development:
-
-```sh
-cargo run -p simtower-inspect -- \
-  analysis/input/SIMTOWER.EXE extract assets/original
-```
-
-This exports 250 DIB resources and 11 custom raw sprite resources as portable
-BMP files, plus 58 embedded WaveMix resources as standard WAV files.
-
-## Reverse engineering
-
-See [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) for binary hashes,
-verified findings, asset mappings, and the compatibility roadmap. Original
-binaries, disc images, decompiler installations/databases, and local tooling
-are deliberately excluded from this repository.
-
-## Manual releases
-
-The **Build release binaries** workflow is manual-only. From the repository's
-Actions tab, choose the workflow, select **Run workflow**, and provide the
-release tag and title. It builds packaged Windows, macOS, and Linux binaries
-without bundled game resources and attaches them to a GitHub Release. Players
-must provide an original `SimTower.exe` when running those builds. The workflow
-has no push, tag, pull-request, or scheduled trigger.
+Please report gameplay problems and platform-specific issues through the
+project's [GitHub issue tracker](https://github.com/0x9090/OpenTower/issues).

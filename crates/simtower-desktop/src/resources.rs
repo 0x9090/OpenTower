@@ -164,9 +164,21 @@ pub(crate) const SCAFFOLD_BMP: AssetRef = bitmap_asset!(3624);
 pub(crate) const FLOOR_STRIP_BMP: AssetRef = bitmap_asset!(5000);
 pub(crate) const EMERGENCY_STAIRS_BMP: AssetRef = bitmap_asset!(1069);
 pub(crate) const ROOF_CRANE_BMP: AssetRef = bitmap_asset!(1002);
-pub(crate) const LOBBY_BACKGROUND_BMP: AssetRef = raw_bitmap_asset!(2536);
-pub(crate) const LOBBY_SECOND_STORY_BMP: AssetRef = raw_bitmap_asset!(2537);
-pub(crate) const LOBBY_THIRD_STORY_BMP: AssetRef = raw_bitmap_asset!(2538);
+pub(crate) const LOBBY_FIRST_STORY_BMPS: [AssetRef; 3] = [
+    raw_bitmap_asset!(2536),
+    raw_bitmap_asset!(2537),
+    raw_bitmap_asset!(2538),
+];
+pub(crate) const LOBBY_SECOND_STORY_BMPS: [AssetRef; 3] = [
+    raw_bitmap_asset!(2600),
+    raw_bitmap_asset!(2601),
+    raw_bitmap_asset!(2602),
+];
+pub(crate) const LOBBY_THIRD_STORY_BMPS: [AssetRef; 3] = [
+    raw_bitmap_asset!(2664),
+    raw_bitmap_asset!(2665),
+    raw_bitmap_asset!(2666),
+];
 pub(crate) const LOBBY_AWNING_BMP: AssetRef = bitmap_asset!(1001);
 pub(crate) const SANTA_BMP: AssetRef = bitmap_asset!(904);
 pub(crate) const TREASURE_BMP: AssetRef = bitmap_asset!(10003);
@@ -351,7 +363,8 @@ pub(crate) const LOBBY_SEGMENT_WAV: AssetRef = sound_asset!(7001);
 pub(crate) const NO_MONEY_WAV: AssetRef = sound_asset!(7002);
 pub(crate) const DEMOLITION_WAV: AssetRef = sound_asset!(7003);
 pub(crate) const PAYMENT_WAV: AssetRef = sound_asset!(10013);
-pub(crate) const FIRE_RESPONSE_WAV: AssetRef = sound_asset!(10004);
+pub(crate) const FIRE_ALERT_WAV: AssetRef = sound_asset!(10006);
+pub(crate) const FIRE_RESPONSE_WAV: AssetRef = sound_asset!(10009);
 pub(crate) const ELEVATOR_MOVE_WAV: AssetRef = sound_asset!(6000);
 pub(crate) const ELEVATOR_OPEN_1_WAV: AssetRef = sound_asset!(6001);
 pub(crate) const ELEVATOR_OPEN_2_WAV: AssetRef = sound_asset!(6002);

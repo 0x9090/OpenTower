@@ -77,16 +77,17 @@ const LOBBY_SEGMENT_SOUND_ID: u16 = 7001;
 const NO_MONEY_SOUND_ID: u16 = 7002;
 const DEMOLITION_SOUND_ID: u16 = 7003;
 const PAYMENT_SOUND_ID: u16 = 10013;
-const FIRE_RESPONSE_SOUND_ID: u16 = 10004;
+const FIRE_ALERT_SOUND_ID: u16 = 10006;
+const FIRE_RESPONSE_SOUND_ID: u16 = 10009;
 const ELEVATOR_MOVE_SOUND_ID: u16 = 6000;
 const ELEVATOR_OPEN_SOUND_IDS: [u16; 2] = [6001, 6002];
 const ELEVATOR_BELL_DIVISOR: u8 = 5;
 const MAX_PAYMENT_SOUND_QUEUE: u8 = 30;
 const PAYMENT_SOUND_INTERVAL: f32 = 0.5;
-const FIRE_RESCUE_COST: i64 = 300_000;
+const FIRE_RESCUE_COST: i64 = 500_000;
 const FIRE_QUICK_RESPONSE_SECONDS: f32 = 22.0;
 const FIRE_HELICOPTER_DURATION_SECONDS: f32 = 12.0;
-const FIRE_RESPONSE_DECISION_SECONDS: f32 = 8.0;
+const FIRE_RESPONSE_DECISION_SECONDS: f32 = 15.0;
 const QUEUE_CONCERNED_PINK: [u8; 3] = [255, 92, 152];
 const CROWD_SOUND_ID: u16 = 8000;
 const RESTAURANT_AMBIENCE_IDS: &[u16] = &[1384, 1385];
@@ -259,7 +260,8 @@ const CLASSIC_DARK: Color = Color::new(0.12, 0.12, 0.12, 1.0);
 const TITLE_BLUE: Color = Color::new(0.06, 0.16, 0.48, 1.0);
 const CONSTRUCTION_SECONDS: f32 = 2.8;
 const LOBBY_BODY_WIDTH: f32 = 256.0;
-const LOBBY_FACADE_X: f32 = 272.0;
+const LOBBY_CHUNK_WIDTH: f32 = 328.0;
+const LOBBY_FACADE_OFFSET: f32 = 272.0;
 const LOBBY_FACADE_WIDTH: f32 = 56.0;
 const LOBBY_AWNING_HALF_WIDTH: f32 = 56.0;
 
@@ -291,6 +293,7 @@ struct FireEventState {
     response: FireResponse,
     saves_unit: bool,
     security_start_x: Option<f32>,
+    resume_speed: SimulationSpeed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1561,7 +1564,9 @@ impl App {
             if event.elapsed >= event.duration {
                 let facility_id = event.facility_id;
                 let saves_unit = event.saves_unit;
+                let resume_speed = event.resume_speed;
                 self.fire_event = None;
+                restore_emergency_speed(&mut self.tower.clock, resume_speed);
                 if saves_unit {
                     self.status =
                         "The fire is out. The quick response saved the tenant space.".to_owned();
@@ -1628,7 +1633,7 @@ impl App {
         let index = (u64::from(self.tower.clock.day).wrapping_mul(17) as usize) % candidates.len();
         let facility_id = candidates[index];
         self.traffic.evacuate_facility(facility_id);
-        apply_emergency_speed(&mut self.tower.clock, &mut self.last_running_speed);
+        let resume_speed = apply_emergency_speed(&mut self.tower.clock);
         self.speed_menu_open = false;
         self.fire_event = Some(FireEventState {
             facility_id,
@@ -1638,10 +1643,12 @@ impl App {
             response: FireResponse::AwaitingDecision,
             saves_unit: false,
             security_start_x: None,
+            resume_speed,
         });
         self.status = format!(
             "Fire reported in tenant #{facility_id}; choose emergency response — speed set to 1x"
         );
+        self.assets.sounds.play_fire_alert();
     }
 
     fn update_fire_response_dialog(&mut self, dt: f32) {
@@ -1691,6 +1698,7 @@ impl App {
                 .iter()
                 .find(|facility| facility.id == event.facility_id)
             else {
+                restore_emergency_speed(&mut self.tower.clock, event.resume_speed);
                 self.fire_event = None;
                 return;
             };
@@ -1700,6 +1708,8 @@ impl App {
                     .facilities()
                     .iter()
                     .filter(|facility| facility.kind == FacilityKind::Security),
+                self.tower.floors(),
+                self.tower.width(),
             ) else {
                 self.status =
                     "No Security Office can respond; call the fire rescue helicopter".to_owned();
@@ -1710,9 +1720,7 @@ impl App {
                 .facilities()
                 .iter()
                 .find(|facility| facility.id == security_id)
-                .map(|security| {
-                    security_team_start_x(target, security, self.tower.floors(), self.tower.width())
-                })
+                .map(|_| security_team_start_x(target, self.tower.floors(), self.tower.width()))
                 .unwrap_or(f32::from(target.position.x));
             if let Some(event) = &mut self.fire_event {
                 event.response = FireResponse::Security;
@@ -2362,8 +2370,8 @@ impl App {
         if built > 0 {
             self.assets.play_construction(FacilityKind::Lobby);
             self.status = format!(
-                "Painted {built} {}-story lobby slice{} across the full buildable length of floor {}",
-                stories,
+                "Painted {built} {} slice{} across the full buildable length of floor {}",
+                lobby_display_name(position.floor, stories),
                 if built == 1 { "" } else { "s" },
                 position.floor
             );
@@ -2478,8 +2486,10 @@ impl App {
                     )
                 } else {
                     format!(
-                        "Built lobby slice on floor {}, column {} — keep dragging to extend",
-                        position.floor, position.x
+                        "Built {} slice on floor {}, column {} — keep dragging to extend",
+                        lobby_display_name(position.floor, 1),
+                        position.floor,
+                        position.x
                     )
                 };
             }
@@ -2549,8 +2559,8 @@ impl App {
                     current.floor
                 ),
                 ToolMode::Build(FacilityKind::Lobby) => format!(
-                    "Painted {built} {}-story lobby slice{} on floor {}",
-                    self.lobby_drag_stories,
+                    "Painted {built} {} slice{} on floor {}",
+                    lobby_display_name(current.floor, self.lobby_drag_stories),
                     if built == 1 { "" } else { "s" },
                     current.floor
                 ),
@@ -2865,9 +2875,15 @@ impl App {
             while run_start > 0 && self.lobby_at(run_start - 1, facility.position.floor) {
                 run_start -= 1;
             }
-            let source_x = (f32::from(facility.position.x - run_start) * CELL_WIDTH)
-                .rem_euclid(LOBBY_BODY_WIDTH);
-            let sprite = &self.assets.facilities.lobby[story];
+            let (sprite, source_base) = self.assets.facilities.lobby_layer(
+                story,
+                facility.stories,
+                facility.position.floor,
+                self.star_rating(),
+            );
+            let source_x = source_base
+                + (f32::from(facility.position.x - run_start) * CELL_WIDTH)
+                    .rem_euclid(LOBBY_BODY_WIDTH);
             return sprite_pixel_is_opaque(
                 sprite,
                 Rect::new(source_x, 0.0, width, FLOOR_HEIGHT),
@@ -3514,7 +3530,7 @@ impl App {
         }) {
             self.draw_facility(facility);
         }
-        // Entrance facade and exterior awnings belong to the lobby layer.
+        // Lobby facades and the ground entrance awnings belong to the lobby layer.
         // Draw them before vertical transport so stairs always remain in the
         // foreground when the two systems occupy the same floor space.
         for facility in self.tower.facilities() {
@@ -3527,6 +3543,7 @@ impl App {
         }) {
             self.draw_facility(facility);
         }
+        self.draw_disabled_elevator_outlines();
         self.draw_elevator_endcaps();
         self.draw_elevator_cars();
         self.draw_roof_crane();
@@ -3595,41 +3612,28 @@ impl App {
     }
 
     fn draw_security_response_team(&self, event: FireEventState, target: &Facility) {
-        let target_center =
-            f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
-        let start_x = event.security_start_x.unwrap_or(target_center);
-        let direction = if start_x <= target_center { 1.0 } else { -1.0 };
-        // The responders work from the corridor at the tenant boundary. If
-        // they enter the unit center they overlap the flame frames and read as
-        // corrupted pixels instead of a separate team.
-        let destination_x = if direction > 0.0 {
-            f32::from(target.position.x) - 0.5
-        } else {
-            f32::from(target.end_x()) + 0.5
-        };
+        let floor_extent = floor_extent_for(target.position.floor, self.tower.floors())
+            .unwrap_or((target.position.x, target.end_x()));
+        let floor_left = f32::from(floor_extent.0);
+        let floor_right = f32::from(floor_extent.1);
+        let start_x = event
+            .security_start_x
+            .unwrap_or((floor_right - 2.0).max(floor_left));
+        // Original guards arrive through the right emergency stair and sweep
+        // left. Their action pose is inside the burning tenant, never beyond
+        // the structural edge where it would appear to float in open sky.
+        let destination_x = (f32::from(target.end_x()) - 2.0)
+            .max(f32::from(target.position.x))
+            .clamp(floor_left, (floor_right - 2.0).max(floor_left));
         let travel_seconds = (event.duration - 6.0).max(0.1);
         let progress = (event.elapsed / travel_seconds).clamp(0.0, 1.0);
-        let team_world_x = start_x + (destination_x - start_x) * progress;
+        let team_world_x = (start_x + (destination_x - start_x) * progress)
+            .clamp(floor_left, (floor_right - 2.0).max(floor_left));
         let screen_x = (team_world_x - self.camera_x) * CELL_WIDTH;
-        let y = tenant_room_top_y(self.ground_y(), target.position.floor);
+        let y = floor_top_y(self.ground_y(), target.position.floor);
         let arrived = progress >= 1.0;
-        for member in 0..3 {
-            let trailing_offset = member as f32 * 7.0 * -direction;
-            // The first pair is the equipment-carrying walk cycle. At the
-            // scene, freeze on the original clean working pose; alternating
-            // substantially different poses while stationary caused flashing.
-            for (frame, weight) in security_team_animation_frames(event.elapsed, arrived, member) {
-                if weight > 0.01 {
-                    self.draw_person_frame(
-                        2,
-                        frame,
-                        screen_x - 4.0 + trailing_offset,
-                        y,
-                        with_alpha(WHITE, weight),
-                    );
-                }
-            }
-        }
+        let source_x = emergency_guard_source_x(arrived, team_world_x);
+        self.draw_security_team_frame(source_x, screen_x, y);
     }
 
     fn draw_fire_response_dialog(&self) {
@@ -3898,7 +3902,11 @@ impl App {
             return;
         }
         if is_elevator_kind(facility.kind) {
-            self.draw_empty_elevator_shaft(x, y, width, facility.position.floor);
+            let visible = self
+                .traffic
+                .elevator_at(facility.kind, facility.position.x)
+                .is_none_or(|shaft| shaft.visible);
+            self.draw_empty_elevator_shaft(x, y, width, facility.position.floor, visible);
             return;
         }
         let floors = f32::from(facility.kind.spec().height);
@@ -4126,7 +4134,8 @@ impl App {
         }
     }
 
-    fn draw_empty_elevator_shaft(&self, x: f32, y: f32, width: f32, floor: i16) {
+    fn draw_empty_elevator_shaft(&self, x: f32, y: f32, width: f32, floor: i16, visible: bool) {
+        let tint = Color::new(1.0, 1.0, 1.0, elevator_display_alpha(visible));
         let tile_width = self.assets.elevator_shaft.width();
         let mut offset = 0.0;
         while offset < width {
@@ -4135,7 +4144,7 @@ impl App {
                 &self.assets.elevator_shaft,
                 x + offset,
                 y,
-                WHITE,
+                tint,
                 DrawTextureParams {
                     dest_size: Some(vec2(draw_width, FLOOR_HEIGHT)),
                     source: Some(Rect::new(0.0, 0.0, draw_width, FLOOR_HEIGHT)),
@@ -4147,17 +4156,17 @@ impl App {
 
         // Resources 2024-2026 are the original light-gray shaft floor
         // designations. Cars are drawn later and naturally cover the label.
-        self.draw_elevator_floor_number(floor, x, y, width);
+        self.draw_elevator_floor_number(floor, x, y, width, tint);
     }
 
-    fn draw_elevator_floor_number(&self, floor: i16, x: f32, y: f32, width: f32) {
+    fn draw_elevator_floor_number(&self, floor: i16, x: f32, y: f32, width: f32, tint: Color) {
         if (1..=9).contains(&floor) || floor == 100 {
             let frame = if floor == 100 { 10 } else { floor as usize };
             draw_texture_ex(
                 &self.assets.elevator_numbers[0],
                 x + (width - 32.0) * 0.5,
                 y,
-                WHITE,
+                tint,
                 DrawTextureParams {
                     source: Some(Rect::new(frame as f32 * 32.0, 0.0, 32.0, 36.0)),
                     dest_size: Some(vec2(32.0, 36.0)),
@@ -4167,36 +4176,74 @@ impl App {
             return;
         }
 
-        let label = if floor < 0 {
-            format!("B{}", floor.unsigned_abs())
-        } else {
-            floor.to_string()
-        };
-        let glyph_width = 16.0;
-        let total_width = glyph_width * label.len() as f32;
+        // The compound-number atlases use 16-pixel cells, but pixel zero is
+        // the shaft divider and the final four pixels are cell padding. Draw
+        // only the eleven-pixel glyph area so two-digit labels remain a
+        // single centered number instead of two separated shaft panels.
+        const CELL_WIDTH: f32 = 16.0;
+        const GLYPH_INSET: f32 = 1.0;
+        const GLYPH_WIDTH: f32 = 11.0;
+        let label = floor.unsigned_abs().to_string();
+        let glyph_count = label.len() + usize::from(floor < 0);
+        let total_width = GLYPH_WIDTH * glyph_count as f32;
         let mut draw_x = x + (width - total_width) * 0.5;
-        for character in label.chars() {
-            let (texture, source_x) = if character == 'B' {
-                (&self.assets.elevator_numbers[2], 0.0)
-            } else {
-                (
-                    &self.assets.elevator_numbers[1],
-                    character.to_digit(10).unwrap_or(0) as f32 * glyph_width,
-                )
-            };
-            draw_texture_ex(
-                texture,
+
+        if floor < 0 {
+            // Resource 2026 starts with packed B1/B2 cels. Its third cell is
+            // the standalone B used when composing normal shaft labels.
+            self.draw_elevator_label_glyph(
+                &self.assets.elevator_numbers[2],
+                2.0 * CELL_WIDTH + 4.0,
                 draw_x,
                 y,
-                WHITE,
+                GLYPH_WIDTH,
+                tint,
+            );
+            draw_x += GLYPH_WIDTH;
+        }
+
+        for character in label.chars() {
+            let digit = character.to_digit(10).unwrap_or(0) as f32;
+            draw_texture_ex(
+                &self.assets.elevator_numbers[1],
+                draw_x,
+                y,
+                tint,
                 DrawTextureParams {
-                    source: Some(Rect::new(source_x, 0.0, glyph_width, 36.0)),
-                    dest_size: Some(vec2(glyph_width, 36.0)),
+                    source: Some(Rect::new(
+                        digit * CELL_WIDTH + GLYPH_INSET,
+                        0.0,
+                        GLYPH_WIDTH,
+                        36.0,
+                    )),
+                    dest_size: Some(vec2(GLYPH_WIDTH, 36.0)),
                     ..Default::default()
                 },
             );
-            draw_x += glyph_width;
+            draw_x += GLYPH_WIDTH;
         }
+    }
+
+    fn draw_elevator_label_glyph(
+        &self,
+        texture: &Texture2D,
+        source_x: f32,
+        x: f32,
+        y: f32,
+        width: f32,
+        tint: Color,
+    ) {
+        draw_texture_ex(
+            texture,
+            x,
+            y,
+            tint,
+            DrawTextureParams {
+                source: Some(Rect::new(source_x, 0.0, width, 36.0)),
+                dest_size: Some(vec2(width, 36.0)),
+                ..Default::default()
+            },
+        );
     }
 
     fn draw_stair_transport(
@@ -4227,9 +4274,16 @@ impl App {
         while run_start > 0 && self.lobby_at(run_start - 1, floor) {
             run_start -= 1;
         }
-        let source_x = (f32::from(column - run_start) * CELL_WIDTH).rem_euclid(LOBBY_BODY_WIDTH);
+        let rating = self.star_rating();
         for story in 0..facility.stories {
-            let sprite = &self.assets.facilities.lobby[usize::from(story)];
+            let (sprite, source_base) = self.assets.facilities.lobby_layer(
+                usize::from(story),
+                facility.stories,
+                floor,
+                rating,
+            );
+            let source_x = source_base
+                + (f32::from(column - run_start) * CELL_WIDTH).rem_euclid(LOBBY_BODY_WIDTH);
             draw_texture_ex(
                 &sprite.texture,
                 x,
@@ -4287,10 +4341,17 @@ impl App {
         let y = floor_top_y(self.ground_y(), facility.position.floor);
         let width = f32::from(end - facility.position.x) * CELL_WIDTH;
         let facade_width = width.min(LOBBY_FACADE_WIDTH);
-        // Resources 2536-2538 are the matching ground, second, and third
-        // original super-lobby layers. Each carries its own left facade.
+        // Each 328-pixel lobby chunk carries a 256-pixel tiled body and its
+        // own left facade at +272. Sky lobbies use chunk 1; grand-lobby
+        // stories select the matching bottom, middle, and top chunks.
+        let rating = self.star_rating();
         for story in 0..facility.stories {
-            let lobby = &self.assets.facilities.lobby[usize::from(story)];
+            let (lobby, source_base) = self.assets.facilities.lobby_layer(
+                usize::from(story),
+                facility.stories,
+                facility.position.floor,
+                rating,
+            );
             draw_texture_ex(
                 &lobby.texture,
                 x,
@@ -4298,10 +4359,19 @@ impl App {
                 WHITE,
                 DrawTextureParams {
                     dest_size: Some(vec2(facade_width, FLOOR_HEIGHT)),
-                    source: Some(Rect::new(LOBBY_FACADE_X, 0.0, facade_width, FLOOR_HEIGHT)),
+                    source: Some(Rect::new(
+                        source_base + LOBBY_FACADE_OFFSET,
+                        0.0,
+                        facade_width,
+                        FLOOR_HEIGHT,
+                    )),
                     ..Default::default()
                 },
             );
+        }
+
+        if facility.position.floor != 1 {
+            return;
         }
 
         // Bitmap 1001 is the two exterior OPEN awnings. Anchor them to the
@@ -4427,8 +4497,9 @@ impl App {
                 return;
             }
         }
-        let (width, height, valid) = match self.tool {
+        let (preview_position, width, height, valid) = match self.tool {
             ToolMode::Floor => (
+                position,
                 CELL_WIDTH,
                 FLOOR_HEIGHT,
                 self.tower.can_place_floor(position).is_ok(),
@@ -4437,20 +4508,45 @@ impl App {
                 let stories = lobby_stories_for_position(&self.tower, position);
                 let mut preview = self.tower.clone();
                 (
+                    position,
                     CELL_WIDTH,
                     f32::from(stories) * FLOOR_HEIGHT,
                     preview.place_lobby(position, stories).is_ok(),
                 )
             }
-            ToolMode::Build(kind) => (
-                f32::from(kind.spec().width) * CELL_WIDTH,
-                f32::from(kind.spec().height) * FLOOR_HEIGHT,
-                self.tower.can_place(kind, position).is_ok(),
-            ),
+            ToolMode::Build(kind) => {
+                let existing_car = is_elevator_kind(kind).then(|| {
+                    self.elevator_facility_at(position)
+                        .filter(|facility| facility.kind == kind)
+                        .map(|facility| {
+                            let shaft = self.traffic.elevator_at(kind, facility.position.x);
+                            let valid = shaft.is_some_and(|shaft| {
+                                shaft.cars.len() < simtower_core::MAX_ELEVATOR_CARS
+                                    && self.tower.cash() >= elevator_car_cost(kind)
+                            });
+                            (facility.position, valid)
+                        })
+                });
+                if let Some((shaft_position, valid)) = existing_car.flatten() {
+                    (
+                        shaft_position,
+                        f32::from(kind.spec().width) * CELL_WIDTH,
+                        f32::from(kind.spec().height) * FLOOR_HEIGHT,
+                        valid,
+                    )
+                } else {
+                    (
+                        position,
+                        f32::from(kind.spec().width) * CELL_WIDTH,
+                        f32::from(kind.spec().height) * FLOOR_HEIGHT,
+                        self.tower.can_place(kind, position).is_ok(),
+                    )
+                }
+            }
             ToolMode::Inspect | ToolMode::Demolish => unreachable!(),
         };
-        let x = (f32::from(position.x) - self.camera_x) * CELL_WIDTH;
-        let y = floor_top_y(self.ground_y(), position.floor);
+        let x = (f32::from(preview_position.x) - self.camera_x) * CELL_WIDTH;
+        let y = floor_top_y(self.ground_y(), preview_position.floor);
         let draw_y = y + FLOOR_HEIGHT - height;
         let color = if valid { GREEN } else { RED };
         draw_rectangle_lines(x, draw_y, width, height, 3.0, color);
@@ -4710,6 +4806,20 @@ impl App {
         );
     }
 
+    fn draw_security_team_frame(&self, source_x: f32, x: f32, y: f32) {
+        draw_texture_ex(
+            &self.assets.people_silhouette[1],
+            x,
+            y,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(16.0, FLOOR_HEIGHT)),
+                source: Some(Rect::new(source_x, 0.0, 16.0, FLOOR_HEIGHT)),
+                ..Default::default()
+            },
+        );
+    }
+
     fn draw_queue_person(&self, mood: PersonMood, id: u64, x: f32, y: f32) {
         let sheet = queue_sheet_for_mood(mood);
         let frame = (id % 8) as f32;
@@ -4810,17 +4920,37 @@ impl App {
         }
     }
 
+    fn draw_disabled_elevator_outlines(&self) {
+        for shaft in self
+            .traffic
+            .elevators()
+            .iter()
+            .filter(|shaft| !shaft.visible && !shaft.served_floors.is_empty())
+        {
+            let bottom = *shaft.served_floors.first().expect("checked above");
+            let top = *shaft.served_floors.last().expect("checked above");
+            let x = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
+            let y = floor_top_y(self.ground_y(), top);
+            let width = f32::from(shaft.kind.spec().width) * CELL_WIDTH;
+            let height = f32::from(
+                simtower_core::floor_ordinal(top) - simtower_core::floor_ordinal(bottom) + 1,
+            ) * FLOOR_HEIGHT;
+            draw_rectangle_lines(x, y, width, height, 1.0, Color::new(0.55, 0.58, 0.66, 0.5));
+        }
+    }
+
     fn draw_elevator_endcaps(&self) {
         for shaft in self
             .traffic
             .elevators()
             .iter()
-            .filter(|shaft| shaft.visible && !shaft.served_floors.is_empty())
+            .filter(|shaft| !shaft.served_floors.is_empty())
         {
             let top = *shaft.served_floors.last().expect("checked above");
             let bottom = *shaft.served_floors.first().expect("checked above");
             let x = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
             let width = f32::from(shaft.kind.spec().width) * CELL_WIDTH;
+            let tint = Color::new(1.0, 1.0, 1.0, elevator_display_alpha(shaft.visible));
             let (texture, frame_width, up_frame, down_frame) = match shaft.kind {
                 FacilityKind::Elevator => (&self.assets.elevator_cars, 32.0, 4.0, 5.0),
                 FacilityKind::ExpressElevator => (
@@ -4846,7 +4976,7 @@ impl App {
                     texture,
                     x,
                     floor_top_y(self.ground_y(), floor),
-                    WHITE,
+                    tint,
                     DrawTextureParams {
                         dest_size: Some(vec2(width, FLOOR_HEIGHT)),
                         source: Some(Rect::new(
@@ -5354,7 +5484,11 @@ impl App {
         let time_width = measure_text(&time, None, 17, 1.0).width;
         let time_x = topbar_clock_x(screen_width(), time_width, controls_right);
         draw_text(&time, time_x, 23.0, 17.0, BLACK);
-        let money = format!("Fund ${}    Pop {}", self.tower.cash(), self.population());
+        let money = format!(
+            "Fund {}    Pop {}",
+            format_currency(self.tower.cash()),
+            self.population()
+        );
         let money_width = measure_text(&money, None, 17, 1.0).width;
         let money_x = (screen_width() - money_width - 12.0).max(time_x + time_width + 18.0);
         draw_text(&money, money_x, 23.0, 17.0, BLACK);
@@ -6143,6 +6277,16 @@ fn seasonal_event_for_date(date: &str) -> Option<SeasonalEventKind> {
     }
 }
 
+fn lobby_display_name(floor: i16, stories: u8) -> &'static str {
+    if floor > 1 {
+        "sky-lobby"
+    } else if stories > 1 {
+        "super-lobby"
+    } else {
+        "lobby"
+    }
+}
+
 fn lobby_stories_for_position(tower: &Tower, position: GridPosition) -> u8 {
     let is_first_lobby = !tower
         .facilities()
@@ -6713,8 +6857,17 @@ fn format_number(value: i64) -> String {
 }
 
 fn format_currency(value: i64) -> String {
+    let magnitude = value.saturating_abs();
+    if magnitude >= 1_000_000 {
+        let millions = magnitude as f64 / 1_000_000.0;
+        return if value < 0 {
+            format!("-${millions:.1}M")
+        } else {
+            format!("${millions:.1}M")
+        };
+    }
     if value < 0 {
-        format!("-${}", format_number(value.saturating_abs()))
+        format!("-${}", format_number(magnitude))
     } else {
         format!("${}", format_number(value))
     }
@@ -7013,6 +7166,10 @@ fn with_alpha(mut color: Color, alpha: f32) -> Color {
     color
 }
 
+const fn elevator_display_alpha(visible: bool) -> f32 {
+    if visible { 1.0 } else { 0.22 }
+}
+
 fn is_vertical_transport(kind: FacilityKind) -> bool {
     matches!(
         kind,
@@ -7171,7 +7328,9 @@ struct OriginalAssets {
 }
 
 struct FacilitySprites {
-    lobby: [Sprite; 3],
+    lobby_first_story: [Sprite; 3],
+    lobby_second_story: [Sprite; 3],
+    lobby_third_story: [Sprite; 3],
     office_vacant: Sprite,
     office: [Sprite; 6],
     condo_states: [Sprite; 15],
@@ -7207,6 +7366,64 @@ struct FacilitySprites {
     housekeeping: Sprite,
     ramp: [Sprite; 3],
     cathedral: Sprite,
+}
+
+impl FacilitySprites {
+    fn lobby_layer(
+        &self,
+        story: usize,
+        stories: u8,
+        floor: i16,
+        star_rating: u8,
+    ) -> (&Sprite, f32) {
+        let style = lobby_style_index(star_rating);
+        let (row, source_x) = lobby_artwork_source(story, stories, floor);
+        let sprite = match row {
+            0 => &self.lobby_first_story[style],
+            1 => &self.lobby_second_story[style],
+            _ => &self.lobby_third_story[style],
+        };
+        (sprite, source_x)
+    }
+}
+
+fn lobby_artwork_source(story: usize, stories: u8, floor: i16) -> (usize, f32) {
+    if floor > 1 {
+        // The second 328-pixel chunk is the dedicated blue-window sky lobby.
+        (0, LOBBY_CHUNK_WIDTH)
+    } else if stories <= 1 {
+        (0, 0.0)
+    } else if story == 0 {
+        // A grand lobby's bottom row is the third chunk of the first sheet.
+        (0, LOBBY_CHUNK_WIDTH * 2.0)
+    } else if story + 1 >= usize::from(stories) {
+        // Both two- and three-story lobbies use the dedicated top-row sheet.
+        (2, 0.0)
+    } else {
+        // Only a three-story lobby has a middle row.
+        (1, LOBBY_CHUNK_WIDTH)
+    }
+}
+
+#[cfg(test)]
+fn lobby_artwork_resource_bounds(row: usize) -> f32 {
+    match row {
+        0 => 992.0,
+        1 => 664.0,
+        _ => 336.0,
+    }
+}
+
+#[cfg(test)]
+fn lobby_artwork_source_fits(row: usize, source_x: f32) -> bool {
+    source_x + LOBBY_FACADE_OFFSET + LOBBY_FACADE_WIDTH <= lobby_artwork_resource_bounds(row)
+}
+
+#[cfg(test)]
+fn assert_lobby_artwork_source(story: usize, stories: u8, floor: i16, expected: (usize, f32)) {
+    let actual = lobby_artwork_source(story, stories, floor);
+    assert_eq!(actual, expected);
+    assert!(lobby_artwork_source_fits(actual.0, actual.1));
 }
 
 impl OriginalAssets {
@@ -7268,12 +7485,14 @@ impl OriginalAssets {
             ],
             elevator_cars: texture_from_bmp_with_white_transparency(ELEVATOR_CARS_BMP)?,
             elevator_shaft: texture_from_bmp_with_white_transparency(ELEVATOR_SHAFT_BMP)?,
-            elevator_numbers: ELEVATOR_NUMBER_BMPS
-                .map(texture_from_bmp_with_white_transparency)
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-                .try_into()
-                .map_err(|_| "elevator number texture count mismatch".to_owned())?,
+            elevator_numbers: [
+                texture_from_bmp(ELEVATOR_NUMBER_BMPS[0])?,
+                texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[1])?,
+                texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[2])?,
+                texture_from_bmp(ELEVATOR_NUMBER_BMPS[3])?,
+                texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[4])?,
+                texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[5])?,
+            ],
             star_on: texture_from_star_bmp(STAR_ON_BMP, true)?,
             star_off: texture_from_star_bmp(STAR_OFF_BMP, false)?,
             _tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
@@ -7301,21 +7520,55 @@ impl OriginalAssets {
             ],
             recycling_truck: texture_from_bmp_with_white_transparency(RECYCLING_TRUCK_BMP)?,
             facilities: FacilitySprites {
-                lobby: [
+                lobby_first_story: [
                     facility_sprite_from_bmp_with_id(
                         FacilityKind::Lobby,
                         2536,
-                        LOBBY_BACKGROUND_BMP,
+                        LOBBY_FIRST_STORY_BMPS[0],
                     )?,
                     facility_sprite_from_bmp_with_id(
                         FacilityKind::Lobby,
                         2537,
-                        LOBBY_SECOND_STORY_BMP,
+                        LOBBY_FIRST_STORY_BMPS[1],
                     )?,
                     facility_sprite_from_bmp_with_id(
                         FacilityKind::Lobby,
                         2538,
-                        LOBBY_THIRD_STORY_BMP,
+                        LOBBY_FIRST_STORY_BMPS[2],
+                    )?,
+                ],
+                lobby_second_story: [
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2600,
+                        LOBBY_SECOND_STORY_BMPS[0],
+                    )?,
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2601,
+                        LOBBY_SECOND_STORY_BMPS[1],
+                    )?,
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2602,
+                        LOBBY_SECOND_STORY_BMPS[2],
+                    )?,
+                ],
+                lobby_third_story: [
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2664,
+                        LOBBY_THIRD_STORY_BMPS[0],
+                    )?,
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2665,
+                        LOBBY_THIRD_STORY_BMPS[1],
+                    )?,
+                    facility_sprite_from_bmp_with_id(
+                        FacilityKind::Lobby,
+                        2666,
+                        LOBBY_THIRD_STORY_BMPS[2],
                     )?,
                 ],
                 office_vacant: facility_sprite_from_bmp_with_id(
@@ -7788,7 +8041,7 @@ impl OriginalAssets {
 
     fn facility_sprite(&self, kind: FacilityKind) -> &Sprite {
         let sprite = match kind {
-            FacilityKind::Lobby => &self.facilities.lobby[0],
+            FacilityKind::Lobby => &self.facilities.lobby_first_story[0],
             FacilityKind::Office => &self.facilities.office[0],
             FacilityKind::Condo => &self.facilities.condo_states[3],
             FacilityKind::HotelSingle => &self.facilities.hotel_single_vacant[0],
@@ -8087,6 +8340,7 @@ struct NativeSounds {
     demolition: PathBuf,
     no_money: PathBuf,
     payment: PathBuf,
+    fire_alert: PathBuf,
     fire_response: PathBuf,
     elevator_move: PathBuf,
     elevator_open: [PathBuf; 2],
@@ -8104,6 +8358,7 @@ impl NativeSounds {
         let demolition = directory.join(format!("demolition-{DEMOLITION_SOUND_ID}.wav"));
         let no_money = directory.join(format!("no-money-{NO_MONEY_SOUND_ID}.wav"));
         let payment = directory.join(format!("payment-{PAYMENT_SOUND_ID}.wav"));
+        let fire_alert = directory.join(format!("fire-alert-{FIRE_ALERT_SOUND_ID}.wav"));
         let fire_response = directory.join(format!("fire-response-{FIRE_RESPONSE_SOUND_ID}.wav"));
         let elevator_move = directory.join(format!("elevator-move-{ELEVATOR_MOVE_SOUND_ID}.wav"));
         let elevator_open =
@@ -8116,6 +8371,7 @@ impl NativeSounds {
         std::fs::write(&demolition, DEMOLITION_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&no_money, NO_MONEY_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&payment, PAYMENT_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&fire_alert, FIRE_ALERT_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&fire_response, FIRE_RESPONSE_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
         std::fs::write(&elevator_move, ELEVATOR_MOVE_WAV.bytes()?)
@@ -8133,6 +8389,7 @@ impl NativeSounds {
             demolition,
             no_money,
             payment,
+            fire_alert,
             fire_response,
             elevator_move,
             elevator_open,
@@ -8187,6 +8444,13 @@ impl NativeSounds {
             return;
         }
         play_native_sound_async(self.payment.clone());
+    }
+
+    fn play_fire_alert(&self) {
+        if self.is_muted() {
+            return;
+        }
+        play_native_sound_async(self.fire_alert.clone());
     }
 
     fn play_fire_response(&self) {
@@ -8333,72 +8597,76 @@ fn emergency_events_unlocked(star_rating: u8) -> bool {
     star_rating >= FacilityKind::Security.unlock_stars()
 }
 
-fn apply_emergency_speed(clock: &mut Clock, last_running_speed: &mut SimulationSpeed) {
+fn apply_emergency_speed(clock: &mut Clock) -> SimulationSpeed {
     // All emergency entry points (fire, terrorist, and future incidents) use
     // this shared control so a high simulation rate cannot hide the response.
+    let resume_speed = clock.speed;
     clock.speed = SimulationSpeed::Normal;
-    *last_running_speed = SimulationSpeed::Normal;
+    resume_speed
+}
+
+fn restore_emergency_speed(clock: &mut Clock, resume_speed: SimulationSpeed) {
+    clock.speed = resume_speed;
 }
 
 fn nearest_security_fire_response<'a>(
     target: &Facility,
     security_offices: impl Iterator<Item = &'a Facility>,
+    floors: &[GridPosition],
+    tower_width: u16,
 ) -> Option<(u64, f32)> {
+    let entry_x = security_team_start_x(target, floors, tower_width);
+    let action_x = (f32::from(target.end_x()) - 2.0).max(f32::from(target.position.x));
+    let sweep_distance = (entry_x - action_x).max(0.0);
     security_offices
         .map(|security| {
             let floor_distance = (security.position.floor - target.position.floor).unsigned_abs();
-            let target_center =
-                f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
-            let security_center =
-                f32::from(security.position.x) + f32::from(security.kind.spec().width) * 0.5;
-            let horizontal_distance = (security_center - target_center).abs();
             (
                 security.id,
-                8.0 + f32::from(floor_distance) * 3.0 + horizontal_distance * 0.05,
+                8.0 + f32::from(floor_distance) * 3.0 + sweep_distance * 0.05,
             )
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
-fn security_team_start_x(
-    target: &Facility,
-    security: &Facility,
-    floors: &[GridPosition],
-    tower_width: u16,
-) -> f32 {
-    if target.position.floor == security.position.floor {
-        return f32::from(security.position.x) + f32::from(security.kind.spec().width) * 0.5;
-    }
+fn security_team_start_x(target: &Facility, floors: &[GridPosition], tower_width: u16) -> f32 {
+    let (left, right) = floor_extent_for(target.position.floor, floors).unwrap_or((0, tower_width));
+    f32::from(right.saturating_sub(2).max(left))
+}
+
+fn floor_extent_for(floor: i16, floors: &[GridPosition]) -> Option<(u16, u16)> {
     let left = floors
         .iter()
-        .filter(|position| position.floor == target.position.floor)
+        .filter(|position| position.floor == floor)
         .map(|position| position.x)
-        .min()
-        .unwrap_or(0);
+        .min()?;
     let right = floors
         .iter()
-        .filter(|position| position.floor == target.position.floor)
+        .filter(|position| position.floor == floor)
         .map(|position| position.x.saturating_add(1))
-        .max()
-        .unwrap_or(tower_width);
-    let target_center = f32::from(target.position.x) + f32::from(target.kind.spec().width) * 0.5;
-    if (target_center - f32::from(left)).abs() <= (f32::from(right) - target_center).abs() {
-        f32::from(left)
-    } else {
-        f32::from(right)
-    }
+        .max()?;
+    Some((left, right))
 }
 
 fn fire_response_timeout_remaining(elapsed: f32) -> u32 {
     (FIRE_RESPONSE_DECISION_SECONDS - elapsed).max(0.0).ceil() as u32
 }
 
-fn security_team_animation_frames(elapsed: f32, arrived: bool, member: usize) -> [(u64, f32); 2] {
+fn lobby_style_index(star_rating: u8) -> usize {
+    match star_rating {
+        0..=2 => 0,
+        3 => 1,
+        _ => 2,
+    }
+}
+
+fn emergency_guard_source_x(arrived: bool, world_x: f32) -> f32 {
     if arrived {
-        [(4, 1.0), (4, 0.0)]
+        112.0
+    } else if world_x.floor() as i32 & 1 == 0 {
+        80.0
     } else {
-        let (first, second) = person_walk_frame_weights(f64::from(elapsed), member as u64, false);
-        [(0, first), (1, second)]
+        96.0
     }
 }
 
@@ -8532,6 +8800,28 @@ fn texture_from_bmp_with_color_transparency(
     let texture = Texture2D::from_rgba8(width, height, &rgba);
     texture.set_filter(FilterMode::Nearest);
     Ok(texture)
+}
+
+fn texture_from_elevator_glyph_bmp(asset: AssetRef) -> Result<Texture2D, String> {
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
+    let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
+    let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
+    let mut rgba = image.rgba().to_vec();
+    apply_elevator_glyph_transparency(&mut rgba);
+    let texture = Texture2D::from_rgba8(width, height, &rgba);
+    texture.set_filter(FilterMode::Nearest);
+    Ok(texture)
+}
+
+fn apply_elevator_glyph_transparency(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        // Compound labels are overlays on the already-rendered shaft. The
+        // atlas background and panel lines occupy the dark half of its gray
+        // palette; the glyph ink begins at level 63.
+        if pixel[0].max(pixel[1]).max(pixel[2]) < 63 {
+            pixel[3] = 0;
+        }
+    }
 }
 
 fn texture_from_star_bmp(asset: AssetRef, earned: bool) -> Result<Texture2D, String> {
@@ -8802,7 +9092,7 @@ mod tests {
     }
 
     #[test]
-    fn every_emergency_forces_the_clock_and_resume_speed_to_one_x() {
+    fn emergency_speed_round_trip_restores_the_original_rate() {
         for starting_speed in [
             SimulationSpeed::Paused,
             SimulationSpeed::Fast,
@@ -8812,10 +9102,11 @@ mod tests {
         ] {
             let mut clock = Clock::default();
             clock.speed = starting_speed;
-            let mut resume_speed = starting_speed;
-            apply_emergency_speed(&mut clock, &mut resume_speed);
+            let resume_speed = apply_emergency_speed(&mut clock);
             assert_eq!(clock.speed, SimulationSpeed::Normal);
-            assert_eq!(resume_speed, SimulationSpeed::Normal);
+            assert_eq!(resume_speed, starting_speed);
+            restore_emergency_speed(&mut clock, resume_speed);
+            assert_eq!(clock.speed, starting_speed);
         }
     }
 
@@ -8841,41 +9132,64 @@ mod tests {
             position: GridPosition { x: 180, floor: 1 },
             ..nearby.clone()
         };
+        let floors = (0..96)
+            .map(|x| GridPosition { x, floor: 8 })
+            .collect::<Vec<_>>();
         let (_, nearby_seconds) =
-            nearest_security_fire_response(&target, std::iter::once(&nearby)).unwrap();
+            nearest_security_fire_response(&target, std::iter::once(&nearby), &floors, 256)
+                .unwrap();
         let (_, distant_seconds) =
-            nearest_security_fire_response(&target, std::iter::once(&distant)).unwrap();
+            nearest_security_fire_response(&target, std::iter::once(&distant), &floors, 256)
+                .unwrap();
         assert!(nearby_seconds <= FIRE_QUICK_RESPONSE_SECONDS);
         assert!(distant_seconds > FIRE_QUICK_RESPONSE_SECONDS);
     }
 
     #[test]
     fn fire_dialog_counts_down_before_automatic_security_dispatch() {
-        assert_eq!(fire_response_timeout_remaining(0.0), 8);
-        assert_eq!(fire_response_timeout_remaining(0.1), 8);
-        assert_eq!(fire_response_timeout_remaining(7.1), 1);
-        assert_eq!(fire_response_timeout_remaining(8.0), 0);
+        assert_eq!(fire_response_timeout_remaining(0.0), 15);
+        assert_eq!(fire_response_timeout_remaining(0.1), 15);
+        assert_eq!(fire_response_timeout_remaining(14.1), 1);
+        assert_eq!(fire_response_timeout_remaining(15.0), 0);
         assert_eq!(fire_response_timeout_remaining(20.0), 0);
     }
 
     #[test]
-    fn security_team_holds_one_clean_frame_after_arrival() {
-        let walking = security_team_animation_frames(0.1, false, 0);
-        assert_eq!(walking[0].0, 0);
-        assert_eq!(walking[1].0, 1);
-        assert!((walking[0].1 + walking[1].1 - 1.0).abs() < f32::EPSILON);
-        for elapsed in [0.0, 0.2, 1.0, 20.0] {
-            for member in 0..3 {
-                assert_eq!(
-                    security_team_animation_frames(elapsed, true, member),
-                    [(4, 1.0), (4, 0.0)]
-                );
-            }
-        }
+    fn security_team_uses_original_emergency_guard_cels() {
+        assert_eq!(emergency_guard_source_x(false, 20.0), 80.0);
+        assert_eq!(emergency_guard_source_x(false, 21.0), 96.0);
+        assert_eq!(emergency_guard_source_x(true, 20.0), 112.0);
     }
 
     #[test]
-    fn security_team_enters_from_the_nearest_outside_stair_on_other_floors() {
+    fn lobby_style_tracks_the_original_rating_tiers() {
+        assert_eq!(lobby_style_index(1), 0);
+        assert_eq!(lobby_style_index(2), 0);
+        assert_eq!(lobby_style_index(3), 1);
+        assert_eq!(lobby_style_index(4), 2);
+        assert_eq!(lobby_style_index(5), 2);
+    }
+
+    #[test]
+    fn sky_lobbies_use_the_dedicated_windowed_chunk() {
+        assert_lobby_artwork_source(0, 1, 15, (0, LOBBY_CHUNK_WIDTH));
+        assert_lobby_artwork_source(0, 1, 30, (0, LOBBY_CHUNK_WIDTH));
+    }
+
+    #[test]
+    fn ground_and_grand_lobbies_use_their_original_rows() {
+        assert_lobby_artwork_source(0, 1, 1, (0, 0.0));
+
+        assert_lobby_artwork_source(0, 2, 1, (0, LOBBY_CHUNK_WIDTH * 2.0));
+        assert_lobby_artwork_source(1, 2, 1, (2, 0.0));
+
+        assert_lobby_artwork_source(0, 3, 1, (0, LOBBY_CHUNK_WIDTH * 2.0));
+        assert_lobby_artwork_source(1, 3, 1, (1, LOBBY_CHUNK_WIDTH));
+        assert_lobby_artwork_source(2, 3, 1, (2, 0.0));
+    }
+
+    #[test]
+    fn security_team_enters_from_the_original_right_emergency_stair() {
         let target = Facility {
             id: 1,
             kind: FacilityKind::Shop,
@@ -8884,27 +9198,13 @@ mod tests {
             price_level: 1,
             stories: 1,
         };
-        let security = Facility {
-            id: 2,
-            kind: FacilityKind::Security,
-            position: GridPosition { x: 100, floor: 2 },
-            occupancy: simtower_core::FacilityOccupancy::NotApplicable,
-            price_level: 1,
-            stories: 1,
-        };
         let floors = (4..80)
             .map(|x| GridPosition { x, floor: 6 })
             .collect::<Vec<_>>();
-        assert_eq!(security_team_start_x(&target, &security, &floors, 256), 4.0);
+        assert_eq!(security_team_start_x(&target, &floors, 256), 78.0);
 
-        let same_floor_security = Facility {
-            position: GridPosition { x: 52, floor: 6 },
-            ..security
-        };
-        assert_eq!(
-            security_team_start_x(&target, &same_floor_security, &floors, 256),
-            60.0
-        );
+        // Office x does not change the entry side; guards use the exterior stair.
+        assert_eq!(security_team_start_x(&target, &floors, 256), 78.0);
     }
 
     #[test]
@@ -8994,6 +9294,27 @@ mod tests {
         assert_eq!(format_floor(15), "15");
         assert_eq!(format_floor(-1), "B1");
         assert_eq!(format_floor(-8), "B8");
+    }
+
+    #[test]
+    fn hidden_elevator_display_keeps_faint_infrastructure() {
+        assert_eq!(elevator_display_alpha(true), 1.0);
+        assert_eq!(elevator_display_alpha(false), 0.22);
+    }
+
+    #[test]
+    fn compound_elevator_labels_only_keep_glyph_ink() {
+        let mut rgba = vec![
+            25, 25, 25, 255, // shaft background
+            38, 38, 38, 255, // shaft bevel
+            63, 63, 63, 255, // normal label ink
+            190, 90, 80, 255, // selected label ink
+        ];
+        apply_elevator_glyph_transparency(&mut rgba);
+        assert_eq!(rgba[3], 0);
+        assert_eq!(rgba[7], 0);
+        assert_eq!(rgba[11], 255);
+        assert_eq!(rgba[15], 255);
     }
 
     #[test]
@@ -9090,6 +9411,7 @@ mod tests {
             demolition: PathBuf::new(),
             no_money: PathBuf::new(),
             payment: PathBuf::new(),
+            fire_alert: PathBuf::new(),
             fire_response: PathBuf::new(),
             elevator_move: PathBuf::new(),
             elevator_open: [PathBuf::new(), PathBuf::new()],
@@ -9257,9 +9579,13 @@ mod tests {
     }
 
     #[test]
-    fn report_currency_is_grouped_and_keeps_the_sign_before_the_dollar() {
+    fn currency_compacts_seven_figure_values_and_keeps_the_sign_before_the_dollar() {
         assert_eq!(format_number(2_000_000), "2,000,000");
-        assert_eq!(format_currency(2_000_000), "$2,000,000");
+        assert_eq!(format_currency(999_999), "$999,999");
+        assert_eq!(format_currency(1_000_000), "$1.0M");
+        assert_eq!(format_currency(2_040_000), "$2.0M");
+        assert_eq!(format_currency(2_060_000), "$2.1M");
+        assert_eq!(format_currency(-1_260_000), "-$1.3M");
         assert_eq!(format_currency(-12_345), "-$12,345");
     }
 
@@ -9562,7 +9888,9 @@ mod tests {
         assert_eq!(NO_MONEY_SOUND_ID, 7002);
         assert_eq!(DEMOLITION_SOUND_ID, 7003);
         assert_eq!(PAYMENT_SOUND_ID, 10013);
-        assert_eq!(FIRE_RESPONSE_SOUND_ID, 10004);
+        assert_eq!(FIRE_ALERT_SOUND_ID, 10006);
+        assert_eq!(FIRE_RESPONSE_SOUND_ID, 10009);
+        assert_eq!(FIRE_RESCUE_COST, 500_000);
         assert_eq!(ELEVATOR_MOVE_SOUND_ID, 6000);
         assert_eq!(ELEVATOR_OPEN_SOUND_IDS, [6001, 6002]);
         assert_eq!(CROWD_SOUND_ID, 8000);
@@ -9570,10 +9898,16 @@ mod tests {
 
     #[test]
     fn embedded_facility_bitmaps_cover_the_registered_source_rectangles() {
-        let resources: [(FacilityKind, AssetRef, u32, u32); 7] = [
-            (FacilityKind::Lobby, LOBBY_BACKGROUND_BMP, 992, 36),
-            (FacilityKind::Lobby, LOBBY_SECOND_STORY_BMP, 992, 36),
-            (FacilityKind::Lobby, LOBBY_THIRD_STORY_BMP, 992, 36),
+        let resources: [(FacilityKind, AssetRef, u32, u32); 13] = [
+            (FacilityKind::Lobby, LOBBY_FIRST_STORY_BMPS[0], 992, 36),
+            (FacilityKind::Lobby, LOBBY_FIRST_STORY_BMPS[1], 992, 36),
+            (FacilityKind::Lobby, LOBBY_FIRST_STORY_BMPS[2], 992, 36),
+            (FacilityKind::Lobby, LOBBY_SECOND_STORY_BMPS[0], 664, 36),
+            (FacilityKind::Lobby, LOBBY_SECOND_STORY_BMPS[1], 664, 36),
+            (FacilityKind::Lobby, LOBBY_SECOND_STORY_BMPS[2], 664, 36),
+            (FacilityKind::Lobby, LOBBY_THIRD_STORY_BMPS[0], 336, 36),
+            (FacilityKind::Lobby, LOBBY_THIRD_STORY_BMPS[1], 336, 36),
+            (FacilityKind::Lobby, LOBBY_THIRD_STORY_BMPS[2], 336, 36),
             (FacilityKind::Office, OFFICE_1_BMP, 288, 24),
             (FacilityKind::Condo, CONDO_STATE_BMPS[3], 128, 24),
             (FacilityKind::Restaurant, RESTAURANT_1_BMP, 384, 24),
@@ -9586,7 +9920,11 @@ mod tests {
             let mapping = facility_resource_ids(kind);
             assert_eq!(image.width(), expected_width, "wrong bitmap for {kind:?}");
             assert_eq!(image.height(), expected_height, "wrong bitmap for {kind:?}");
-            assert!(image.width() >= u32::from(mapping.source_width));
+            if kind == FacilityKind::Lobby {
+                assert!(image.width() >= (LOBBY_FACADE_OFFSET + LOBBY_FACADE_WIDTH) as u32);
+            } else {
+                assert!(image.width() >= u32::from(mapping.source_width));
+            }
             assert!(image.height() >= u32::from(mapping.source_height));
         }
 
@@ -9619,6 +9957,9 @@ mod tests {
         let payment_sound = simtower_formats::inspect_wave(PAYMENT_WAV.bytes().unwrap())
             .expect("payment sound resource must be a valid WAVE file");
         assert_eq!(payment_sound.channels, 1);
+        let fire_alert_sound = simtower_formats::inspect_wave(FIRE_ALERT_WAV.bytes().unwrap())
+            .expect("fire alert sound resource must be a valid WAVE file");
+        assert_eq!(fire_alert_sound.channels, 1);
         let fire_response_sound =
             simtower_formats::inspect_wave(FIRE_RESPONSE_WAV.bytes().unwrap())
                 .expect("fire response sound resource must be a valid WAVE file");
@@ -9656,6 +9997,13 @@ mod tests {
         let scaffolding =
             DibImage::decode_bmp(SCAFFOLD_BMP.bytes().unwrap()).expect("scaffolding must decode");
         assert_eq!((scaffolding.width(), scaffolding.height()), (328, 36));
+        let emergency_guards = DibImage::decode_bmp(PEOPLE_SILHOUETTE_BMPS[1].bytes().unwrap())
+            .expect("emergency guard strip must decode");
+        assert_eq!(
+            (emergency_guards.width(), emergency_guards.height()),
+            (160, 36)
+        );
+        assert!(emergency_guard_source_x(true, 0.0) + 16.0 <= emergency_guards.width() as f32);
         let santa = DibImage::decode_bmp(SANTA_BMP.bytes().unwrap())
             .expect("Santa event bitmap must decode");
         assert_eq!((santa.width(), santa.height()), (140, 48));
