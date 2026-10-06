@@ -156,6 +156,12 @@ enum TravelMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ElevatorAccess {
+    Public,
+    Housekeeping,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrafficSimulation {
     people: Vec<Person>,
@@ -167,6 +173,8 @@ pub struct TrafficSimulation {
     routes_from_lobby: HashMap<u64, TravelMode>,
     #[serde(default)]
     topology_signature: u64,
+    #[serde(default)]
+    known_destinations: HashSet<u64>,
     #[serde(default)]
     current_visitors: HashMap<u64, usize>,
     #[serde(default)]
@@ -187,6 +195,7 @@ impl Default for TrafficSimulation {
             reachable_facilities: HashSet::new(),
             routes_from_lobby: HashMap::new(),
             topology_signature: 0,
+            known_destinations: HashSet::new(),
             current_visitors: HashMap::new(),
             daily_visits: HashMap::new(),
             patronage_day: 0,
@@ -360,98 +369,141 @@ impl TrafficSimulation {
     }
 
     pub fn sync_with_tower(&mut self, tower: &Tower) {
+        self.sync_with_tower_internal(tower, false);
+    }
+
+    /// Synchronizes after construction that only adds route infrastructure.
+    /// Existing routes remain valid, so only newly placed or previously
+    /// unreachable destinations need pathfinding. Destructive edits continue
+    /// to use `sync_with_tower` and rebuild every route.
+    pub fn sync_with_tower_after_addition(&mut self, tower: &Tower) {
+        self.sync_with_tower_internal(tower, true);
+    }
+
+    fn sync_with_tower_internal(&mut self, tower: &Tower, additive_topology: bool) {
         let signature = tower_topology_signature(tower);
-        let route_cache_complete = self.routes_from_lobby.len() == self.reachable_facilities.len()
-            && self
-                .reachable_facilities
-                .iter()
-                .all(|facility_id| self.routes_from_lobby.contains_key(facility_id));
-        if self.topology_signature == signature && route_cache_complete {
-            return;
-        }
-
-        let mut groups: Vec<(FacilityKind, u16, u64, Vec<i16>)> = Vec::new();
-        for facility in tower.facilities().iter().filter(|facility| {
-            matches!(
-                facility.kind,
-                FacilityKind::Elevator
-                    | FacilityKind::ServiceElevator
-                    | FacilityKind::ExpressElevator
-            )
-        }) {
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| group.0 == facility.kind && group.1 == facility.position.x)
-            {
-                group.2 = group.2.min(facility.id);
-                if !group.3.contains(&facility.position.floor) {
-                    group.3.push(facility.position.floor);
-                }
-            } else {
-                groups.push((
-                    facility.kind,
-                    facility.position.x,
-                    facility.id,
-                    vec![facility.position.floor],
-                ));
-            }
-        }
-
-        let mut synchronized = Vec::with_capacity(groups.len());
-        for (kind, x, id, mut served_floors) in groups {
-            served_floors.sort_by_key(|floor| floor_ordinal(*floor));
-            if let Some(mut existing) = self
-                .elevators
-                .iter()
-                .find(|shaft| shaft.kind == kind && shaft.x == x)
-                .cloned()
-            {
-                existing.id = id;
-                existing.served_floors = served_floors;
-                for car in &mut existing.cars {
-                    if !existing.served_floors.contains(&car.home_floor) {
-                        car.home_floor = default_home_floor(&existing.served_floors);
-                    }
-                }
-                synchronized.push(existing);
-            } else {
-                let home_floor = default_home_floor(&served_floors);
-                synchronized.push(ElevatorShaft {
-                    id,
-                    kind,
-                    x,
-                    served_floors,
-                    cars: vec![ElevatorCar {
-                        floor_position: f32::from(floor_ordinal(home_floor)),
-                        home_floor,
-                        direction: ElevatorDirection::Idle,
-                        target_floor: None,
-                        passengers: Vec::new(),
-                        dwell_remaining: 0.0,
-                    }],
-                    schedules: [ElevatorSchedule::default(); 12],
-                    visible: true,
-                });
-            }
-        }
-        self.elevators = synchronized;
-
-        self.routes_from_lobby = tower
+        let destinations = tower
             .facilities()
             .iter()
             .filter(|facility| facility.kind.has_tenant_occupancy())
-            .filter_map(|facility| {
-                route_from_first_floor_lobby(
+            .collect::<Vec<_>>();
+        let destination_ids = destinations
+            .iter()
+            .map(|facility| facility.id)
+            .collect::<HashSet<_>>();
+        let topology_changed = self.topology_signature != signature;
+        let destinations_changed = self.known_destinations != destination_ids;
+        if !topology_changed && !destinations_changed {
+            return;
+        }
+
+        if topology_changed {
+            let mut groups: Vec<(FacilityKind, u16, u64, Vec<i16>)> = Vec::new();
+            for facility in tower.facilities().iter().filter(|facility| {
+                matches!(
+                    facility.kind,
+                    FacilityKind::Elevator
+                        | FacilityKind::ServiceElevator
+                        | FacilityKind::ExpressElevator
+                )
+            }) {
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.0 == facility.kind && group.1 == facility.position.x)
+                {
+                    group.2 = group.2.min(facility.id);
+                    if !group.3.contains(&facility.position.floor) {
+                        group.3.push(facility.position.floor);
+                    }
+                } else {
+                    groups.push((
+                        facility.kind,
+                        facility.position.x,
+                        facility.id,
+                        vec![facility.position.floor],
+                    ));
+                }
+            }
+
+            let mut synchronized = Vec::with_capacity(groups.len());
+            for (kind, x, id, mut served_floors) in groups {
+                served_floors.sort_by_key(|floor| floor_ordinal(*floor));
+                if let Some(mut existing) = self
+                    .elevators
+                    .iter()
+                    .find(|shaft| shaft.kind == kind && shaft.x == x)
+                    .cloned()
+                {
+                    existing.id = id;
+                    existing.served_floors = served_floors;
+                    for car in &mut existing.cars {
+                        if !existing.served_floors.contains(&car.home_floor) {
+                            car.home_floor = default_home_floor(&existing.served_floors);
+                        }
+                    }
+                    synchronized.push(existing);
+                } else {
+                    let home_floor = default_home_floor(&served_floors);
+                    synchronized.push(ElevatorShaft {
+                        id,
+                        kind,
+                        x,
+                        served_floors,
+                        cars: vec![ElevatorCar {
+                            floor_position: f32::from(floor_ordinal(home_floor)),
+                            home_floor,
+                            direction: ElevatorDirection::Idle,
+                            target_floor: None,
+                            passengers: Vec::new(),
+                            dwell_remaining: 0.0,
+                        }],
+                        schedules: [ElevatorSchedule::default(); 12],
+                        visible: true,
+                    });
+                }
+            }
+            self.elevators = synchronized;
+        }
+
+        if topology_changed && !additive_topology {
+            self.routes_from_lobby = destinations
+                .iter()
+                .filter_map(|facility| {
+                    route_from_first_floor_lobby(
+                        endpoint(facility),
+                        &self.elevators,
+                        tower.facilities(),
+                        tower.floors(),
+                    )
+                    .map(|route| (facility.id, route))
+                })
+                .collect();
+        } else {
+            // Tenant placement does not change corridors or transport.
+            // Additive construction cannot invalidate a working path either,
+            // so preserve existing routes and retry only new or unreachable
+            // destinations instead of rebuilding the whole tower graph.
+            self.routes_from_lobby
+                .retain(|facility_id, _| destination_ids.contains(facility_id));
+            for facility in &destinations {
+                let route_needs_refresh = !self.known_destinations.contains(&facility.id)
+                    || !self.routes_from_lobby.contains_key(&facility.id);
+                if !route_needs_refresh {
+                    continue;
+                }
+                if let Some(route) = route_from_first_floor_lobby(
                     endpoint(facility),
                     &self.elevators,
                     tower.facilities(),
                     tower.floors(),
-                )
-                .map(|route| (facility.id, route))
-            })
-            .collect();
+                ) {
+                    self.routes_from_lobby.insert(facility.id, route);
+                }
+            }
+        }
         self.reachable_facilities = self.routes_from_lobby.keys().copied().collect();
         self.topology_signature = signature;
+        self.known_destinations = destination_ids;
 
         let live_facilities: HashSet<u64> = tower
             .facilities()
@@ -1091,13 +1143,31 @@ fn tower_topology_signature(tower: &Tower) -> u64 {
         signature = mix64(signature ^ floor_bits);
     }
     signature = mix64(signature ^ tower.floors().len() as u64);
-    for facility in tower.facilities() {
+    let route_infrastructure = tower
+        .facilities()
+        .iter()
+        .filter(|facility| is_route_infrastructure(facility.kind));
+    let mut infrastructure_count = 0_u64;
+    for facility in route_infrastructure {
+        infrastructure_count += 1;
         let position_bits = u64::from(facility.position.x)
             | ((facility.position.floor as i64 as u64) << 16)
             | (u64::from(facility.stories) << 32);
         signature = mix64(signature ^ facility.id ^ ((facility.kind as u64) << 48) ^ position_bits);
     }
-    mix64(signature ^ tower.facilities().len() as u64)
+    mix64(signature ^ infrastructure_count)
+}
+
+const fn is_route_infrastructure(kind: FacilityKind) -> bool {
+    matches!(
+        kind,
+        FacilityKind::Lobby
+            | FacilityKind::Stairs
+            | FacilityKind::Escalator
+            | FacilityKind::Elevator
+            | FacilityKind::ServiceElevator
+            | FacilityKind::ExpressElevator
+    )
 }
 
 fn choose_route_scored(
@@ -1106,6 +1176,24 @@ fn choose_route_scored(
     elevators: &[ElevatorShaft],
     facilities: &[Facility],
     floors: &[GridPosition],
+) -> Option<(TravelMode, f32)> {
+    choose_route_scored_for(
+        origin,
+        destination,
+        elevators,
+        facilities,
+        floors,
+        ElevatorAccess::Public,
+    )
+}
+
+fn choose_route_scored_for(
+    origin: Endpoint,
+    destination: Endpoint,
+    elevators: &[ElevatorShaft],
+    facilities: &[Facility],
+    floors: &[GridPosition],
+    access: ElevatorAccess,
 ) -> Option<(TravelMode, f32)> {
     if origin.floor == destination.floor {
         return horizontal_floor_path(origin.floor, origin.x, destination.x, floors)
@@ -1119,31 +1207,33 @@ fn choose_route_scored(
     // flights. Their perceived cost rises quadratically, so people prefer a
     // nearby lift as the climb grows instead of treating every staircase as
     // equally attractive.
-    for (kind, x) in connected_vertical_walkways(origin.floor, destination.floor, facilities) {
-        let limit = if kind == FacilityKind::Escalator {
-            MAX_ESCALATOR_FLIGHTS
-        } else {
-            MAX_STAIR_FLIGHTS
-        };
-        if flights <= limit
-            && horizontal_floor_path(origin.floor, origin.x, x, floors)
-            && horizontal_floor_path(destination.floor, x, destination.x, floors)
-        {
-            let flight_penalty = if kind == FacilityKind::Escalator {
-                3.0
+    if access == ElevatorAccess::Public {
+        for (kind, x) in connected_vertical_walkways(origin.floor, destination.floor, facilities) {
+            let limit = if kind == FacilityKind::Escalator {
+                MAX_ESCALATOR_FLIGHTS
             } else {
-                6.0
+                MAX_STAIR_FLIGHTS
             };
-            let score = (origin.x - x).abs()
-                + (destination.x - x).abs()
-                + (flights * flights) as f32 * flight_penalty;
-            candidates.push((TravelMode::Stairs { x }, score));
+            if flights <= limit
+                && horizontal_floor_path(origin.floor, origin.x, x, floors)
+                && horizontal_floor_path(destination.floor, x, destination.x, floors)
+            {
+                let flight_penalty = if kind == FacilityKind::Escalator {
+                    3.0
+                } else {
+                    6.0
+                };
+                let score = (origin.x - x).abs()
+                    + (destination.x - x).abs()
+                    + (flights * flights) as f32 * flight_penalty;
+                candidates.push((TravelMode::Stairs { x }, score));
+            }
         }
     }
 
     for shaft in elevators.iter().filter(|shaft| {
         let x = shaft_center(shaft);
-        shaft.kind != FacilityKind::ServiceElevator
+        elevator_accepts(shaft.kind, access)
             && shaft_stops_at(shaft, origin.floor, facilities)
             && shaft_stops_at(shaft, destination.floor, facilities)
             && lobby_endpoint_connects_to_shaft(origin, shaft, facilities)
@@ -1161,6 +1251,15 @@ fn choose_route_scored(
         ));
     }
 
+    // Housekeepers walk on their current floor and take one direct service
+    // elevator between floors. They never use passenger/express cars, stairs,
+    // escalators, or public sky-lobby transfers.
+    if access == ElevatorAccess::Housekeeping {
+        return candidates
+            .into_iter()
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+    }
+
     let mut lobby_floors: Vec<i16> = facilities
         .iter()
         .filter(|facility| facility.kind == FacilityKind::Lobby)
@@ -1170,7 +1269,7 @@ fn choose_route_scored(
     lobby_floors.dedup();
     for first in elevators.iter().filter(|shaft| {
         let x = shaft_center(shaft);
-        shaft.kind != FacilityKind::ServiceElevator
+        elevator_accepts(shaft.kind, access)
             && shaft_stops_at(shaft, origin.floor, facilities)
             && lobby_endpoint_connects_to_shaft(origin, shaft, facilities)
             && horizontal_floor_path(origin.floor, origin.x, x, floors)
@@ -1218,6 +1317,13 @@ fn choose_route_scored(
     candidates
         .into_iter()
         .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+fn elevator_accepts(kind: FacilityKind, access: ElevatorAccess) -> bool {
+    match access {
+        ElevatorAccess::Public => kind != FacilityKind::ServiceElevator,
+        ElevatorAccess::Housekeeping => kind == FacilityKind::ServiceElevator,
+    }
 }
 
 fn shaft_center(shaft: &ElevatorShaft) -> f32 {
@@ -1672,7 +1778,42 @@ mod tests {
             Some(&TravelMode::SameFloor)
         );
 
-        tower.place_floor(GridPosition { x: 63, floor: 3 }).unwrap();
+        // Adding another tenant computes only that destination. Existing
+        // routes stay untouched because corridors and transport did not
+        // change.
+        let second_office = tower
+            .place(FacilityKind::Office, GridPosition { x: 9, floor: 2 })
+            .unwrap();
+        traffic.sync_with_tower(&tower);
+        assert_eq!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(&TravelMode::SameFloor)
+        );
+        assert!(matches!(
+            traffic.routes_from_lobby.get(&second_office),
+            Some(TravelMode::Elevator { .. })
+        ));
+
+        for x in 20..24 {
+            tower.place_floor(GridPosition { x, floor: 3 }).unwrap();
+        }
+        traffic.sync_with_tower_after_addition(&tower);
+        assert_eq!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(&TravelMode::SameFloor)
+        );
+
+        let extension = tower
+            .place(FacilityKind::Elevator, GridPosition { x: 20, floor: 3 })
+            .unwrap();
+        traffic.sync_with_tower_after_addition(&tower);
+        assert_eq!(
+            traffic.routes_from_lobby.get(&office_id),
+            Some(&TravelMode::SameFloor)
+        );
+        assert_eq!(traffic.elevators[0].served_floors, vec![1, 2, 3]);
+
+        tower.demolish(extension).unwrap();
         traffic.sync_with_tower(&tower);
         assert!(matches!(
             traffic.routes_from_lobby.get(&office_id),
@@ -1839,6 +1980,58 @@ mod tests {
             route,
             Some(TravelMode::Elevator { shaft_id: 2, .. })
         ));
+    }
+
+    #[test]
+    fn housekeeping_routes_are_exclusive_to_service_elevators() {
+        let public = test_shaft(1, FacilityKind::Elevator, 4, &[1, 2]);
+        let express = test_shaft(2, FacilityKind::ExpressElevator, 10, &[1, 2]);
+        let service = test_shaft(3, FacilityKind::ServiceElevator, 20, &[1, 2]);
+        let origin = Endpoint {
+            facility_id: 10,
+            x: 0.0,
+            floor: 1,
+        };
+        let destination = Endpoint {
+            facility_id: 11,
+            x: 30.0,
+            floor: 2,
+        };
+
+        let housekeeping_route = choose_route_scored_for(
+            origin,
+            destination,
+            &[public.clone(), express.clone(), service.clone()],
+            &[],
+            &[],
+            ElevatorAccess::Housekeeping,
+        )
+        .map(|(route, _)| route);
+        assert!(matches!(
+            housekeeping_route,
+            Some(TravelMode::Elevator { shaft_id: 3, .. })
+        ));
+
+        assert!(
+            choose_route_scored_for(
+                origin,
+                destination,
+                &[public, express],
+                &[],
+                &[],
+                ElevatorAccess::Housekeeping,
+            )
+            .is_none()
+        );
+        let public_route = choose_route_scored_for(
+            origin,
+            destination,
+            &[service],
+            &[],
+            &[],
+            ElevatorAccess::Public,
+        );
+        assert!(public_route.is_none());
     }
 
     #[test]
@@ -2099,6 +2292,8 @@ mod tests {
     fn businesses_only_generate_arrivals_during_open_hours() {
         assert!(!facility_is_open(FacilityKind::FastFood, 9 * 60 + 59));
         assert!(facility_is_open(FacilityKind::FastFood, 10 * 60));
+        assert!(facility_is_open(FacilityKind::FastFood, 20 * 60 + 59));
+        assert!(!facility_is_open(FacilityKind::FastFood, 21 * 60));
         assert!(!facility_is_open(FacilityKind::Office, 8 * 60 + 59));
         assert!(facility_is_open(FacilityKind::Office, 9 * 60));
         assert!(!facility_is_open(FacilityKind::Office, 17 * 60));

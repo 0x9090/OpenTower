@@ -17,7 +17,9 @@ needs from that file.
 
 1. Download the package for your operating system from the project's
    [Releases page](https://github.com/0x9090/OpenTower/releases).
-2. Extract the package and launch `simtower` (`simtower.exe` on Windows).
+2. Extract the package and launch `OpenTower.app` on macOS, `OpenTower.exe`
+   on Windows, or `OpenTower` on Linux. The desktop game does not require a
+   terminal or command-prompt window.
 3. The first time OpenTower starts, select your original `SimTower.exe` when
    prompted.
 

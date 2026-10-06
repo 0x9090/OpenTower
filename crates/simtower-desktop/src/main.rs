@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(feature = "bundled-resources")]
 use macroquad::miniquad::conf::Icon;
 use macroquad::miniquad::window;
@@ -19,6 +21,16 @@ use std::{
 
 mod resources;
 use resources::*;
+
+#[cfg(target_os = "windows")]
+fn hidden_windows_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
 
 // The original placement code converts x coordinates in 8-pixel slices and
 // y coordinates in 36-pixel floors. Keeping that ratio is essential to the
@@ -46,7 +58,11 @@ const SPEED_CHOICES: [SimulationSpeed; 6] = [
 ];
 const SKY_TILE_WIDTH: f32 = 200.0;
 const SKY_HORIZON: f32 = 264.0;
-const VERTICAL_WHEEL_FLOORS_PER_STEP: f32 = 1.0;
+const VERTICAL_WHEEL_FLOORS_PER_STEP: f32 = 0.5;
+const HORIZONTAL_WHEEL_COLUMNS_PER_STEP: f32 = 2.0;
+const LOBBY_HEIGHT_HELP: &str =
+    "first lobby: Ctrl/Option = 2 stories; Ctrl/Option+Shift = 3; build upper floors first";
+const EMERGENCY_STAIR_HALF_WIDTH: f32 = 24.0;
 const PALETTE_X: f32 = 12.0;
 const PALETTE_Y: f32 = 78.0;
 const PALETTE_TITLE_HEIGHT: f32 = 20.0;
@@ -360,6 +376,40 @@ struct SaveNameDialog {
     name: String,
     error: Option<String>,
     overwrite_path: Option<PathBuf>,
+    replace_default_on_input: bool,
+}
+
+impl SaveNameDialog {
+    fn with_default_name() -> Self {
+        Self {
+            name: DEFAULT_SAVE_NAME.to_owned(),
+            error: None,
+            overwrite_path: None,
+            replace_default_on_input: true,
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.replace_default_on_input {
+            self.name.clear();
+            self.replace_default_on_input = false;
+        } else {
+            self.name.pop();
+        }
+        self.error = None;
+    }
+
+    fn push_character(&mut self, character: char) {
+        if character.is_control() || self.name.chars().count() >= 64 {
+            return;
+        }
+        if self.replace_default_on_input {
+            self.name.clear();
+            self.replace_default_on_input = false;
+        }
+        self.name.push(character);
+        self.error = None;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1076,11 +1126,7 @@ impl App {
     }
 
     fn begin_save_name_dialog(&mut self) {
-        self.save_name_dialog = Some(SaveNameDialog {
-            name: DEFAULT_SAVE_NAME.to_owned(),
-            error: None,
-            overwrite_path: None,
-        });
+        self.save_name_dialog = Some(SaveNameDialog::with_default_name());
         self.status = "Enter a save-game name".to_owned();
     }
 
@@ -1108,6 +1154,7 @@ impl App {
                 if let Some(dialog) = &mut self.save_name_dialog {
                     dialog.overwrite_path = None;
                     dialog.error = Some("Existing save kept; enter a different name".to_owned());
+                    dialog.replace_default_on_input = true;
                 }
                 self.status = "Save was not overwritten".to_owned();
                 return;
@@ -1139,14 +1186,10 @@ impl App {
         let mut cancel = is_key_pressed(KeyCode::Escape);
         if let Some(dialog) = &mut self.save_name_dialog {
             if is_key_pressed(KeyCode::Backspace) {
-                dialog.name.pop();
-                dialog.error = None;
+                dialog.backspace();
             }
             while let Some(character) = get_char_pressed() {
-                if !character.is_control() && dialog.name.chars().count() < 64 {
-                    dialog.name.push(character);
-                    dialog.error = None;
-                }
+                dialog.push_character(character);
             }
         }
         if is_mouse_button_pressed(MouseButton::Left) {
@@ -1767,8 +1810,9 @@ impl App {
                 } else {
                     wheel.0
                 };
-                self.camera_x =
-                    (self.camera_x - horizontal_delta * 8.0).clamp(0.0, maximum_camera_x);
+                self.camera_x = (self.camera_x
+                    - horizontal_delta * HORIZONTAL_WHEEL_COLUMNS_PER_STEP)
+                    .clamp(0.0, maximum_camera_x);
             } else {
                 self.camera_floor = (self.camera_floor + wheel.1 * VERTICAL_WHEEL_FLOORS_PER_STEP)
                     .clamp(-8.0, 99.0);
@@ -2033,7 +2077,7 @@ impl App {
             match self.tower.place(kind, GridPosition { x, floor }) {
                 Ok(_) => {
                     self.assets.play_construction(kind);
-                    self.traffic.sync_with_tower(&self.tower);
+                    self.traffic.sync_with_tower_after_addition(&self.tower);
                     if self.show_secret_discovery() {
                         return;
                     }
@@ -2056,7 +2100,9 @@ impl App {
                     self.build_floor_across_width(position.floor);
                     return;
                 }
-                ToolMode::Build(FacilityKind::Lobby) => {
+                ToolMode::Build(FacilityKind::Lobby)
+                    if lobby_stories_for_position(&self.tower, position) == 1 =>
+                {
                     self.build_lobby_across_width(position);
                     return;
                 }
@@ -2135,7 +2181,7 @@ impl App {
                     match result {
                         Ok(_) => {
                             self.assets.play_construction(kind);
-                            self.traffic.sync_with_tower(&self.tower);
+                            self.traffic.sync_with_tower_after_addition(&self.tower);
                             if self.show_secret_discovery() {
                                 return;
                             }
@@ -2263,6 +2309,7 @@ impl App {
         self.paint_drag_last = Some(position);
         match self.tower.place_floor(position) {
             Ok(()) => {
+                self.traffic.sync_with_tower_after_addition(&self.tower);
                 self.assets.play_floor_construction();
                 self.status = format!(
                     "Built empty floor on level {}, column {} — keep dragging to extend",
@@ -2304,6 +2351,7 @@ impl App {
 
         self.paint_drag_last = None;
         if built > 0 {
+            self.traffic.sync_with_tower_after_addition(&self.tower);
             self.assets.play_floor_construction();
         }
         let final_error = last_error.or(limiting_error);
@@ -2368,6 +2416,7 @@ impl App {
         self.paint_drag_last = None;
         self.lobby_drag_stories = stories;
         if built > 0 {
+            self.traffic.sync_with_tower_after_addition(&self.tower);
             self.assets.play_construction(FacilityKind::Lobby);
             self.status = format!(
                 "Painted {built} {} slice{} across the full buildable length of floor {}",
@@ -2420,7 +2469,7 @@ impl App {
             }
         }
         self.paint_drag_last = None;
-        self.traffic.sync_with_tower(&self.tower);
+        self.traffic.sync_with_tower_after_addition(&self.tower);
         self.sync_tenant_variants();
         if built > 0 {
             self.assets.play_construction(kind);
@@ -2474,6 +2523,7 @@ impl App {
         self.paint_drag_last = Some(position);
         match self.tower.place_lobby(position, self.lobby_drag_stories) {
             Ok(id) => {
+                self.traffic.sync_with_tower_after_addition(&self.tower);
                 self.construction.push(ConstructionAnimation {
                     facility_id: id,
                     remaining: CONSTRUCTION_SECONDS,
@@ -2552,6 +2602,7 @@ impl App {
             self.assets.play_no_money();
         }
         if built > 0 {
+            self.traffic.sync_with_tower_after_addition(&self.tower);
             self.status = match self.tool {
                 ToolMode::Floor => format!(
                     "Extended empty floor by {built} slice{} on level {}",
@@ -2607,7 +2658,7 @@ impl App {
         }
         if built > 0 {
             self.assets.play_construction(drag.kind);
-            self.traffic.sync_with_tower(&self.tower);
+            self.traffic.sync_with_tower_after_addition(&self.tower);
             self.status = format!(
                 "Extended {} shaft by {built} floor{}",
                 drag.kind.spec().name,
@@ -2690,7 +2741,13 @@ impl App {
         self.tool = ToolMode::Build(kind);
         self.open_menu = None;
         self.paint_drag_last = None;
-        self.status = if is_elevator_kind(kind) {
+        self.status = if kind == FacilityKind::Lobby {
+            format!(
+                "Selected Lobby - {}; {}",
+                build_price_label(kind),
+                LOBBY_HEIGHT_HELP
+            )
+        } else if is_elevator_kind(kind) {
             format!(
                 "Selected {} - {}; endpoint arrows extend the shaft without another shaft charge",
                 kind.spec().name,
@@ -3821,16 +3878,19 @@ impl App {
     }
 
     fn draw_floor_end_stairs(&self) {
-        const STAIR_HALF_WIDTH: f32 = 24.0;
         let floor_cells = self.tower.floors().iter().copied().collect::<HashSet<_>>();
         for start in self.tower.floors() {
-            if !self.floor_cell_is_visible(*start)
-                || (start.x > 0
-                    && floor_cells.contains(&GridPosition {
-                        x: start.x - 1,
-                        floor: start.floor,
-                    }))
+            if start.x > 0
+                && floor_cells.contains(&GridPosition {
+                    x: start.x - 1,
+                    floor: start.floor,
+                })
             {
+                continue;
+            }
+
+            let y = floor_top_y(self.ground_y(), start.floor);
+            if y + FLOOR_HEIGHT < TOPBAR_HEIGHT || y > screen_height() {
                 continue;
             }
 
@@ -3844,23 +3904,31 @@ impl App {
                 end_x += 1;
             }
 
-            let x = (f32::from(start.x) - self.camera_x) * CELL_WIDTH;
-            let y = floor_top_y(self.ground_y(), start.floor);
-            for (destination_x, source_x) in [
-                (x - STAIR_HALF_WIDTH, 0.0),
-                (
-                    (f32::from(end_x) - self.camera_x) * CELL_WIDTH,
-                    STAIR_HALF_WIDTH,
-                ),
-            ] {
+            let destinations = emergency_stair_screen_xs(start.x, end_x, self.camera_x);
+            for (destination_x, source_x) in destinations
+                .into_iter()
+                .zip([0.0, EMERGENCY_STAIR_HALF_WIDTH])
+            {
+                if !horizontal_span_is_visible(
+                    destination_x,
+                    EMERGENCY_STAIR_HALF_WIDTH,
+                    screen_width(),
+                ) {
+                    continue;
+                }
                 draw_texture_ex(
                     &self.assets.emergency_stairs,
                     destination_x,
                     y,
                     WHITE,
                     DrawTextureParams {
-                        dest_size: Some(vec2(STAIR_HALF_WIDTH, FLOOR_HEIGHT)),
-                        source: Some(Rect::new(source_x, 0.0, STAIR_HALF_WIDTH, FLOOR_HEIGHT)),
+                        dest_size: Some(vec2(EMERGENCY_STAIR_HALF_WIDTH, FLOOR_HEIGHT)),
+                        source: Some(Rect::new(
+                            source_x,
+                            0.0,
+                            EMERGENCY_STAIR_HALF_WIDTH,
+                            FLOOR_HEIGHT,
+                        )),
                         ..Default::default()
                     },
                 );
@@ -3902,11 +3970,22 @@ impl App {
             return;
         }
         if is_elevator_kind(facility.kind) {
-            let visible = self
-                .traffic
-                .elevator_at(facility.kind, facility.position.x)
-                .is_none_or(|shaft| shaft.visible);
-            self.draw_empty_elevator_shaft(x, y, width, facility.position.floor, visible);
+            let shaft = self.traffic.elevator_at(facility.kind, facility.position.x);
+            let visible = shaft.is_none_or(|shaft| shaft.visible);
+            let default_waiting_floor = shaft.is_some_and(|shaft| {
+                shaft
+                    .cars
+                    .iter()
+                    .any(|car| car.home_floor == facility.position.floor)
+            });
+            self.draw_empty_elevator_shaft(
+                x,
+                y,
+                width,
+                facility.position.floor,
+                visible,
+                default_waiting_floor,
+            );
             return;
         }
         let floors = f32::from(facility.kind.spec().height);
@@ -4134,7 +4213,15 @@ impl App {
         }
     }
 
-    fn draw_empty_elevator_shaft(&self, x: f32, y: f32, width: f32, floor: i16, visible: bool) {
+    fn draw_empty_elevator_shaft(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        floor: i16,
+        visible: bool,
+        default_waiting_floor: bool,
+    ) {
         let tint = Color::new(1.0, 1.0, 1.0, elevator_display_alpha(visible));
         let tile_width = self.assets.elevator_shaft.width();
         let mut offset = 0.0;
@@ -4154,16 +4241,27 @@ impl App {
             offset += draw_width;
         }
 
-        // Resources 2024-2026 are the original light-gray shaft floor
-        // designations. Cars are drawn later and naturally cover the label.
-        self.draw_elevator_floor_number(floor, x, y, width, tint);
+        // Resources 2024-2026 are the light-gray shaft designations;
+        // 2027-2029 are their original light-pink default-floor counterparts.
+        // Cars are drawn later and naturally cover the label.
+        self.draw_elevator_floor_number(floor, x, y, width, tint, default_waiting_floor);
     }
 
-    fn draw_elevator_floor_number(&self, floor: i16, x: f32, y: f32, width: f32, tint: Color) {
+    fn draw_elevator_floor_number(
+        &self,
+        floor: i16,
+        x: f32,
+        y: f32,
+        width: f32,
+        tint: Color,
+        default_waiting_floor: bool,
+    ) {
+        let (single_atlas, digit_atlas, basement_atlas) =
+            elevator_number_texture_indices(default_waiting_floor);
         if (1..=9).contains(&floor) || floor == 100 {
             let frame = if floor == 100 { 10 } else { floor as usize };
             draw_texture_ex(
-                &self.assets.elevator_numbers[0],
+                &self.assets.elevator_numbers[single_atlas],
                 x + (width - 32.0) * 0.5,
                 y,
                 tint,
@@ -4192,7 +4290,7 @@ impl App {
             // Resource 2026 starts with packed B1/B2 cels. Its third cell is
             // the standalone B used when composing normal shaft labels.
             self.draw_elevator_label_glyph(
-                &self.assets.elevator_numbers[2],
+                &self.assets.elevator_numbers[basement_atlas],
                 2.0 * CELL_WIDTH + 4.0,
                 draw_x,
                 y,
@@ -4205,7 +4303,7 @@ impl App {
         for character in label.chars() {
             let digit = character.to_digit(10).unwrap_or(0) as f32;
             draw_texture_ex(
-                &self.assets.elevator_numbers[1],
+                &self.assets.elevator_numbers[digit_atlas],
                 draw_x,
                 y,
                 tint,
@@ -4456,10 +4554,12 @@ impl App {
                 ToolMode::Floor => Some((floor_fill_plan(&self.tower, position.floor), 1_u8)),
                 ToolMode::Build(FacilityKind::Lobby) => {
                     let stories = lobby_stories_for_position(&self.tower, position);
-                    Some((
-                        lobby_fill_plan(&self.tower, position.floor, stories),
-                        stories,
-                    ))
+                    (stories == 1).then(|| {
+                        (
+                            lobby_fill_plan(&self.tower, position.floor, stories),
+                            stories,
+                        )
+                    })
                 }
                 ToolMode::Build(kind) if kind.has_tenant_occupancy() => {
                     let plan = tenant_fill_plan(&self.tower, kind, position);
@@ -4881,7 +4981,7 @@ impl App {
                 }
                 _ => continue,
             };
-            for (car_index, car) in shaft.cars.iter().enumerate() {
+            for car in &shaft.cars {
                 let passenger_count = car.passengers.len();
                 let frame = if passenger_count == 0 {
                     0
@@ -4903,7 +5003,10 @@ impl App {
                             Rect::new(frame as f32 * frame_width, 0.0, frame_width, FLOOR_HEIGHT),
                         )
                     };
-                let x = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH + car_index as f32 * 2.0;
+                // All cars share the shaft origin. Offsetting later cars made
+                // them drift outside the shaft whenever they occupied
+                // different floors.
+                let x = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
                 let y = floor_position_top_y(self.ground_y(), car.floor_position);
                 draw_texture_ex(
                     car_texture,
@@ -5638,13 +5741,31 @@ impl App {
             };
             visible_name = &visible_name[index..];
         }
-        draw_text(visible_name, input.x + 6.0, input.y + 19.0, 16.0, BLACK);
-        let caret_x = input.x
-            + 6.0
-            + measure_text(visible_name, None, 16, 1.0)
-                .width
-                .min(max_width);
-        draw_line(caret_x, input.y + 5.0, caret_x, input.y + 22.0, 1.0, BLACK);
+        let visible_width = measure_text(visible_name, None, 16, 1.0).width;
+        if dialog.replace_default_on_input && !visible_name.is_empty() {
+            draw_rectangle(
+                input.x + 4.0,
+                input.y + 3.0,
+                visible_width + 4.0,
+                input.h - 6.0,
+                TITLE_BLUE,
+            );
+        }
+        draw_text(
+            visible_name,
+            input.x + 6.0,
+            input.y + 19.0,
+            16.0,
+            if dialog.replace_default_on_input {
+                WHITE
+            } else {
+                BLACK
+            },
+        );
+        let caret_x = input.x + 6.0 + visible_width.min(max_width);
+        if !dialog.replace_default_on_input {
+            draw_line(caret_x, input.y + 5.0, caret_x, input.y + 22.0, 1.0, BLACK);
+        }
         if let Some(error) = &dialog.error {
             draw_text(error, rect.x + 14.0, rect.y + 105.0, 12.0, RED);
         } else if let Ok(directory) = save_game_directory() {
@@ -5908,6 +6029,13 @@ impl App {
                 )
             } else if entry.builds_floor {
                 format!("{} — ${FLOOR_CONSTRUCTION_COST} per slice", entry.label)
+            } else if entry.kind == Some(FacilityKind::Lobby) {
+                format!(
+                    "{} — {}; {}",
+                    entry.label,
+                    build_price_label(FacilityKind::Lobby),
+                    LOBBY_HEIGHT_HELP
+                )
             } else {
                 entry.kind.map_or_else(
                     || entry.label.to_owned(),
@@ -6257,16 +6385,33 @@ const fn queue_sheet_for_mood(mood: PersonMood) -> usize {
 fn requested_lobby_stories() -> u8 {
     let control = is_key_down(KeyCode::LeftControl)
         || is_key_down(KeyCode::RightControl)
+        || is_key_down(KeyCode::LeftAlt)
+        || is_key_down(KeyCode::RightAlt)
         || is_key_down(KeyCode::LeftSuper)
         || is_key_down(KeyCode::RightSuper);
     let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
-    if control && shift {
+    lobby_stories_for_modifiers(control, shift)
+}
+
+const fn lobby_stories_for_modifiers(control_or_option: bool, shift: bool) -> u8 {
+    if control_or_option && shift {
         3
-    } else if control {
+    } else if control_or_option {
         2
     } else {
         1
     }
+}
+
+fn horizontal_span_is_visible(x: f32, width: f32, viewport_width: f32) -> bool {
+    x + width >= 0.0 && x <= viewport_width
+}
+
+fn emergency_stair_screen_xs(start_x: u16, end_x: u16, camera_x: f32) -> [f32; 2] {
+    [
+        (f32::from(start_x) - camera_x) * CELL_WIDTH - EMERGENCY_STAIR_HALF_WIDTH,
+        (f32::from(end_x) - camera_x) * CELL_WIDTH,
+    ]
 }
 
 fn seasonal_event_for_date(date: &str) -> Option<SeasonalEventKind> {
@@ -6288,12 +6433,31 @@ fn lobby_display_name(floor: i16, stories: u8) -> &'static str {
 }
 
 fn lobby_stories_for_position(tower: &Tower, position: GridPosition) -> u8 {
-    let is_first_lobby = !tower
+    lobby_stories_for_position_with_request(tower, position, requested_lobby_stories())
+}
+
+fn lobby_stories_for_position_with_request(
+    tower: &Tower,
+    position: GridPosition,
+    requested_stories: u8,
+) -> u8 {
+    if position.floor != 1 || requested_stories <= 1 {
+        return 1;
+    }
+    let existing_lobbies = tower
         .facilities()
         .iter()
-        .any(|facility| facility.kind == FacilityKind::Lobby);
-    if is_first_lobby && position.floor == 1 {
-        requested_lobby_stories()
+        .filter(|facility| facility.kind == FacilityKind::Lobby)
+        .collect::<Vec<_>>();
+    if existing_lobbies.is_empty()
+        || (existing_lobbies
+            .iter()
+            .all(|facility| facility.position.floor == 1 && facility.stories == requested_stories)
+            && existing_lobbies.iter().any(|facility| {
+                facility.position.x + 1 == position.x || position.x + 1 == facility.position.x
+            }))
+    {
+        requested_stories
     } else {
         1
     }
@@ -6308,7 +6472,7 @@ fn seasonal_event_for_system_date() -> Option<SeasonalEventKind> {
         return seasonal_event_for_date(&override_date);
     }
     #[cfg(target_os = "windows")]
-    let output = Command::new("powershell")
+    let output = hidden_windows_command("powershell")
         .args(["-NoProfile", "-Command", "(Get-Date).ToString('MM-dd')"])
         .output()
         .ok()?;
@@ -6740,7 +6904,7 @@ fn choose_save_game_file() -> Result<Option<PathBuf>, String> {
     let script = format!(
         "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Title='Load SimTower save game'; $d.InitialDirectory='{directory}'; $d.Filter='SimTower saves (*.smtower)|*.smtower|All files (*.*)|*.*'; if($d.ShowDialog() -eq 'OK'){{$d.FileName}}"
     );
-    let output = Command::new("powershell.exe")
+    let output = hidden_windows_command("powershell.exe")
         .args(["-NoProfile", "-STA", "-Command", &script])
         .output()
         .map_err(|error| format!("could not launch the Windows file picker: {error}"))?;
@@ -7168,6 +7332,14 @@ fn with_alpha(mut color: Color, alpha: f32) -> Color {
 
 const fn elevator_display_alpha(visible: bool) -> f32 {
     if visible { 1.0 } else { 0.22 }
+}
+
+const fn elevator_number_texture_indices(default_waiting_floor: bool) -> (usize, usize, usize) {
+    if default_waiting_floor {
+        (3, 4, 5)
+    } else {
+        (0, 1, 2)
+    }
 }
 
 fn is_vertical_transport(kind: FacilityKind) -> bool {
@@ -8497,7 +8669,7 @@ fn play_native_sound(path: PathBuf) {
 fn play_native_sound(path: PathBuf) {
     let escaped = path.to_string_lossy().replace('\'', "''");
     let script = format!("(New-Object System.Media.SoundPlayer '{escaped}').PlaySync()");
-    if let Ok(mut child) = Command::new("powershell")
+    if let Ok(mut child) = hidden_windows_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .spawn()
     {
@@ -8930,15 +9102,74 @@ fn texture_from_bmp(asset: AssetRef) -> Result<Texture2D, String> {
 #[cfg(target_os = "macos")]
 fn maximize_window() {
     use objc_rs::runtime::Object;
-    use objc_rs::{class, msg_send, sel, sel_impl};
+    use objc_rs::{Encode, Encoding, class, msg_send, sel, sel_impl};
 
-    // AppKit's zoom action is the native maximize operation and deliberately
-    // keeps the app in a normal, decorated window rather than a fullscreen Space.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsPoint {
+        x: f64,
+        y: f64,
+    }
+
+    unsafe impl Encode for NsPoint {
+        fn encode() -> Encoding {
+            let encoding = format!(
+                "{{CGPoint={}{}}}",
+                f64::encode().as_str(),
+                f64::encode().as_str()
+            );
+            unsafe { Encoding::from_str(&encoding) }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsSize {
+        width: f64,
+        height: f64,
+    }
+
+    unsafe impl Encode for NsSize {
+        fn encode() -> Encoding {
+            let encoding = format!(
+                "{{CGSize={}{}}}",
+                f64::encode().as_str(),
+                f64::encode().as_str()
+            );
+            unsafe { Encoding::from_str(&encoding) }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsRect {
+        origin: NsPoint,
+        size: NsSize,
+    }
+
+    unsafe impl Encode for NsRect {
+        fn encode() -> Encoding {
+            let encoding = format!(
+                "{{CGRect={}{}}}",
+                NsPoint::encode().as_str(),
+                NsSize::encode().as_str()
+            );
+            unsafe { Encoding::from_str(&encoding) }
+        }
+    }
+
+    // Resize to the usable screen bounds without animation. AppKit's `zoom:`
+    // action can synchronously trigger another draw while Macroquad is already
+    // drawing, which aborts a normally launched .app bundle.
     unsafe {
         let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
         let window: *mut Object = msg_send![application, mainWindow];
         if !window.is_null() {
-            let _: () = msg_send![window, zoom: std::ptr::null_mut::<Object>()];
+            let screen: *mut Object = msg_send![window, screen];
+            if !screen.is_null() {
+                let visible_frame: NsRect = msg_send![screen, visibleFrame];
+                let _: () = msg_send![window, setFrame:visible_frame display:false animate:false];
+            }
         }
     }
 }
@@ -9189,6 +9420,36 @@ mod tests {
     }
 
     #[test]
+    fn original_lobby_modifiers_select_two_and_three_story_artwork() {
+        assert_eq!(lobby_stories_for_modifiers(false, false), 1);
+        assert_eq!(lobby_stories_for_modifiers(true, false), 2);
+        assert_eq!(lobby_stories_for_modifiers(true, true), 3);
+        assert_eq!(lobby_stories_for_modifiers(false, true), 1);
+
+        let mut tower = Tower::new(16, 1_000_000);
+        for floor in 1..=3 {
+            for x in 0..4 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        assert_eq!(
+            lobby_stories_for_position_with_request(&tower, GridPosition { x: 0, floor: 1 }, 3),
+            3
+        );
+        tower
+            .place_lobby(GridPosition { x: 0, floor: 1 }, 3)
+            .unwrap();
+        assert_eq!(
+            lobby_stories_for_position_with_request(&tower, GridPosition { x: 1, floor: 1 }, 3),
+            3
+        );
+        assert_eq!(
+            lobby_stories_for_position_with_request(&tower, GridPosition { x: 3, floor: 1 }, 3),
+            1
+        );
+    }
+
+    #[test]
     fn security_team_enters_from_the_original_right_emergency_stair() {
         let target = Facility {
             id: 1,
@@ -9300,6 +9561,12 @@ mod tests {
     fn hidden_elevator_display_keeps_faint_infrastructure() {
         assert_eq!(elevator_display_alpha(true), 1.0);
         assert_eq!(elevator_display_alpha(false), 0.22);
+    }
+
+    #[test]
+    fn elevator_default_floors_use_the_original_pink_number_atlases() {
+        assert_eq!(elevator_number_texture_indices(false), (0, 1, 2));
+        assert_eq!(elevator_number_texture_indices(true), (3, 4, 5));
     }
 
     #[test]
@@ -9539,6 +9806,23 @@ mod tests {
     }
 
     #[test]
+    fn save_dialog_always_starts_with_selected_tower_default() {
+        let mut dialog = SaveNameDialog::with_default_name();
+        assert_eq!(dialog.name, "Tower");
+        assert!(dialog.replace_default_on_input);
+
+        dialog.push_character('M');
+        dialog.push_character('y');
+        assert_eq!(dialog.name, "My");
+        assert!(!dialog.replace_default_on_input);
+
+        let mut dialog = SaveNameDialog::with_default_name();
+        dialog.backspace();
+        assert!(dialog.name.is_empty());
+        assert!(!dialog.replace_default_on_input);
+    }
+
+    #[test]
     fn save_game_json_round_trips_simulation_state() {
         let mut tower = Tower::new(32, 2_000_000);
         for x in 0..16 {
@@ -9670,7 +9954,23 @@ mod tests {
         let origin = sky_tile_origin_x(0.0);
         let shifted = sky_tile_origin_x(1.0);
         assert_eq!(shifted - origin, -CELL_WIDTH);
-        assert_eq!(VERTICAL_WHEEL_FLOORS_PER_STEP, 1.0);
+        assert_eq!(VERTICAL_WHEEL_FLOORS_PER_STEP, 0.5);
+        assert_eq!(HORIZONTAL_WHEEL_COLUMNS_PER_STEP, 2.0);
+    }
+
+    #[test]
+    fn each_emergency_stair_is_culled_independently_while_panning() {
+        let [left, right] = emergency_stair_screen_xs(0, 100, 40.0);
+        assert!(!horizontal_span_is_visible(
+            left,
+            EMERGENCY_STAIR_HALF_WIDTH,
+            1_200.0
+        ));
+        assert!(horizontal_span_is_visible(
+            right,
+            EMERGENCY_STAIR_HALF_WIDTH,
+            1_200.0
+        ));
     }
 
     #[test]

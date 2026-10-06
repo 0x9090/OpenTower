@@ -63,21 +63,32 @@ jobs:
       - name: Build OpenTower
         run: cargo build --locked --release --package simtower-desktop --no-default-features
 
-      - name: Package Linux or macOS binary
-        if: runner.os != 'Windows'
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          case "$RUNNER_OS" in
-            Linux) platform="linux" ;;
-            macOS) platform="macos" ;;
-            *) echo "Unsupported runner: $RUNNER_OS" >&2; exit 1 ;;
-          esac
           architecture="$(uname -m)"
-          package="OpenTower-${platform}-${architecture}"
+          package="OpenTower-linux-${architecture}"
           mkdir -p "packages/${package}"
           install -m 755 target/release/simtower "packages/${package}/OpenTower"
           tar -C packages -czf "packages/${package}.tar.gz" "${package}"
+          rm -rf "packages/${package}"
+
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          architecture="$(uname -m)"
+          package="OpenTower-macos-${architecture}"
+          mkdir -p "packages/${package}"
+          scripts/create-macos-app.sh \
+            target/release/simtower \
+            "packages/${package}/OpenTower.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "packages/${package}" \
+            "packages/${package}.zip"
           rm -rf "packages/${package}"
 
       - name: Package Windows binary

@@ -3,6 +3,16 @@ use simtower_formats::{DibImage, NeFile, trim_wave};
 #[cfg(not(feature = "bundled-resources"))]
 use std::{collections::HashMap, env, fs, path::PathBuf, process::Command, sync::OnceLock};
 
+#[cfg(all(not(feature = "bundled-resources"), target_os = "windows"))]
+fn hidden_windows_command(program: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
 #[cfg(not(feature = "bundled-resources"))]
 const RT_BITMAP: u16 = 2;
 #[cfg(not(feature = "bundled-resources"))]
@@ -511,7 +521,7 @@ fn choose_original_executable() -> Result<Option<PathBuf>, String> {
 #[cfg(all(not(feature = "bundled-resources"), target_os = "windows"))]
 fn choose_original_executable() -> Result<Option<PathBuf>, String> {
     let script = "Add-Type -AssemblyName System.Windows.Forms; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Title='Select your original SimTower.exe'; $d.Filter='SimTower executable (SimTower.exe)|SimTower.exe|Windows executables (*.exe)|*.exe'; if($d.ShowDialog() -eq 'OK'){$d.FileName}";
-    let output = Command::new("powershell.exe")
+    let output = hidden_windows_command("powershell.exe")
         .args(["-NoProfile", "-STA", "-Command", script])
         .output()
         .map_err(|error| format!("could not launch the Windows file picker: {error}"))?;
