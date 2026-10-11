@@ -340,6 +340,40 @@ impl TrafficSimulation {
         &self.reachable_facilities
     }
 
+    /// Whether a housekeeper can walk from a housekeeping office to a room.
+    /// Cross-floor routes deliberately consider service elevators only; this
+    /// keeps housekeeping staff out of passenger lifts and escalators.
+    pub fn housekeeping_route_available(
+        &self,
+        tower: &Tower,
+        housekeeping_id: u64,
+        room_id: u64,
+    ) -> bool {
+        let Some(origin) = tower.facilities().iter().find(|facility| {
+            facility.id == housekeeping_id && facility.kind == FacilityKind::Housekeeping
+        }) else {
+            return false;
+        };
+        let Some(destination) = tower.facilities().iter().find(|facility| {
+            facility.id == room_id
+                && matches!(
+                    facility.kind,
+                    FacilityKind::HotelSingle | FacilityKind::HotelTwin | FacilityKind::HotelSuite
+                )
+        }) else {
+            return false;
+        };
+        choose_route_scored_for(
+            endpoint(origin),
+            endpoint(destination),
+            &self.elevators,
+            tower.facilities(),
+            tower.floors(),
+            ElevatorAccess::Housekeeping,
+        )
+        .is_some()
+    }
+
     pub fn elevator_mut(&mut self, shaft_id: u64) -> Option<&mut ElevatorShaft> {
         self.elevators.iter_mut().find(|shaft| shaft.id == shaft_id)
     }

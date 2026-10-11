@@ -17,6 +17,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 mod resources;
@@ -48,6 +49,8 @@ const RATING_ROW_WIDTH: f32 = 128.0;
 const SAVE_FORMAT_VERSION: u32 = 1;
 const SAVE_EXTENSION: &str = "smtower";
 const DEFAULT_SAVE_NAME: &str = "Tower";
+const UX_SCALE_SETTINGS_FILE: &str = "OpenTower.ux-scale";
+static ACTIVE_UX_SCALE: AtomicU8 = AtomicU8::new(UxScale::One as u8);
 const SPEED_CHOICES: [SimulationSpeed; 6] = [
     SimulationSpeed::Normal,
     SimulationSpeed::Fast,
@@ -59,7 +62,7 @@ const SPEED_CHOICES: [SimulationSpeed; 6] = [
 const SKY_TILE_WIDTH: f32 = 200.0;
 const SKY_HORIZON: f32 = 264.0;
 const VERTICAL_WHEEL_FLOORS_PER_STEP: f32 = 0.5;
-const HORIZONTAL_WHEEL_COLUMNS_PER_STEP: f32 = 2.0;
+const HORIZONTAL_WHEEL_COLUMNS_PER_STEP: f32 = 2.5;
 const LOBBY_HEIGHT_HELP: &str =
     "first lobby: Ctrl/Option = 2 stories; Ctrl/Option+Shift = 3; build upper floors first";
 const EMERGENCY_STAIR_HALF_WIDTH: f32 = 24.0;
@@ -370,6 +373,26 @@ struct SaveGame {
     tenant_variants: HashMap<u64, usize>,
     #[serde(default)]
     tenant_variant_bags: HashMap<FacilityKind, TenantVariantBag>,
+    #[serde(default)]
+    tenant_names: HashMap<u64, String>,
+    #[serde(default)]
+    tenant_finances: HashMap<u64, TenantFinanceState>,
+    #[serde(default)]
+    hotel_guest_stays: HashSet<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct TenantFinanceState {
+    current_day: u32,
+    current_profit: i64,
+    previous_profit: i64,
+}
+
+struct TenantPanelState {
+    facility_id: u64,
+    renaming: bool,
+    rename_draft: String,
+    original_name: String,
 }
 
 struct SaveNameDialog {
@@ -377,15 +400,46 @@ struct SaveNameDialog {
     error: Option<String>,
     overwrite_path: Option<PathBuf>,
     replace_default_on_input: bool,
+    key_repeat: Option<TextKeyRepeat>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TextEditAction {
+    Backspace,
+    Insert(char),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextKeyRepeat {
+    key: KeyCode,
+    action: TextEditAction,
+    elapsed: f32,
+    next_repeat: f32,
+}
+
+impl TextKeyRepeat {
+    fn advance(&mut self, dt: f32) -> usize {
+        self.elapsed += dt.max(0.0);
+        let mut repeats = 0;
+        while self.elapsed >= self.next_repeat {
+            repeats += 1;
+            self.next_repeat += TEXT_REPEAT_INTERVAL_SECONDS;
+        }
+        repeats
+    }
+}
+
+const TEXT_REPEAT_DELAY_SECONDS: f32 = 0.42;
+const TEXT_REPEAT_INTERVAL_SECONDS: f32 = 0.045;
+
 impl SaveNameDialog {
-    fn with_default_name() -> Self {
+    fn with_default_name(name: &str) -> Self {
         Self {
-            name: DEFAULT_SAVE_NAME.to_owned(),
+            name: name.to_owned(),
             error: None,
             overwrite_path: None,
             replace_default_on_input: true,
+            key_repeat: None,
         }
     }
 
@@ -410,6 +464,94 @@ impl SaveNameDialog {
         self.name.push(character);
         self.error = None;
     }
+
+    fn start_key_repeat(&mut self, key: KeyCode, action: TextEditAction) {
+        self.key_repeat = Some(TextKeyRepeat {
+            key,
+            action,
+            elapsed: 0.0,
+            next_repeat: TEXT_REPEAT_DELAY_SECONDS,
+        });
+    }
+
+    fn is_repeating_key(&self, key: KeyCode) -> bool {
+        self.key_repeat.is_some_and(|repeat| repeat.key == key)
+    }
+
+    fn update_key_repeat(&mut self, dt: f32) {
+        let Some(mut repeat) = self.key_repeat.take() else {
+            return;
+        };
+        if !is_key_down(repeat.key) {
+            return;
+        }
+        for _ in 0..repeat.advance(dt) {
+            match repeat.action {
+                TextEditAction::Backspace => self.backspace(),
+                TextEditAction::Insert(character) => self.push_character(character),
+            }
+        }
+        self.key_repeat = Some(repeat);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum UxScale {
+    One = 4,
+    OneAndQuarter = 5,
+    OneAndHalf = 6,
+    Two = 8,
+}
+
+const UX_SCALE_CHOICES: [UxScale; 4] = [
+    UxScale::One,
+    UxScale::OneAndQuarter,
+    UxScale::OneAndHalf,
+    UxScale::Two,
+];
+
+impl UxScale {
+    const fn factor(self) -> f32 {
+        self as u8 as f32 / 4.0
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::One => "1x",
+            Self::OneAndQuarter => "1.25x",
+            Self::OneAndHalf => "1.5x",
+            Self::Two => "2x",
+        }
+    }
+
+    const fn preference_value(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::OneAndQuarter => "1.25",
+            Self::OneAndHalf => "1.5",
+            Self::Two => "2",
+        }
+    }
+
+    const fn from_quarters(value: u8) -> Self {
+        match value {
+            5 => Self::OneAndQuarter,
+            6 => Self::OneAndHalf,
+            8 => Self::Two,
+            _ => Self::One,
+        }
+    }
+
+    fn from_preference(value: &str) -> Option<Self> {
+        match value.trim() {
+            "1" | "1x" => Some(Self::One),
+            "1.25" | "1.25x" => Some(Self::OneAndQuarter),
+            "1.5" | "1.5x" => Some(Self::OneAndHalf),
+            "2" | "2x" | "3" | "3x" => Some(Self::Two),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -418,14 +560,16 @@ enum GameMenuAction {
     Save,
     Load,
     AutomaticReports,
+    UxScale,
     Quit,
 }
 
-const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 5] = [
+const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 6] = [
     (GameMenuAction::New, "New"),
     (GameMenuAction::Save, "Save"),
     (GameMenuAction::Load, "Load"),
     (GameMenuAction::AutomaticReports, "Automatic reports"),
+    (GameMenuAction::UxScale, "UX scale"),
     (GameMenuAction::Quit, "Quit"),
 ];
 
@@ -513,6 +657,41 @@ impl FinanceLedger {
         self.other_income = 0;
         self.period_start_balance = ending_balance;
         self.last_observed_cash = ending_balance;
+    }
+}
+
+fn record_tenant_finances(
+    finances: &mut HashMap<u64, TenantFinanceState>,
+    day: u32,
+    events: &[IncomeEvent],
+) {
+    for state in finances.values_mut() {
+        if state.current_day == 0 {
+            state.current_day = day;
+        } else if state.current_day != day {
+            state.previous_profit = if state.current_day.saturating_add(1) == day {
+                state.current_profit
+            } else {
+                0
+            };
+            state.current_profit = 0;
+            state.current_day = day;
+        }
+    }
+    for event in events.iter().filter(|event| event.amount > 0) {
+        let state = finances.entry(event.facility_id).or_default();
+        if state.current_day == 0 {
+            state.current_day = day;
+        } else if state.current_day != day {
+            state.previous_profit = if state.current_day.saturating_add(1) == day {
+                state.current_profit
+            } else {
+                0
+            };
+            state.current_profit = 0;
+            state.current_day = day;
+        }
+        state.current_profit = state.current_profit.saturating_add(event.amount);
     }
 }
 
@@ -873,10 +1052,11 @@ struct TrafficAudioSnapshot {
     people: usize,
     moving_cars: usize,
     passengers: usize,
+    escalator_riders: usize,
 }
 
 impl TrafficAudioSnapshot {
-    fn capture(traffic: &TrafficSimulation) -> Self {
+    fn capture(traffic: &TrafficSimulation, escalator_riders: usize) -> Self {
         Self {
             people: traffic.people().len(),
             moving_cars: traffic
@@ -891,6 +1071,7 @@ impl TrafficAudioSnapshot {
                 .flat_map(|shaft| &shaft.cars)
                 .map(|car| car.passengers.len())
                 .sum(),
+            escalator_riders,
         }
     }
 }
@@ -900,6 +1081,7 @@ enum TrafficSoundEvent {
     ElevatorMove,
     ElevatorOpen,
     Crowd,
+    EscalatorMove,
 }
 
 fn traffic_sound_events(
@@ -916,7 +1098,44 @@ fn traffic_sound_events(
     if current.people > previous.people {
         events.push(TrafficSoundEvent::Crowd);
     }
+    if current.escalator_riders > previous.escalator_riders {
+        events.push(TrafficSoundEvent::EscalatorMove);
+    }
     events
+}
+
+fn escalator_rider_count(tower: &Tower, traffic: &TrafficSimulation) -> usize {
+    traffic
+        .people()
+        .iter()
+        .filter(|person| person.activity == PersonActivity::UsingStairs)
+        .filter(|person| {
+            tower.facilities().iter().any(|facility| {
+                if facility.kind != FacilityKind::Escalator {
+                    return false;
+                }
+                let base = simtower_core::floor_ordinal(facility.position.floor);
+                let center_x =
+                    f32::from(facility.position.x) + f32::from(facility.kind.spec().width) * 0.5;
+                (person.x - center_x).abs() < 0.1
+                    && person.floor_position >= f32::from(base) - 0.01
+                    && person.floor_position <= f32::from(base + 1) + 0.01
+            })
+        })
+        .count()
+}
+
+fn escalator_frame_for_position(base_floor: i16, origin_floor: i16, floor_position: f32) -> usize {
+    let base = f32::from(simtower_core::floor_ordinal(base_floor));
+    let progress_upward = (floor_position - base).clamp(0.0, 1.0);
+    let descending =
+        simtower_core::floor_ordinal(origin_floor) > simtower_core::floor_ordinal(base_floor);
+    let travel_progress = if descending {
+        1.0 - progress_upward
+    } else {
+        progress_upward
+    };
+    (travel_progress * 7.0).round().clamp(0.0, 7.0) as usize
 }
 
 #[derive(Default)]
@@ -926,6 +1145,7 @@ struct SimulationSoundState {
     elevator_move_cooldown: f32,
     elevator_open_cooldown: f32,
     crowd_cooldown: f32,
+    escalator_cooldown: f32,
     elevator_open_variant: usize,
     elevator_bell_phase: u8,
     payment_pending: u8,
@@ -954,10 +1174,12 @@ impl SimulationSoundState {
         traffic: &TrafficSimulation,
         sounds: &NativeSounds,
         simulation_paused: bool,
+        escalator_riders: usize,
     ) {
         self.elevator_move_cooldown = (self.elevator_move_cooldown - dt).max(0.0);
         self.elevator_open_cooldown = (self.elevator_open_cooldown - dt).max(0.0);
         self.crowd_cooldown = (self.crowd_cooldown - dt).max(0.0);
+        self.escalator_cooldown = (self.escalator_cooldown - dt).max(0.0);
         if !simulation_paused {
             self.payment_cooldown = (self.payment_cooldown - dt).max(0.0);
             if self.payment_pending > 0 && self.payment_cooldown <= 0.0 {
@@ -967,7 +1189,7 @@ impl SimulationSoundState {
             }
         }
 
-        let current = TrafficAudioSnapshot::capture(traffic);
+        let current = TrafficAudioSnapshot::capture(traffic, escalator_riders);
         if !self.initialized {
             self.previous = current;
             self.initialized = true;
@@ -993,6 +1215,10 @@ impl SimulationSoundState {
                     sounds.play_crowd();
                     self.crowd_cooldown = 5.0;
                 }
+                TrafficSoundEvent::EscalatorMove if self.escalator_cooldown <= 0.0 => {
+                    sounds.play_escalator_move();
+                    self.escalator_cooldown = 1.5;
+                }
                 _ => {}
             }
         }
@@ -1003,6 +1229,9 @@ impl SimulationSoundState {
 struct App {
     tower: Tower,
     traffic: TrafficSimulation,
+    cached_population_by_kind: HashMap<FacilityKind, u32>,
+    cached_population: u32,
+    cached_star_rating: u8,
     assets: OriginalAssets,
     tool: ToolMode,
     open_menu: Option<BuildMenu>,
@@ -1018,6 +1247,11 @@ struct App {
     visual_people_x: HashMap<u64, f32>,
     tenant_variants: HashMap<u64, usize>,
     tenant_variant_bags: HashMap<FacilityKind, TenantVariantBag>,
+    tenant_names: HashMap<u64, String>,
+    tenant_finances: HashMap<u64, TenantFinanceState>,
+    hotel_guest_stays: HashSet<u64>,
+    tenant_panel: Option<TenantPanelState>,
+    tenant_panel_resume_speed: Option<SimulationSpeed>,
     people_animation_seconds: f64,
     view_mode: ViewMode,
     speed_menu_open: bool,
@@ -1034,19 +1268,28 @@ struct App {
     finance_panel_open: bool,
     finance_resume_speed: Option<SimulationSpeed>,
     automatic_finance_reports: bool,
+    ux_scale: UxScale,
     intro_remaining: f32,
     game_menu_open: bool,
+    ux_scale_menu_open: bool,
     mode_menu_open: bool,
     save_name_dialog: Option<SaveNameDialog>,
+    current_save_name: String,
 }
 
 impl App {
     fn new(assets: OriginalAssets) -> Self {
         let tower = fresh_tower();
         let finance_ledger = FinanceLedger::new(tower.cash());
+        let cached_star_rating = tower.star_rating_for_population(0);
+        let ux_scale = load_ux_scale_preference();
+        set_active_ux_scale(ux_scale);
         Self {
             tower,
             traffic: TrafficSimulation::new(),
+            cached_population_by_kind: HashMap::new(),
+            cached_population: 0,
+            cached_star_rating,
             assets,
             tool: ToolMode::Floor,
             open_menu: Some(BuildMenu::Structure),
@@ -1062,6 +1305,11 @@ impl App {
             visual_people_x: HashMap::new(),
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
+            tenant_names: HashMap::new(),
+            tenant_finances: HashMap::new(),
+            hotel_guest_stays: HashSet::new(),
+            tenant_panel: None,
+            tenant_panel_resume_speed: None,
             people_animation_seconds: 0.0,
             view_mode: ViewMode::Edit,
             speed_menu_open: false,
@@ -1079,16 +1327,22 @@ impl App {
             finance_panel_open: false,
             finance_resume_speed: None,
             automatic_finance_reports: true,
+            ux_scale,
             intro_remaining: 2.4,
             game_menu_open: false,
+            ux_scale_menu_open: false,
             mode_menu_open: false,
             save_name_dialog: None,
+            current_save_name: DEFAULT_SAVE_NAME.to_owned(),
         }
     }
 
     fn start_new_tower(&mut self) {
         self.tower = fresh_tower();
         self.traffic = TrafficSimulation::new();
+        self.cached_population_by_kind.clear();
+        self.cached_population = 0;
+        self.cached_star_rating = self.tower.star_rating_for_population(0);
         self.tool = ToolMode::Floor;
         self.open_menu = Some(BuildMenu::Structure);
         self.camera_x = 0.0;
@@ -1103,6 +1357,11 @@ impl App {
         self.visual_people_x.clear();
         self.tenant_variants.clear();
         self.tenant_variant_bags.clear();
+        self.tenant_names.clear();
+        self.tenant_finances.clear();
+        self.hotel_guest_stays.clear();
+        self.tenant_panel = None;
+        self.tenant_panel_resume_speed = None;
         self.people_animation_seconds = 0.0;
         self.view_mode = ViewMode::Edit;
         self.speed_menu_open = false;
@@ -1121,12 +1380,14 @@ impl App {
         self.finance_resume_speed = None;
         self.intro_remaining = 0.0;
         self.game_menu_open = false;
+        self.ux_scale_menu_open = false;
         self.mode_menu_open = false;
         self.save_name_dialog = None;
+        self.current_save_name = DEFAULT_SAVE_NAME.to_owned();
     }
 
     fn begin_save_name_dialog(&mut self) {
-        self.save_name_dialog = Some(SaveNameDialog::with_default_name());
+        self.save_name_dialog = Some(SaveNameDialog::with_default_name(&self.current_save_name));
         self.status = "Enter a save-game name".to_owned();
     }
 
@@ -1137,7 +1398,130 @@ impl App {
         }
     }
 
-    fn update_save_name_dialog(&mut self) {
+    fn open_tenant_panel(&mut self, facility_id: u64) {
+        let Some((kind, variant)) = self
+            .tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == facility_id && facility.kind.has_tenant_occupancy())
+            .map(|facility| {
+                (
+                    facility.kind,
+                    self.tenant_variants.get(&facility_id).copied(),
+                )
+            })
+        else {
+            return;
+        };
+        let name = self
+            .tenant_names
+            .get(&facility_id)
+            .cloned()
+            .unwrap_or_else(|| default_tenant_name(kind, variant).to_owned());
+        if self.tower.clock.speed != SimulationSpeed::Paused {
+            self.tenant_panel_resume_speed = Some(self.tower.clock.speed);
+            self.tower.clock.speed = SimulationSpeed::Paused;
+        } else {
+            self.tenant_panel_resume_speed = None;
+        }
+        self.open_menu = None;
+        self.speed_menu_open = false;
+        self.game_menu_open = false;
+        self.ux_scale_menu_open = false;
+        self.mode_menu_open = false;
+        self.tenant_panel = Some(TenantPanelState {
+            facility_id,
+            renaming: false,
+            rename_draft: name.clone(),
+            original_name: name,
+        });
+        self.status = format!("Inspecting {}", kind.spec().name);
+    }
+
+    fn close_tenant_panel(&mut self) {
+        self.tenant_panel = None;
+        if let Some(speed) = self.tenant_panel_resume_speed.take() {
+            self.tower.clock.speed = speed;
+        }
+        self.status = "Selection cursor".to_owned();
+    }
+
+    fn commit_tenant_rename(&mut self) {
+        let Some(panel) = &mut self.tenant_panel else {
+            return;
+        };
+        let name = panel.rename_draft.trim().to_owned();
+        if !name.is_empty() {
+            self.tenant_names.insert(panel.facility_id, name.clone());
+            panel.rename_draft.clone_from(&name);
+            panel.original_name = name;
+        }
+        panel.renaming = false;
+    }
+
+    fn update_tenant_panel(&mut self) {
+        let Some(panel) = &mut self.tenant_panel else {
+            return;
+        };
+        if !self
+            .tower
+            .facilities()
+            .iter()
+            .any(|facility| facility.id == panel.facility_id)
+        {
+            self.close_tenant_panel();
+            return;
+        }
+
+        if panel.renaming {
+            if is_key_pressed(KeyCode::Escape) {
+                panel.renaming = false;
+                panel.rename_draft.clone_from(&panel.original_name);
+                return;
+            }
+            if is_key_pressed(KeyCode::Backspace) {
+                panel.rename_draft.pop();
+            }
+            while let Some(character) = get_char_pressed() {
+                if !character.is_control() && panel.rename_draft.chars().count() < 15 {
+                    panel.rename_draft.push(character);
+                }
+            }
+            if is_key_pressed(KeyCode::Enter) {
+                self.commit_tenant_rename();
+                return;
+            }
+        } else if is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Enter) {
+            self.close_tenant_panel();
+            return;
+        }
+
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let point = ui_mouse_position();
+            if tenant_info_ok_rect().contains(point) {
+                if self
+                    .tenant_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.renaming)
+                {
+                    self.commit_tenant_rename();
+                }
+                self.close_tenant_panel();
+            } else if tenant_info_rename_rect().contains(point) {
+                if self
+                    .tenant_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.renaming)
+                {
+                    self.commit_tenant_rename();
+                } else if let Some(panel) = &mut self.tenant_panel {
+                    panel.renaming = true;
+                }
+            }
+        }
+    }
+
+    fn update_save_name_dialog(&mut self, dt: f32) {
         let confirming_overwrite = self
             .save_name_dialog
             .as_ref()
@@ -1146,7 +1530,7 @@ impl App {
             let mut confirm = is_key_pressed(KeyCode::Enter);
             let mut decline = is_key_pressed(KeyCode::Escape);
             if is_mouse_button_pressed(MouseButton::Left) {
-                let point = vec2(mouse_position().0, mouse_position().1);
+                let point = ui_mouse_position();
                 confirm |= save_dialog_save_rect().contains(point);
                 decline |= save_dialog_cancel_rect().contains(point);
             }
@@ -1169,6 +1553,7 @@ impl App {
                 .unwrap_or_default();
             match self.save_named(&name) {
                 Ok(path) => {
+                    self.current_save_name = save_default_name_for_path(&path);
                     self.save_name_dialog = None;
                     self.status = format!("Replaced save game at {}", path.display());
                 }
@@ -1187,13 +1572,23 @@ impl App {
         if let Some(dialog) = &mut self.save_name_dialog {
             if is_key_pressed(KeyCode::Backspace) {
                 dialog.backspace();
+                dialog.start_key_repeat(KeyCode::Backspace, TextEditAction::Backspace);
             }
             while let Some(character) = get_char_pressed() {
-                dialog.push_character(character);
+                let key = key_for_text_character(character);
+                let generated_by_native_repeat =
+                    key.is_some_and(|key| dialog.is_repeating_key(key) && !is_key_pressed(key));
+                if !generated_by_native_repeat {
+                    dialog.push_character(character);
+                    if let Some(key) = key.filter(|key| is_key_pressed(*key)) {
+                        dialog.start_key_repeat(key, TextEditAction::Insert(character));
+                    }
+                }
             }
+            dialog.update_key_repeat(dt);
         }
         if is_mouse_button_pressed(MouseButton::Left) {
-            let point = vec2(mouse_position().0, mouse_position().1);
+            let point = ui_mouse_position();
             submit |= save_dialog_save_rect().contains(point);
             cancel |= save_dialog_cancel_rect().contains(point);
         }
@@ -1229,6 +1624,7 @@ impl App {
         }
         match self.save_named(&name) {
             Ok(path) => {
+                self.current_save_name = save_default_name_for_path(&path);
                 self.save_name_dialog = None;
                 self.status = format!("Saved game to {}", path.display());
             }
@@ -1254,6 +1650,9 @@ impl App {
             automatic_finance_reports: self.automatic_finance_reports,
             tenant_variants: self.tenant_variants.clone(),
             tenant_variant_bags: self.tenant_variant_bags.clone(),
+            tenant_names: self.tenant_names.clone(),
+            tenant_finances: self.tenant_finances.clone(),
+            hotel_guest_stays: self.hotel_guest_stays.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&save)
             .map_err(|error| format!("Could not encode the save game: {error}"))?;
@@ -1315,6 +1714,7 @@ impl App {
         self.open_menu = None;
         self.speed_menu_open = false;
         self.game_menu_open = false;
+        self.ux_scale_menu_open = false;
         self.mode_menu_open = false;
         self.construction.clear();
         self.paint_drag_last = None;
@@ -1325,14 +1725,21 @@ impl App {
         self.visual_people_x.clear();
         self.tenant_variants = save.tenant_variants;
         self.tenant_variant_bags = save.tenant_variant_bags;
+        self.tenant_names = save.tenant_names;
+        self.tenant_finances = save.tenant_finances;
+        self.hotel_guest_stays = save.hotel_guest_stays;
+        self.tenant_panel = None;
+        self.tenant_panel_resume_speed = None;
         self.simulation_sounds = SimulationSoundState::default();
         self.treasure_popup = None;
         self.fire_event = None;
         self.promotion_dialog_open = false;
         self.promotion_resume_speed = None;
+        self.refresh_tower_metrics();
         self.last_star_rating = self.star_rating();
         self.promotion_rating = self.last_star_rating;
         self.intro_remaining = 0.0;
+        self.current_save_name = save_default_name_for_path(path);
         self.sync_tenant_variants();
         Ok(())
     }
@@ -1350,13 +1757,17 @@ impl App {
             return;
         }
         if self.save_name_dialog.is_some() {
-            self.update_save_name_dialog();
+            self.update_save_name_dialog(dt);
+            return;
+        }
+        if self.tenant_panel.is_some() {
+            self.update_tenant_panel();
             return;
         }
         if self.finance_panel_open {
             if is_key_pressed(KeyCode::Escape)
                 || (is_mouse_button_pressed(MouseButton::Left)
-                    && finance_ok_rect().contains(vec2(mouse_position().0, mouse_position().1)))
+                    && finance_ok_rect().contains(ui_mouse_position()))
             {
                 self.close_finance_panel();
             }
@@ -1366,7 +1777,7 @@ impl App {
             let dismiss = is_key_pressed(KeyCode::Escape)
                 || is_key_pressed(KeyCode::Enter)
                 || (is_mouse_button_pressed(MouseButton::Left)
-                    && promotion_ok_rect().contains(vec2(mouse_position().0, mouse_position().1)));
+                    && promotion_ok_rect().contains(ui_mouse_position()));
             if dismiss {
                 self.promotion_dialog_open = false;
                 if let Some(speed) = self.promotion_resume_speed.take() {
@@ -1407,6 +1818,7 @@ impl App {
         };
         let simulation_dt = dt * traffic_scale;
         self.traffic.sync_with_tower(&self.tower);
+        self.capture_hotel_guest_stays();
         let reachable_lookup = self.traffic.reachable_facility_set().clone();
         let reachable_facilities = reachable_lookup.iter().copied().collect::<Vec<_>>();
         let visitor_counts = self
@@ -1433,13 +1845,28 @@ impl App {
             Some(&reachable_facilities),
         );
         self.finance_ledger.record(&income_events);
+        record_tenant_finances(
+            &mut self.tenant_finances,
+            self.tower.clock.day,
+            &income_events,
+        );
         self.finance_ledger.last_observed_cash = self.tower.cash();
         let closed_quarter =
             quarter_closed_between(previous_absolute_minute, self.tower.clock.absolute_minute());
+        self.update_hotel_room_service(
+            previous_absolute_minute,
+            self.tower.clock.absolute_minute(),
+        );
+        self.traffic.advance_after_sync(&self.tower, simulation_dt);
+        self.capture_hotel_guest_stays();
+        self.refresh_tower_metrics();
         if let Some((year, quarter)) = closed_quarter {
-            let population_by_kind = self.population_by_kind();
-            self.finance_ledger
-                .close_quarter(year, quarter, self.tower.cash(), population_by_kind);
+            self.finance_ledger.close_quarter(
+                year,
+                quarter,
+                self.tower.cash(),
+                self.population_by_kind(),
+            );
             if self.automatic_finance_reports {
                 if self.tower.clock.speed != SimulationSpeed::Paused {
                     self.last_running_speed = self.tower.clock.speed;
@@ -1449,7 +1876,6 @@ impl App {
                 self.finance_panel_open = true;
             }
         }
-        self.traffic.advance_after_sync(&self.tower, simulation_dt);
         self.update_fire_event(simulation_dt);
         let current_rating = self.star_rating();
         if current_rating > self.last_star_rating {
@@ -1468,11 +1894,13 @@ impl App {
         let visual_dt = visual_animation_delta(dt, self.tower.clock.speed);
         self.people_animation_seconds += f64::from(visual_dt);
         self.simulation_sounds.queue_payments(&income_events);
+        let escalator_riders = escalator_rider_count(&self.tower, &self.traffic);
         self.simulation_sounds.update(
             dt,
             &self.traffic,
             &self.assets.sounds,
             self.tower.clock.speed == SimulationSpeed::Paused,
+            escalator_riders,
         );
         self.update_people_visuals(visual_dt);
         for animation in &mut self.construction {
@@ -1521,7 +1949,7 @@ impl App {
             } else if is_mouse_button_pressed(MouseButton::Left)
                 || is_mouse_button_pressed(MouseButton::Right)
             {
-                self.handle_elevator_panel_click(vec2(mouse_position().0, mouse_position().1));
+                self.handle_elevator_panel_click(ui_mouse_position());
             }
             return;
         }
@@ -1530,6 +1958,7 @@ impl App {
         if is_mouse_button_pressed(MouseButton::Right) {
             let point = vec2(mouse_position().0, mouse_position().1);
             self.game_menu_open = false;
+            self.ux_scale_menu_open = false;
             self.mode_menu_open = false;
             if !self.point_is_ui(point) {
                 if self.view_mode == ViewMode::Pricing {
@@ -1551,6 +1980,7 @@ impl App {
         }
         if is_key_pressed(KeyCode::Escape) {
             self.game_menu_open = false;
+            self.ux_scale_menu_open = false;
             self.mode_menu_open = false;
             self.open_menu = None;
             if self.clear_active_build_tool() {
@@ -1571,6 +2001,13 @@ impl App {
     }
 
     fn sync_tenant_variants(&mut self) {
+        let live_tenant_ids = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind.has_tenant_occupancy())
+            .map(|facility| facility.id)
+            .collect::<HashSet<_>>();
         let live_tenants = self
             .tower
             .facilities()
@@ -1585,6 +2022,12 @@ impl App {
             .collect::<HashSet<_>>();
         self.tenant_variants
             .retain(|facility_id, _| live_ids.contains(facility_id));
+        self.tenant_names
+            .retain(|facility_id, _| live_tenant_ids.contains(facility_id));
+        self.tenant_finances
+            .retain(|facility_id, _| live_tenant_ids.contains(facility_id));
+        self.hotel_guest_stays
+            .retain(|facility_id| live_tenant_ids.contains(facility_id));
         for (facility_id, kind, variant_count) in live_tenants {
             if !self.tenant_variants.contains_key(&facility_id) {
                 let variant = self
@@ -1593,6 +2036,186 @@ impl App {
                     .or_default()
                     .next(variant_count);
                 self.tenant_variants.insert(facility_id, variant);
+            }
+        }
+    }
+
+    fn capture_hotel_guest_stays(&mut self) {
+        self.hotel_guest_stays.extend(
+            self.tower
+                .facilities()
+                .iter()
+                .filter(|facility| {
+                    is_hotel_room(facility.kind)
+                        && facility.is_occupied()
+                        && (self.traffic.visitors_at(facility.id) > 0
+                            || self.traffic.daily_visitors_at(facility.id) > 0)
+                })
+                .map(|facility| facility.id),
+        );
+    }
+
+    /// Advances the original hotel's checkout/housekeeping/infestation loop.
+    /// Guest departures are staggered from 06:30 through noon. Each of the
+    /// six workers in every housekeeping office gets 19 half-hour cleaning
+    /// rounds, with the last room begun at 16:30 (114 rooms per office/day).
+    fn update_hotel_room_service(&mut self, previous: u64, current: u64) {
+        if current <= previous {
+            return;
+        }
+        for absolute_minute in previous + 1..=current {
+            let minute = (absolute_minute % (24 * 60)) as u16;
+            let day = (absolute_minute / (24 * 60)) as u32 + 1;
+            if (6 * 60 + 30..=12 * 60).contains(&minute) {
+                self.checkout_hotel_rooms(day, minute);
+            }
+            if (7 * 60 + 30..=16 * 60 + 30).contains(&minute)
+                && (minute - (7 * 60 + 30)).is_multiple_of(30)
+            {
+                self.run_housekeeping_round();
+            }
+            if minute == 17 * 60 {
+                self.update_hotel_infestations(day);
+            }
+        }
+    }
+
+    fn checkout_hotel_rooms(&mut self, day: u32, minute: u16) {
+        let checked_out = self
+            .hotel_guest_stays
+            .iter()
+            .copied()
+            .filter(|facility_id| hotel_checkout_minute(*facility_id) == minute)
+            .collect::<Vec<_>>();
+        for facility_id in checked_out {
+            self.hotel_guest_stays.remove(&facility_id);
+            if self.tower.mark_hotel_dirty(facility_id, day) {
+                self.traffic.evacuate_facility(facility_id);
+            }
+        }
+    }
+
+    fn update_hotel_infestations(&mut self, day: u32) {
+        let room_geometry = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| is_hotel_room(facility.kind))
+            .map(|facility| {
+                (
+                    facility.id,
+                    facility.position.floor,
+                    facility.position.x,
+                    facility.end_x(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let infestation_sources = self
+            .tower
+            .facilities()
+            .iter()
+            .filter_map(|facility| match facility.occupancy {
+                simtower_core::FacilityOccupancy::HotelInfested => Some(facility.id),
+                simtower_core::FacilityOccupancy::HotelDirty { since_day }
+                    if day.saturating_sub(since_day) > 3 =>
+                {
+                    Some(facility.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut infest = infestation_sources.clone();
+        for source_id in infestation_sources {
+            let Some((_, floor, start, end)) = room_geometry
+                .iter()
+                .find(|(room_id, _, _, _)| *room_id == source_id)
+                .copied()
+            else {
+                continue;
+            };
+            infest.extend(
+                room_geometry
+                    .iter()
+                    .filter(|(_, other_floor, other_start, other_end)| {
+                        *other_floor == floor && (*other_end == start || *other_start == end)
+                    })
+                    .map(|(room_id, _, _, _)| *room_id),
+            );
+        }
+        infest.sort_unstable();
+        infest.dedup();
+        let mut newly_infested = 0;
+        for facility_id in infest {
+            if self.tower.mark_hotel_infested(facility_id) {
+                self.traffic.evacuate_facility(facility_id);
+                newly_infested += 1;
+            }
+        }
+
+        if newly_infested > 0 {
+            self.status = if newly_infested == 1 {
+                "A hotel room has become infested and must be bulldozed".to_owned()
+            } else {
+                format!("{newly_infested} hotel rooms are infested and must be bulldozed")
+            };
+        }
+    }
+
+    fn run_housekeeping_round(&mut self) {
+        let housekeeping_ids = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Housekeeping)
+            .map(|facility| facility.id)
+            .collect::<Vec<_>>();
+        for housekeeping_id in housekeeping_ids {
+            // The original assigns at most one worker from a housekeeping
+            // office to any one floor. Six workers can therefore cover six
+            // floors in parallel, but cannot pile onto a single long floor.
+            let mut serviced_floors = HashSet::new();
+            for _ in 0..6 {
+                let Some((housekeeping_floor, housekeeping_x)) = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .find(|facility| facility.id == housekeeping_id)
+                    .map(|facility| (facility.position.floor, facility.position.x))
+                else {
+                    break;
+                };
+                let mut candidates = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .filter(|facility| facility.is_hotel_dirty())
+                    .filter(|facility| !serviced_floors.contains(&facility.position.floor))
+                    .filter(|facility| {
+                        self.traffic.housekeeping_route_available(
+                            &self.tower,
+                            housekeeping_id,
+                            facility.id,
+                        )
+                    })
+                    .map(|facility| {
+                        (
+                            facility.id,
+                            facility.position.floor,
+                            (i32::from(facility.position.floor) - i32::from(housekeeping_floor))
+                                .unsigned_abs(),
+                            facility.position.x.abs_diff(housekeeping_x),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_by_key(|(facility_id, _, floors, columns)| {
+                    (*floors, *columns, *facility_id)
+                });
+                let Some((facility_id, floor, _, _)) = candidates.first().copied() else {
+                    break;
+                };
+                self.tower.clean_hotel_room(facility_id);
+                serviced_floors.insert(floor);
             }
         }
     }
@@ -1676,6 +2299,7 @@ impl App {
         let index = (u64::from(self.tower.clock.day).wrapping_mul(17) as usize) % candidates.len();
         let facility_id = candidates[index];
         self.traffic.evacuate_facility(facility_id);
+        self.center_camera_on_facility(facility_id);
         let resume_speed = apply_emergency_speed(&mut self.tower.clock);
         self.speed_menu_open = false;
         self.fire_event = Some(FireEventState {
@@ -1699,7 +2323,7 @@ impl App {
             event.decision_elapsed =
                 (event.decision_elapsed + dt).min(FIRE_RESPONSE_DECISION_SECONDS);
         }
-        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let mouse = ui_mouse_position();
         let choose_helicopter = is_key_pressed(KeyCode::H)
             || (is_mouse_button_pressed(MouseButton::Left)
                 && fire_helicopter_button_rect().contains(mouse));
@@ -1820,6 +2444,30 @@ impl App {
         }
     }
 
+    fn center_camera_on_facility(&mut self, facility_id: u64) {
+        let Some(facility) = self
+            .tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == facility_id)
+        else {
+            return;
+        };
+        let visible_columns = (screen_width() / CELL_WIDTH).floor();
+        let maximum_camera_x = (f32::from(self.tower.width()) - visible_columns).max(0.0);
+        let center_x = f32::from(facility.position.x) + f32::from(facility.kind.spec().width) * 0.5;
+        self.camera_x = (center_x - visible_columns * 0.5).clamp(0.0, maximum_camera_x);
+
+        let target_y = TOPBAR_HEIGHT + (screen_height() - TOPBAR_HEIGHT) * 0.48;
+        let floor_offset = if facility.position.floor > 0 {
+            f32::from(facility.position.floor)
+        } else {
+            f32::from(facility.position.floor + 1)
+        };
+        self.camera_floor =
+            (floor_offset + (target_y - self.view_anchor_y()) / FLOOR_HEIGHT).clamp(-8.0, 99.0);
+    }
+
     fn update_people_visuals(&mut self, dt: f32) {
         let live_people = self
             .traffic
@@ -1837,10 +2485,14 @@ impl App {
     }
 
     fn population(&self) -> u32 {
-        self.population_by_kind().values().copied().sum()
+        self.cached_population
     }
 
     fn population_by_kind(&self) -> HashMap<FacilityKind, u32> {
+        self.cached_population_by_kind.clone()
+    }
+
+    fn refresh_tower_metrics(&mut self) {
         let reachable = self.traffic.reachable_facility_set();
         let mut totals = HashMap::new();
         for facility in self.tower.facilities().iter().filter(|facility| {
@@ -1856,12 +2508,23 @@ impl App {
                 | FacilityKind::PartyHall => self
                     .economic_patronage(facility, true)
                     .min(facility.kind.population_capacity()),
+                // Hotel population is the number actually checked in right
+                // now. Unlike offices and sold condos, the original counter
+                // rises and falls as guests arrive and leave.
+                FacilityKind::HotelSingle | FacilityKind::HotelTwin | FacilityKind::HotelSuite => {
+                    (self.traffic.visitors_at(facility.id) as u32)
+                        .min(facility.kind.population_capacity())
+                }
                 _ => facility.kind.population_capacity(),
             };
             let total = totals.entry(facility.kind).or_insert(0_u32);
             *total = total.saturating_add(population);
         }
-        totals
+        self.cached_population = totals.values().copied().sum();
+        self.cached_star_rating = self
+            .tower
+            .star_rating_for_population(self.cached_population);
+        self.cached_population_by_kind = totals;
     }
 
     fn economic_patronage(&self, facility: &Facility, reachable: bool) -> u32 {
@@ -1879,7 +2542,7 @@ impl App {
     }
 
     fn star_rating(&self) -> u8 {
-        self.tower.star_rating_for_population(self.population())
+        self.cached_star_rating
     }
 
     fn update_shortcuts(&mut self) {
@@ -1915,16 +2578,43 @@ impl App {
     }
 
     fn handle_left_click(&mut self, point: Vec2) {
-        if game_menu_button_rect().contains(point) {
+        let ui_point = physical_to_ui(point, self.ux_scale);
+        if game_menu_button_rect().contains(ui_point) {
             self.game_menu_open = !self.game_menu_open;
+            if !self.game_menu_open {
+                self.ux_scale_menu_open = false;
+            }
             self.mode_menu_open = false;
             self.open_menu = None;
             self.speed_menu_open = false;
             return;
         }
         if self.game_menu_open {
-            let action = game_menu_action_at(point);
+            if self.ux_scale_menu_open {
+                if let Some(scale) = ux_scale_menu_choice_at(ui_point) {
+                    self.ux_scale = scale;
+                    set_active_ux_scale(scale);
+                    self.game_menu_open = false;
+                    self.ux_scale_menu_open = false;
+                    self.status = match save_ux_scale_preference(scale) {
+                        Ok(()) => format!("Interface scale set to {}", scale.label()),
+                        Err(error) => {
+                            format!("Interface scale set to {} ({error})", scale.label())
+                        }
+                    };
+                    return;
+                }
+                if ux_scale_menu_rect().contains(ui_point) {
+                    return;
+                }
+            }
+            let action = game_menu_action_at(ui_point);
+            if action == Some(GameMenuAction::UxScale) {
+                self.ux_scale_menu_open = !self.ux_scale_menu_open;
+                return;
+            }
             self.game_menu_open = false;
+            self.ux_scale_menu_open = false;
             match action {
                 Some(GameMenuAction::New) => self.start_new_tower(),
                 Some(GameMenuAction::Save) => self.begin_save_name_dialog(),
@@ -1940,42 +2630,45 @@ impl App {
                 }
                 Some(GameMenuAction::Quit) => std::process::exit(0),
                 None => {}
+                Some(_) => unreachable!("all game menu actions are handled"),
             }
             return;
         }
-        if mode_menu_button_rect().contains(point) {
+        if mode_menu_button_rect().contains(ui_point) {
             self.mode_menu_open = !self.mode_menu_open;
             self.game_menu_open = false;
+            self.ux_scale_menu_open = false;
             self.open_menu = None;
             self.speed_menu_open = false;
             return;
         }
         if self.mode_menu_open {
-            if let Some(mode) = mode_menu_choice_at(point) {
+            if let Some(mode) = mode_menu_choice_at(ui_point) {
                 self.select_view_mode(mode);
                 return;
             }
             self.mode_menu_open = false;
-            if mode_menu_rect().contains(point) {
+            if mode_menu_rect().contains(ui_point) {
                 return;
             }
         }
         if self.speed_menu_open
-            && let Some(speed) = speed_menu_choice_at(point)
+            && let Some(speed) = speed_menu_choice_at(ui_point)
         {
             self.set_simulation_speed(speed);
             self.speed_menu_open = false;
             return;
         }
-        if point.y <= 30.0 && point.x >= screen_width() - 360.0 {
+        if ui_point.y <= 30.0 && ui_point.x >= ui_screen_width() - 360.0 {
             self.finance_panel_open = true;
             self.open_menu = None;
             self.speed_menu_open = false;
             self.status = "Quarterly financial report".to_owned();
             return;
         }
-        if sound_menu_button_rect().contains(point) {
+        if sound_menu_button_rect().contains(ui_point) {
             self.game_menu_open = false;
+            self.ux_scale_menu_open = false;
             self.mode_menu_open = false;
             let muted = self.assets.sounds.toggle_muted();
             self.status = if muted {
@@ -1986,7 +2679,7 @@ impl App {
             .to_owned();
             return;
         }
-        if let Some((menu, index)) = self.menu_entry_at(point) {
+        if let Some((menu, index)) = self.menu_entry_at(ui_point) {
             let entry = menu.entries()[index];
             let rating = self.star_rating();
             if !entry.is_available(rating) {
@@ -2009,7 +2702,7 @@ impl App {
             }
             return;
         }
-        if let Some(index) = palette_button_at(point) {
+        if let Some(index) = palette_button_at(ui_point) {
             let button = PALETTE_BUTTONS[index];
             if let PaletteAction::Menu(menu) = button.action
                 && self.star_rating() < menu.unlock_stars()
@@ -2061,7 +2754,7 @@ impl App {
             }
             return;
         }
-        if point.y < TOPBAR_HEIGHT || palette_rect().contains(point) {
+        if ui_point.y < TOPBAR_HEIGHT || palette_rect().contains(ui_point) {
             return;
         }
         self.speed_menu_open = false;
@@ -2237,6 +2930,12 @@ impl App {
                     is_elevator_kind(kind) && self.open_elevator_controls_for(kind, position.x)
                 }) {
                     return;
+                }
+                if let Some((id, kind, _)) = selected {
+                    if kind.has_tenant_occupancy() {
+                        self.open_tenant_panel(id);
+                        return;
+                    }
                 }
                 self.status = selected.map_or_else(
                     || {
@@ -2992,19 +3691,25 @@ impl App {
         let base_ordinal = simtower_core::floor_ordinal(facility.position.floor);
         let upper_ordinal = base_ordinal + 1;
         let center_x = f32::from(facility.position.x) + f32::from(facility.kind.spec().width) * 0.5;
-        let occupants = self
-            .traffic
-            .people()
-            .iter()
-            .filter(|person| {
-                person.activity == PersonActivity::UsingStairs
-                    && (person.x - center_x).abs() < 0.1
-                    && person.floor_position >= f32::from(base_ordinal) - 0.01
-                    && person.floor_position <= f32::from(upper_ordinal) + 0.01
+        let riders = self.traffic.people().iter().filter(|person| {
+            person.activity == PersonActivity::UsingStairs
+                && (person.x - center_x).abs() < 0.1
+                && person.floor_position >= f32::from(base_ordinal) - 0.01
+                && person.floor_position <= f32::from(upper_ordinal) + 0.01
+        });
+        let frame = if facility.kind == FacilityKind::Escalator {
+            riders.min_by_key(|person| person.id).map_or(0, |person| {
+                escalator_frame_for_position(
+                    facility.position.floor,
+                    person.current_floor,
+                    person.floor_position,
+                )
             })
-            .count();
+        } else {
+            riders.count().min(6)
+        };
         Rect::new(
-            occupants.min(6) as f32 * f32::from(facility.kind.spec().width) * CELL_WIDTH,
+            frame as f32 * f32::from(facility.kind.spec().width) * CELL_WIDTH,
             0.0,
             f32::from(facility.kind.spec().width) * CELL_WIDTH,
             sprite.source.h,
@@ -3178,7 +3883,9 @@ impl App {
     }
 
     fn point_is_ui(&self, point: Vec2) -> bool {
+        let point = physical_to_ui(point, self.ux_scale);
         self.save_name_dialog.is_some()
+            || self.tenant_panel.is_some()
             || self.elevator_panel.is_some()
             || self.promotion_dialog_open
             || self
@@ -3187,6 +3894,9 @@ impl App {
             || point.y < TOPBAR_HEIGHT
             || palette_rect().contains(point)
             || (self.game_menu_open && game_menu_rect().contains(point))
+            || (self.game_menu_open
+                && self.ux_scale_menu_open
+                && ux_scale_menu_rect().contains(point))
             || (self.mode_menu_open && mode_menu_rect().contains(point))
             || (self.speed_menu_open && speed_menu_rect().contains(point))
             || self
@@ -3199,6 +3909,7 @@ impl App {
         let demolition_cursor = self.tool == ToolMode::Demolish
             && self.view_mode == ViewMode::Edit
             && self.elevator_panel.is_none()
+            && self.tenant_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
             && !self
@@ -3209,6 +3920,7 @@ impl App {
         let inspect_cursor = self.tool == ToolMode::Inspect
             && self.view_mode == ViewMode::Edit
             && self.elevator_panel.is_none()
+            && self.tenant_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
             && !self
@@ -3224,6 +3936,7 @@ impl App {
         self.draw_world_background();
         self.draw_world();
         self.draw_world_lighting();
+        begin_ui_camera(self.ux_scale);
         self.draw_topbar();
         self.draw_palette();
         if let Some(menu) = self.open_menu {
@@ -3234,6 +3947,9 @@ impl App {
         }
         if self.game_menu_open {
             self.draw_game_menu();
+            if self.ux_scale_menu_open {
+                self.draw_ux_scale_menu();
+            }
         }
         if self.mode_menu_open {
             self.draw_mode_menu();
@@ -3244,17 +3960,10 @@ impl App {
         if self.finance_panel_open {
             self.draw_finance_panel();
         }
-        self.draw_ui_tooltip(mouse);
-        if demolition_cursor {
-            self.draw_demolition_cursor(mouse);
-        } else if let Some((_, _, _, direction)) = resize_handle {
-            self.draw_elevator_resize_cursor(mouse, direction);
-        } else if inspect_cursor {
-            self.draw_magnifier_cursor(mouse);
+        if self.tenant_panel.is_some() {
+            self.draw_tenant_panel();
         }
-        if self.intro_remaining > 0.0 {
-            self.draw_intro();
-        }
+        self.draw_ui_tooltip(physical_to_ui(mouse, self.ux_scale));
         if self.save_name_dialog.is_some() {
             self.draw_save_name_dialog();
         }
@@ -3266,6 +3975,17 @@ impl App {
             .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
         {
             self.draw_fire_response_dialog();
+        }
+        set_default_camera();
+        if demolition_cursor {
+            self.draw_demolition_cursor(mouse);
+        } else if let Some((_, _, _, direction)) = resize_handle {
+            self.draw_elevator_resize_cursor(mouse, direction);
+        } else if inspect_cursor {
+            self.draw_magnifier_cursor(mouse);
+        }
+        if self.intro_remaining > 0.0 {
+            self.draw_intro();
         }
     }
 
@@ -3573,13 +4293,25 @@ impl App {
                 );
             }
         }
+        // Keep the untextured room fills and textured utility strips in
+        // separate passes. Alternating them once per 8-pixel floor slice
+        // forced Macroquad to break the GPU batch thousands of times in a
+        // wide tower, which made scrolling and even the cursor stutter.
         for position in self
             .tower
             .floors()
             .iter()
             .filter(|position| self.floor_cell_is_visible(**position))
         {
-            self.draw_empty_floor(*position);
+            self.draw_empty_floor_room(*position);
+        }
+        for position in self
+            .tower
+            .floors()
+            .iter()
+            .filter(|position| self.floor_cell_is_visible(**position))
+        {
+            self.draw_empty_floor_strip(*position);
         }
         self.draw_floor_end_stairs();
         for facility in self.tower.facilities().iter().filter(|facility| {
@@ -3839,7 +4571,163 @@ impl App {
         );
     }
 
-    fn draw_empty_floor(&self, position: GridPosition) {
+    fn draw_tenant_panel(&self) {
+        let Some(panel_state) = &self.tenant_panel else {
+            return;
+        };
+        let Some(facility) = self
+            .tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == panel_state.facility_id)
+        else {
+            return;
+        };
+        let panel = tenant_info_rect();
+        draw_classic_panel(panel);
+        draw_rectangle_lines(
+            panel.x + 5.0,
+            panel.y + 5.0,
+            panel.w - 10.0,
+            panel.h - 10.0,
+            1.0,
+            CLASSIC_SHADOW,
+        );
+
+        let name_field = Rect::new(panel.x + 14.0, panel.y + 13.0, panel.w - 28.0, 25.0);
+        draw_recessed_field(name_field);
+        let stored_name = self
+            .tenant_names
+            .get(&facility.id)
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                default_tenant_name(
+                    facility.kind,
+                    self.tenant_variants.get(&facility.id).copied(),
+                )
+            });
+        let title = if panel_state.renaming {
+            format!("{}|", panel_state.rename_draft)
+        } else {
+            format!(
+                "{stored_name}, Floor {}",
+                format_floor(facility.position.floor)
+            )
+        };
+        draw_fitted_text(
+            &title,
+            name_field.x + 7.0,
+            name_field.y + 18.0,
+            name_field.w - 14.0,
+            17,
+            BLACK,
+        );
+        if panel_state.renaming {
+            draw_rectangle_lines(
+                name_field.x + 2.0,
+                name_field.y + 2.0,
+                name_field.w - 4.0,
+                name_field.h - 4.0,
+                1.0,
+                Color::from_rgba(20, 55, 190, 255),
+            );
+        }
+
+        let crowd = self.facility_crowd(facility);
+        let (sprite, source) = self.assets.facility_sprite_for(
+            facility,
+            crowd,
+            self.tenant_variants.get(&facility.id).copied(),
+            self.tower.clock.minute_of_day,
+            self.facility_visual_load(facility),
+        );
+        let scale = (300.0 / source.w).min(54.0 / source.h).min(2.0);
+        let sprite_size = vec2(source.w * scale, source.h * scale);
+        draw_texture_ex(
+            &sprite.texture,
+            (panel.x + panel.w * 0.5 - sprite_size.x * 0.5).round(),
+            panel.y + 48.0 + (54.0 - sprite_size.y) * 0.5,
+            WHITE,
+            DrawTextureParams {
+                source: Some(source),
+                dest_size: Some(sprite_size),
+                ..Default::default()
+            },
+        );
+
+        let reachable = self.traffic.reachable_facility_set().contains(&facility.id);
+        let patronage = self.traffic.daily_visitors_at(facility.id);
+        let current_inside = self.traffic.visitors_at(facility.id) as u32;
+        let previous_profit = self
+            .tenant_finances
+            .get(&facility.id)
+            .map_or(0, |state| state.previous_profit);
+        let details = tenant_info_details(facility, patronage, current_inside, previous_profit);
+        let field_x = panel.x + 222.0;
+        let field_w = panel.w - 247.0;
+        for (index, (label, value)) in details.fields.iter().enumerate() {
+            let y = panel.y + 119.0 + index as f32 * 31.0;
+            draw_right_aligned_text(label, field_x - 10.0, y + 19.0, 16, BLACK);
+            let field = Rect::new(field_x, y, field_w, 24.0);
+            draw_recessed_field(field);
+            if index == 0 && details.progress_max > 0 {
+                let filled = (field.w - 4.0)
+                    * (details.progress_value as f32 / details.progress_max as f32).clamp(0.0, 1.0);
+                if filled > 0.0 {
+                    draw_rectangle(
+                        field.x + 2.0,
+                        field.y + 2.0,
+                        filled,
+                        field.h - 4.0,
+                        Color::from_rgba(22, 40, 225, 255),
+                    );
+                }
+            }
+            draw_fitted_text(
+                value,
+                field.x + 6.0,
+                field.y + 18.0,
+                field.w - 12.0,
+                16,
+                BLACK,
+            );
+        }
+
+        let people_box = Rect::new(panel.x + 14.0, panel.y + 183.0, panel.w - 28.0, 39.0);
+        draw_recessed_field(people_box);
+        draw_tenant_people_meter(people_box, details.people_icons);
+
+        let evaluation_box = Rect::new(panel.x + 14.0, panel.y + 231.0, panel.w - 28.0, 55.0);
+        draw_recessed_field(evaluation_box);
+        let evaluation = tenant_evaluation(facility, reachable, patronage, current_inside);
+        draw_fitted_text(
+            evaluation,
+            evaluation_box.x + 8.0,
+            evaluation_box.y + 22.0,
+            evaluation_box.w - 16.0,
+            16,
+            BLACK,
+        );
+
+        let rename = tenant_info_rename_rect();
+        draw_classic_button(rename, false);
+        draw_centered_text(
+            if panel_state.renaming {
+                "Save name"
+            } else {
+                "Rename"
+            },
+            rename.x + rename.w * 0.5,
+            rename.y + 20.0,
+            15,
+            BLACK,
+        );
+        let ok = tenant_info_ok_rect();
+        draw_classic_button(ok, false);
+        draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 20.0, 15, BLACK);
+    }
+
+    fn draw_empty_floor_room(&self, position: GridPosition) {
         let x = (f32::from(position.x) - self.camera_x) * CELL_WIDTH;
         let room_y = tenant_room_top_y(self.ground_y(), position.floor);
         draw_rectangle(
@@ -3849,6 +4737,10 @@ impl App {
             ROOM_HEIGHT,
             Color::from_rgba(55, 56, 57, 255),
         );
+    }
+
+    fn draw_empty_floor_strip(&self, position: GridPosition) {
+        let x = (f32::from(position.x) - self.camera_x) * CELL_WIDTH;
         self.draw_floor_strip(
             position.x,
             x,
@@ -4005,7 +4897,7 @@ impl App {
             x,
             draw_y,
             if facility.is_burned() {
-                Color::new(0.28, 0.24, 0.22, 1.0)
+                Color::new(0.15, 0.12, 0.1, 1.0)
             } else {
                 facility_light_tint(facility.kind, crowd)
             },
@@ -4105,16 +4997,32 @@ impl App {
                 room_y,
                 width,
                 ROOM_HEIGHT,
-                Color::new(0.08, 0.06, 0.05, 0.48),
+                Color::new(0.035, 0.025, 0.02, 0.68),
+            );
+            draw_rectangle(x, room_y, width, 3.0, Color::new(0.01, 0.008, 0.006, 0.95));
+            draw_rectangle(
+                x,
+                room_y + ROOM_HEIGHT - 4.0,
+                width,
+                4.0,
+                Color::new(0.01, 0.008, 0.006, 0.92),
             );
             let scorch_count = (width / 24.0).ceil() as usize;
             for scorch in 0..scorch_count {
                 let center_x = x + 10.0 + scorch as f32 * 24.0;
                 draw_circle(
                     center_x.min(x + width - 5.0),
-                    room_y + 15.0 + (scorch % 2) as f32 * 3.0,
-                    5.0 + (scorch % 3) as f32,
-                    Color::new(0.03, 0.025, 0.02, 0.7),
+                    room_y + 12.0 + (scorch % 2) as f32 * 5.0,
+                    7.0 + (scorch % 3) as f32,
+                    Color::new(0.008, 0.006, 0.004, 0.9),
+                );
+                draw_line(
+                    (center_x - 7.0).max(x),
+                    room_y + 4.0,
+                    (center_x + 6.0).min(x + width),
+                    room_y + ROOM_HEIGHT - 3.0,
+                    2.0,
+                    Color::new(0.12, 0.075, 0.04, 0.9),
                 );
             }
         }
@@ -4871,10 +5779,14 @@ impl App {
                     if !is_hotel_room(facility.kind) {
                         continue;
                     }
-                    if facility.is_occupied() {
+                    if facility.is_hotel_infested() {
+                        Color::from_rgba(35, 25, 20, 255)
+                    } else if facility.is_hotel_dirty() {
+                        Color::from_rgba(220, 45, 45, 255)
+                    } else if facility.is_occupied() {
                         Color::from_rgba(45, 105, 225, 255)
                     } else {
-                        Color::from_rgba(220, 45, 45, 255)
+                        Color::from_rgba(110, 115, 120, 255)
                     }
                 }
             };
@@ -5111,8 +6023,8 @@ impl App {
         draw_rectangle(
             0.0,
             TOPBAR_HEIGHT,
-            screen_width(),
-            screen_height() - TOPBAR_HEIGHT,
+            ui_screen_width(),
+            ui_screen_height() - TOPBAR_HEIGHT,
             Color::from_rgba(0, 0, 0, 80),
         );
         draw_classic_panel(rect);
@@ -5276,8 +6188,8 @@ impl App {
         draw_rectangle(
             0.0,
             TOPBAR_HEIGHT,
-            screen_width(),
-            screen_height() - TOPBAR_HEIGHT,
+            ui_screen_width(),
+            ui_screen_height() - TOPBAR_HEIGHT,
             Color::from_rgba(0, 0, 0, 80),
         );
         draw_texture_ex(
@@ -5525,11 +6437,11 @@ impl App {
     }
 
     fn draw_topbar(&self) {
-        draw_rectangle(0.0, 0.0, screen_width(), TOPBAR_HEIGHT, CLASSIC_FACE);
+        draw_rectangle(0.0, 0.0, ui_screen_width(), TOPBAR_HEIGHT, CLASSIC_FACE);
         draw_line(
             0.0,
             TOPBAR_HEIGHT - 1.0,
-            screen_width(),
+            ui_screen_width(),
             TOPBAR_HEIGHT - 1.0,
             2.0,
             CLASSIC_DARK,
@@ -5585,7 +6497,7 @@ impl App {
             clock.minute_of_day % 60
         );
         let time_width = measure_text(&time, None, 17, 1.0).width;
-        let time_x = topbar_clock_x(screen_width(), time_width, controls_right);
+        let time_x = topbar_clock_x(ui_screen_width(), time_width, controls_right);
         draw_text(&time, time_x, 23.0, 17.0, BLACK);
         let money = format!(
             "Fund {}    Pop {}",
@@ -5593,16 +6505,23 @@ impl App {
             self.population()
         );
         let money_width = measure_text(&money, None, 17, 1.0).width;
-        let money_x = (screen_width() - money_width - 12.0).max(time_x + time_width + 18.0);
+        let money_x = (ui_screen_width() - money_width - 12.0).max(time_x + time_width + 18.0);
         draw_text(&money, money_x, 23.0, 17.0, BLACK);
         draw_rectangle(
             6.0,
             35.0,
-            screen_width() - 12.0,
+            ui_screen_width() - 12.0,
             22.0,
             Color::from_rgba(235, 235, 235, 255),
         );
-        draw_rectangle_lines(6.0, 35.0, screen_width() - 12.0, 22.0, 1.0, CLASSIC_SHADOW);
+        draw_rectangle_lines(
+            6.0,
+            35.0,
+            ui_screen_width() - 12.0,
+            22.0,
+            1.0,
+            CLASSIC_SHADOW,
+        );
         let mode = match self.view_mode {
             ViewMode::Evaluation => "Evaluation".to_owned(),
             ViewMode::Pricing => "Rent".to_owned(),
@@ -5622,7 +6541,7 @@ impl App {
             BLACK,
         );
 
-        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let mouse = ui_mouse_position();
         if let Some(star) = (0..5).find(|star| rating_star_rect(*star).contains(mouse)) {
             self.draw_star_tooltip(star + 1, rating_star_rect(star).x, 31.0);
         }
@@ -5631,24 +6550,63 @@ impl App {
     fn draw_game_menu(&self) {
         let menu = game_menu_rect();
         draw_classic_panel(menu);
-        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let mouse = ui_mouse_position();
         for (index, (action, label)) in GAME_MENU_ACTIONS.iter().enumerate() {
             let row = game_menu_entry_rect(index);
-            let hovered = row.contains(mouse);
+            let hovered = row.contains(mouse)
+                || (*action == GameMenuAction::UxScale && self.ux_scale_menu_open);
+            let checked =
+                *action == GameMenuAction::AutomaticReports && self.automatic_finance_reports;
+            let checkable = *action == GameMenuAction::AutomaticReports;
+            let display_label = if *action == GameMenuAction::UxScale {
+                format!("UX scale: {}", self.ux_scale.label())
+            } else {
+                (*label).to_owned()
+            };
             if hovered {
                 draw_rectangle(row.x, row.y, row.w, row.h, TITLE_BLUE);
             }
-            if *action == GameMenuAction::AutomaticReports && self.automatic_finance_reports {
+            if checked {
                 draw_menu_checkmark(row, if hovered { WHITE } else { BLACK });
             }
             draw_text(
-                label,
-                row.x
-                    + if *action == GameMenuAction::AutomaticReports {
-                        25.0
-                    } else {
-                        8.0
-                    },
+                &display_label,
+                row.x + if checkable { 25.0 } else { 8.0 },
+                row.y + 17.0,
+                14.0,
+                if hovered { WHITE } else { BLACK },
+            );
+            if *action == GameMenuAction::UxScale {
+                let arrow_color = if hovered { WHITE } else { BLACK };
+                let arrow_x = row.x + row.w - 12.0;
+                let arrow_y = row.y + row.h * 0.5;
+                draw_triangle(
+                    vec2(arrow_x, arrow_y - 4.0),
+                    vec2(arrow_x, arrow_y + 4.0),
+                    vec2(arrow_x + 5.0, arrow_y),
+                    arrow_color,
+                );
+            }
+        }
+    }
+
+    fn draw_ux_scale_menu(&self) {
+        let menu = ux_scale_menu_rect();
+        draw_classic_panel(menu);
+        let mouse = ui_mouse_position();
+        for (index, scale) in UX_SCALE_CHOICES.iter().copied().enumerate() {
+            let row = ux_scale_menu_entry_rect(index);
+            let hovered = row.contains(mouse);
+            let selected = self.ux_scale == scale;
+            if hovered {
+                draw_rectangle(row.x, row.y, row.w, row.h, TITLE_BLUE);
+            }
+            if selected {
+                draw_menu_checkmark(row, if hovered { WHITE } else { BLACK });
+            }
+            draw_text(
+                scale.label(),
+                row.x + 25.0,
                 row.y + 17.0,
                 14.0,
                 if hovered { WHITE } else { BLACK },
@@ -5659,7 +6617,7 @@ impl App {
     fn draw_mode_menu(&self) {
         let menu = mode_menu_rect();
         draw_classic_panel(menu);
-        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let mouse = ui_mouse_position();
         for (index, label) in MODE_MENU_LABELS.iter().enumerate() {
             let row = mode_menu_entry_rect(index);
             let mode = ViewMode::from_menu_index(index).expect("mode menu index is valid");
@@ -5694,8 +6652,8 @@ impl App {
         draw_rectangle(
             0.0,
             TOPBAR_HEIGHT,
-            screen_width(),
-            screen_height() - TOPBAR_HEIGHT,
+            ui_screen_width(),
+            ui_screen_height() - TOPBAR_HEIGHT,
             Color::from_rgba(0, 0, 0, 90),
         );
         let rect = save_name_dialog_rect();
@@ -5802,7 +6760,7 @@ impl App {
         }
         width += 12.0;
         let height = if second.is_some() { 38.0 } else { 22.0 };
-        let x = x.min(screen_width() - width - 4.0).max(4.0);
+        let x = x.min(ui_screen_width() - width - 4.0).max(4.0);
         draw_rectangle(x, y, width, height, Color::from_rgba(255, 255, 220, 250));
         draw_rectangle_lines(x, y, width, height, 1.0, BLACK);
         draw_text(first, x + 6.0, y + 15.0, font_size as f32, BLACK);
@@ -5906,7 +6864,7 @@ impl App {
             TITLE_BLUE,
         );
         draw_text(menu.title(), rect.x + 7.0, rect.y + 15.0, 12.0, WHITE);
-        let mouse = vec2(mouse_position().0, mouse_position().1);
+        let mouse = ui_mouse_position();
         let rating = self.star_rating();
         for (index, entry) in menu.entries().iter().enumerate() {
             let row = submenu_entry_rect(index);
@@ -6052,7 +7010,7 @@ impl App {
 
     fn draw_tooltip(&self, text: &str, x: f32, y: f32) {
         let width = measure_text(text, None, 13, 1.0).width + 10.0;
-        let x = x.min(screen_width() - width - 4.0).max(4.0);
+        let x = x.min(ui_screen_width() - width - 4.0).max(4.0);
         let y = y.max(TOPBAR_HEIGHT + 1.0);
         draw_rectangle(x, y, width, 20.0, Color::from_rgba(255, 255, 220, 250));
         draw_rectangle_lines(x, y, width, 20.0, 1.0, BLACK);
@@ -6559,11 +7517,30 @@ fn office_sprite_frame(minute_of_day: u16) -> usize {
     usize::from(night_sprite_active(minute_of_day))
 }
 
-fn hotel_sprite_frame(minute_of_day: u16, visitors: usize) -> usize {
-    // The first pair is a room in use, the second is a clean room waiting
-    // for its next guest. Later pairs are dirty/infested states, which are
-    // reserved until housekeeping simulation supplies those conditions.
-    usize::from(visitors == 0) * 2 + usize::from(night_sprite_active(minute_of_day))
+fn hotel_sprite_frame(minute_of_day: u16, visitors: usize, dirty: bool, infested: bool) -> usize {
+    // Reverse engineering the original 1193/1257/1321 resource families
+    // confirms four day/night pairs: occupied, clean, dirty, infested.
+    let state = if infested {
+        3
+    } else if dirty {
+        2
+    } else if visitors == 0 {
+        1
+    } else {
+        0
+    };
+    state * 2 + usize::from(night_sprite_active(minute_of_day))
+}
+
+fn hotel_checkout_minute(facility_id: u64) -> u16 {
+    const FIRST_CHECKOUT: u16 = 6 * 60 + 30;
+    const LAST_CHECKOUT: u16 = 12 * 60;
+    let window = u64::from(LAST_CHECKOUT - FIRST_CHECKOUT + 1);
+    FIRST_CHECKOUT
+        + (facility_id
+            .wrapping_mul(97)
+            .wrapping_add(facility_id.rotate_left(17))
+            % window) as u16
 }
 
 const fn speed_label(speed: SimulationSpeed) -> &'static str {
@@ -6771,7 +7748,7 @@ fn game_menu_rect() -> Rect {
     Rect::new(
         6.0,
         31.0,
-        158.0,
+        176.0,
         7.0 + GAME_MENU_ACTIONS.len() as f32 * 24.0,
     )
 }
@@ -6794,10 +7771,78 @@ fn game_menu_action_at(point: Vec2) -> Option<GameMenuAction> {
         .map(|(_, (action, _))| *action)
 }
 
+fn ux_scale_menu_rect() -> Rect {
+    let parent = game_menu_entry_rect(4);
+    Rect::new(
+        parent.x + parent.w - 1.0,
+        parent.y,
+        106.0,
+        7.0 + UX_SCALE_CHOICES.len() as f32 * 24.0,
+    )
+}
+
+fn ux_scale_menu_entry_rect(index: usize) -> Rect {
+    let menu = ux_scale_menu_rect();
+    Rect::new(
+        menu.x + 3.0,
+        menu.y + 3.0 + index as f32 * 24.0,
+        menu.w - 6.0,
+        24.0,
+    )
+}
+
+fn ux_scale_menu_choice_at(point: Vec2) -> Option<UxScale> {
+    UX_SCALE_CHOICES
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(index, _)| ux_scale_menu_entry_rect(*index).contains(point))
+        .map(|(_, scale)| scale)
+}
+
+fn active_ux_scale() -> UxScale {
+    UxScale::from_quarters(ACTIVE_UX_SCALE.load(Ordering::Relaxed))
+}
+
+fn set_active_ux_scale(scale: UxScale) {
+    ACTIVE_UX_SCALE.store(scale as u8, Ordering::Relaxed);
+}
+
+fn physical_to_ui(point: Vec2, scale: UxScale) -> Vec2 {
+    point / scale.factor()
+}
+
+fn ui_mouse_position() -> Vec2 {
+    let (x, y) = mouse_position();
+    physical_to_ui(vec2(x, y), active_ux_scale())
+}
+
+fn ui_screen_width() -> f32 {
+    screen_width() / active_ux_scale().factor()
+}
+
+fn ui_screen_height() -> f32 {
+    screen_height() / active_ux_scale().factor()
+}
+
+fn begin_ui_camera(scale: UxScale) {
+    set_active_ux_scale(scale);
+    let width = ui_screen_width();
+    let height = ui_screen_height();
+    // Camera2D's onscreen matrix applies its own Y inversion. A positive Y
+    // zoom therefore preserves the same top-left origin as Macroquad's
+    // default drawing coordinates while scaling only this overlay pass.
+    set_camera(&Camera2D {
+        target: vec2(width * 0.5, height * 0.5),
+        zoom: vec2(2.0 / width, 2.0 / height),
+        ..Default::default()
+    });
+}
+
 fn save_name_dialog_rect() -> Rect {
     Rect::new(
-        screen_width() * 0.5 - 190.0,
-        screen_height() * 0.5 - 80.0,
+        ui_screen_width() * 0.5 - 190.0,
+        ui_screen_height() * 0.5 - 80.0,
         380.0,
         160.0,
     )
@@ -6839,6 +7884,29 @@ fn save_game_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not determine the current user's home folder".to_owned())
 }
 
+fn ux_scale_preference_path() -> Result<PathBuf, String> {
+    Ok(save_game_directory()?.join(UX_SCALE_SETTINGS_FILE))
+}
+
+fn load_ux_scale_preference() -> UxScale {
+    ux_scale_preference_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|value| UxScale::from_preference(&value))
+        .unwrap_or(UxScale::One)
+}
+
+fn save_ux_scale_preference(scale: UxScale) -> Result<(), String> {
+    let path = ux_scale_preference_path()?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "UX scale preference path does not have a parent folder".to_owned())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("could not create settings folder: {error}"))?;
+    fs::write(&path, scale.preference_value())
+        .map_err(|error| format!("could not save UX scale preference: {error}"))
+}
+
 fn sanitized_save_filename(name: &str) -> Result<String, String> {
     let mut sanitized = String::new();
     for character in name.trim().chars().take(64) {
@@ -6866,6 +7934,79 @@ fn sanitized_save_filename(name: &str) -> Result<String, String> {
 
 fn save_game_path(name: &str) -> Result<PathBuf, String> {
     Ok(save_game_directory()?.join(sanitized_save_filename(name)?))
+}
+
+fn save_default_name_for_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(DEFAULT_SAVE_NAME)
+        .to_owned()
+}
+
+fn key_for_text_character(character: char) -> Option<KeyCode> {
+    const LETTER_KEYS: [KeyCode; 26] = [
+        KeyCode::A,
+        KeyCode::B,
+        KeyCode::C,
+        KeyCode::D,
+        KeyCode::E,
+        KeyCode::F,
+        KeyCode::G,
+        KeyCode::H,
+        KeyCode::I,
+        KeyCode::J,
+        KeyCode::K,
+        KeyCode::L,
+        KeyCode::M,
+        KeyCode::N,
+        KeyCode::O,
+        KeyCode::P,
+        KeyCode::Q,
+        KeyCode::R,
+        KeyCode::S,
+        KeyCode::T,
+        KeyCode::U,
+        KeyCode::V,
+        KeyCode::W,
+        KeyCode::X,
+        KeyCode::Y,
+        KeyCode::Z,
+    ];
+    const NUMBER_KEYS: [KeyCode; 10] = [
+        KeyCode::Key0,
+        KeyCode::Key1,
+        KeyCode::Key2,
+        KeyCode::Key3,
+        KeyCode::Key4,
+        KeyCode::Key5,
+        KeyCode::Key6,
+        KeyCode::Key7,
+        KeyCode::Key8,
+        KeyCode::Key9,
+    ];
+    if character.is_ascii_alphabetic() {
+        let index = character.to_ascii_lowercase() as usize - 'a' as usize;
+        return Some(LETTER_KEYS[index]);
+    }
+    if character.is_ascii_digit() {
+        return Some(NUMBER_KEYS[character as usize - '0' as usize]);
+    }
+    match character {
+        ' ' => Some(KeyCode::Space),
+        '-' | '_' => Some(KeyCode::Minus),
+        '=' | '+' => Some(KeyCode::Equal),
+        '[' | '{' => Some(KeyCode::LeftBracket),
+        ']' | '}' => Some(KeyCode::RightBracket),
+        '\\' | '|' => Some(KeyCode::Backslash),
+        ';' | ':' => Some(KeyCode::Semicolon),
+        '\'' | '"' => Some(KeyCode::Apostrophe),
+        ',' | '<' => Some(KeyCode::Comma),
+        '.' | '>' => Some(KeyCode::Period),
+        '/' | '?' => Some(KeyCode::Slash),
+        '`' | '~' => Some(KeyCode::GraveAccent),
+        _ => None,
+    }
 }
 
 fn prepared_save_game_directory() -> Result<PathBuf, String> {
@@ -7114,6 +8255,49 @@ fn draw_classic_panel(rect: Rect) {
     );
 }
 
+fn draw_recessed_field(rect: Rect) {
+    draw_rectangle(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        Color::from_rgba(238, 238, 238, 255),
+    );
+    draw_line(rect.x, rect.y, rect.x + rect.w, rect.y, 2.0, CLASSIC_DARK);
+    draw_line(rect.x, rect.y, rect.x, rect.y + rect.h, 2.0, CLASSIC_DARK);
+    draw_line(
+        rect.x,
+        rect.y + rect.h,
+        rect.x + rect.w,
+        rect.y + rect.h,
+        2.0,
+        CLASSIC_LIGHT,
+    );
+    draw_line(
+        rect.x + rect.w,
+        rect.y,
+        rect.x + rect.w,
+        rect.y + rect.h,
+        2.0,
+        CLASSIC_LIGHT,
+    );
+}
+
+fn draw_tenant_people_meter(rect: Rect, people_icons: u32) {
+    let count = people_icons.min(30) as usize;
+    let spacing = ((rect.w - 16.0) / 30.0).max(6.0);
+    for index in 0..count {
+        let x = rect.x + 9.0 + index as f32 * spacing;
+        let y = rect.y + 11.0;
+        draw_circle(x, y, 2.2, BLACK);
+        draw_line(x, y + 2.0, x, y + 13.0, 2.0, BLACK);
+        draw_line(x, y + 5.0, x - 3.0, y + 10.0, 1.5, BLACK);
+        draw_line(x, y + 5.0, x + 3.0, y + 10.0, 1.5, BLACK);
+        draw_line(x, y + 13.0, x - 3.0, y + 20.0, 1.5, BLACK);
+        draw_line(x, y + 13.0, x + 3.0, y + 20.0, 1.5, BLACK);
+    }
+}
+
 fn draw_menu_checkmark(row: Rect, color: Color) {
     let x = row.x + 7.0;
     let y = row.y + 12.0;
@@ -7205,10 +8389,10 @@ fn draw_classic_button(rect: Rect, pressed: bool) {
 
 fn elevator_panel_rect() -> Rect {
     let width = 280.0;
-    let height = 465.0_f32.min(screen_height() - TOPBAR_HEIGHT - 20.0);
+    let height = 465.0_f32.min(ui_screen_height() - TOPBAR_HEIGHT - 20.0);
     Rect::new(
-        (screen_width() - width) * 0.5,
-        TOPBAR_HEIGHT + (screen_height() - TOPBAR_HEIGHT - height) * 0.5,
+        (ui_screen_width() - width) * 0.5,
+        TOPBAR_HEIGHT + (ui_screen_height() - TOPBAR_HEIGHT - height) * 0.5,
         width,
         height,
     )
@@ -7218,10 +8402,36 @@ fn finance_panel_rect() -> Rect {
     let width = 343.0;
     let height = 364.0;
     Rect::new(
-        (screen_width() - width) * 0.5,
-        ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
         width,
         height,
+    )
+}
+
+fn tenant_info_rect() -> Rect {
+    let width = 510.0_f32.min(ui_screen_width() - 20.0);
+    let height = 340.0_f32.min(ui_screen_height() - TOPBAR_HEIGHT - 16.0);
+    Rect::new(
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        width,
+        height,
+    )
+}
+
+fn tenant_info_rename_rect() -> Rect {
+    let panel = tenant_info_rect();
+    Rect::new(panel.x + 14.0, panel.y + panel.h - 40.0, 112.0, 27.0)
+}
+
+fn tenant_info_ok_rect() -> Rect {
+    let panel = tenant_info_rect();
+    Rect::new(
+        panel.x + panel.w - 126.0,
+        panel.y + panel.h - 40.0,
+        112.0,
+        27.0,
     )
 }
 
@@ -7234,8 +8444,8 @@ fn promotion_dialog_rect() -> Rect {
     let width = 390.0;
     let height = 166.0;
     Rect::new(
-        (screen_width() - width) * 0.5,
-        ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
         width,
         height,
     )
@@ -7257,8 +8467,8 @@ fn fire_response_dialog_rect() -> Rect {
     let width = 540.0;
     let height = 210.0;
     Rect::new(
-        (screen_width() - width) * 0.5,
-        ((screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
         width,
         height,
     )
@@ -7322,6 +8532,202 @@ fn format_floor(floor: i16) -> String {
         format!("B{}", floor.unsigned_abs())
     } else {
         floor.to_string()
+    }
+}
+
+struct TenantInfoDetails {
+    fields: [(&'static str, String); 2],
+    progress_value: u32,
+    progress_max: u32,
+    people_icons: u32,
+}
+
+fn tenant_info_details(
+    facility: &Facility,
+    patronage: u32,
+    current_inside: u32,
+    previous_profit: i64,
+) -> TenantInfoDetails {
+    let capacity = facility.kind.population_capacity().max(1);
+    let current_inside = current_inside.min(capacity);
+    match facility.kind {
+        FacilityKind::Restaurant
+        | FacilityKind::FastFood
+        | FacilityKind::Shop
+        | FacilityKind::Cinema
+        | FacilityKind::PartyHall => TenantInfoDetails {
+            fields: [
+                ("Today's Patronage", patronage.to_string()),
+                ("Yesterday's Profit", format_currency(previous_profit)),
+            ],
+            progress_value: patronage,
+            progress_max: capacity,
+            people_icons: proportional_people_icons(patronage, capacity),
+        },
+        FacilityKind::Office => TenantInfoDetails {
+            fields: [
+                ("Occupancy", format!("{current_inside} / {capacity}")),
+                (
+                    "Rent",
+                    format_currency(tenant_rate(facility.kind, facility.price_level)),
+                ),
+            ],
+            progress_value: current_inside,
+            progress_max: capacity,
+            people_icons: current_inside,
+        },
+        FacilityKind::Condo => TenantInfoDetails {
+            fields: [
+                (
+                    "Status",
+                    if facility.is_occupied() {
+                        "Occupied"
+                    } else {
+                        "For Sale"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "Price",
+                    format_currency(tenant_rate(facility.kind, facility.price_level)),
+                ),
+            ],
+            progress_value: u32::from(facility.is_occupied()),
+            progress_max: 1,
+            people_icons: if facility.is_occupied() { capacity } else { 0 },
+        },
+        FacilityKind::HotelSingle | FacilityKind::HotelTwin | FacilityKind::HotelSuite => {
+            TenantInfoDetails {
+                fields: [
+                    ("Now on board", format!("{current_inside} / {capacity}")),
+                    (
+                        "Rate",
+                        format_currency(tenant_rate(facility.kind, facility.price_level)),
+                    ),
+                ],
+                progress_value: current_inside,
+                progress_max: capacity,
+                people_icons: current_inside,
+            }
+        }
+        _ => TenantInfoDetails {
+            fields: [
+                ("Status", "Occupied".to_owned()),
+                ("Value", format_currency(previous_profit)),
+            ],
+            progress_value: current_inside,
+            progress_max: capacity,
+            people_icons: current_inside,
+        },
+    }
+}
+
+fn proportional_people_icons(value: u32, maximum: u32) -> u32 {
+    (((value.min(maximum) as f32 / maximum.max(1) as f32) * 30.0).ceil() as u32).min(30)
+}
+
+fn tenant_rate(kind: FacilityKind, price_level: u8) -> i64 {
+    let index = usize::from(price_level.min(3));
+    match kind {
+        FacilityKind::Office => [5_000, 10_000, 15_000, 20_000][index],
+        FacilityKind::Condo => [100_000, 150_000, 200_000, 250_000][index],
+        FacilityKind::HotelSingle => [1_000, 2_000, 3_000, 4_000][index],
+        FacilityKind::HotelTwin => [1_500, 3_000, 4_500, 6_000][index],
+        FacilityKind::HotelSuite => [3_000, 6_000, 9_000, 12_000][index],
+        FacilityKind::Shop => [7_500, 15_000, 22_500, 30_000][index],
+        _ => 0,
+    }
+}
+
+fn tenant_evaluation(
+    facility: &Facility,
+    reachable: bool,
+    patronage: u32,
+    current_inside: u32,
+) -> &'static str {
+    if facility.is_burned() {
+        return "Burned Area";
+    }
+    if facility.is_hotel_infested() {
+        return "Cockroach infestation - bulldoze room";
+    }
+    if facility.is_hotel_dirty() {
+        return "Waiting for housekeeping";
+    }
+    if !facility.is_occupied() {
+        return if facility.kind == FacilityKind::Condo {
+            "For Sale"
+        } else {
+            "For Rent"
+        };
+    }
+    if !reachable {
+        return "No transportation connected";
+    }
+    if matches!(
+        facility.kind,
+        FacilityKind::Restaurant
+            | FacilityKind::FastFood
+            | FacilityKind::Shop
+            | FacilityKind::Cinema
+            | FacilityKind::PartyHall
+    ) {
+        let capacity = facility.kind.population_capacity().max(1);
+        return match patronage.saturating_mul(100) / capacity {
+            75.. => "Business is very good!",
+            45..=74 => "Business is good",
+            20..=44 => "Business is average",
+            _ => "Very few customers",
+        };
+    }
+    if current_inside > 0 || facility.kind == FacilityKind::Condo {
+        "Transportation access is good"
+    } else {
+        "Waiting for occupants"
+    }
+}
+
+fn default_tenant_name(kind: FacilityKind, variant: Option<usize>) -> &'static str {
+    const RESTAURANTS: [&str; 5] = [
+        "English Pub",
+        "French Restaurant",
+        "Chinese Restaurant",
+        "Sushi Bar",
+        "Steak House",
+    ];
+    const FAST_FOOD: [&str; 5] = [
+        "Japanese Soba",
+        "Chinese Cafe",
+        "Hamburger Stand",
+        "Ice Cream",
+        "Coffee Shop",
+    ];
+    const SHOPS: [&str; 11] = [
+        "Men's Clothing",
+        "Pet Store",
+        "Flower Shop",
+        "Book Store",
+        "Drug Store",
+        "Boutique",
+        "Electronics",
+        "Bank",
+        "Hair Salon",
+        "Post Office",
+        "Sports Gear",
+    ];
+    let index = variant.unwrap_or(0);
+    match kind {
+        FacilityKind::Restaurant => RESTAURANTS[index % RESTAURANTS.len()],
+        FacilityKind::FastFood => FAST_FOOD[index % FAST_FOOD.len()],
+        FacilityKind::Shop => SHOPS[index % SHOPS.len()],
+        FacilityKind::Office => "Office",
+        FacilityKind::Condo => "Condominium",
+        FacilityKind::HotelSingle => "Single Room",
+        FacilityKind::HotelTwin => "Twin Room",
+        FacilityKind::HotelSuite => "Hotel Suite",
+        FacilityKind::Cinema => "Movie Theater",
+        FacilityKind::PartyHall => "Party Hall",
+        _ => kind.spec().name,
     }
 }
 
@@ -8175,7 +9581,7 @@ impl OriginalAssets {
                 escalator: facility_sprite_from_vertical_bmps(
                     FacilityKind::Escalator,
                     &[ESCALATOR_UPPER_BMP, ESCALATOR_LOWER_BMP],
-                    false,
+                    true,
                 )?,
                 elevator: facility_sprite_from_bmp(FacilityKind::Elevator, ELEVATOR_BMP)?,
                 service_elevator: facility_sprite_from_bmp(
@@ -8362,13 +9768,21 @@ impl OriginalAssets {
             let style = tenant_variant
                 .unwrap_or_else(|| facility_variant_index(facility, vacant.len()))
                 % vacant.len();
-            if !facility.is_occupied() {
+            if !facility.is_occupied()
+                && !facility.is_hotel_dirty()
+                && !facility.is_hotel_infested()
+            {
                 let sprite = &vacant[style];
                 return (sprite, sprite.source);
             }
             let sprite = &occupied[style];
             let mut source = sprite.source;
-            let frame = hotel_sprite_frame(minute_of_day, visual_load);
+            let frame = hotel_sprite_frame(
+                minute_of_day,
+                visual_load,
+                facility.is_hotel_dirty(),
+                facility.is_hotel_infested(),
+            );
             source.x += frame as f32 * source.w;
             return (sprite, source);
         }
@@ -8516,6 +9930,7 @@ struct NativeSounds {
     fire_response: PathBuf,
     elevator_move: PathBuf,
     elevator_open: [PathBuf; 2],
+    escalator_move: PathBuf,
     crowd: PathBuf,
     muted: Cell<bool>,
 }
@@ -8535,6 +9950,7 @@ impl NativeSounds {
         let elevator_move = directory.join(format!("elevator-move-{ELEVATOR_MOVE_SOUND_ID}.wav"));
         let elevator_open =
             ELEVATOR_OPEN_SOUND_IDS.map(|id| directory.join(format!("elevator-open-{id}.wav")));
+        let escalator_move = directory.join("escalator-move.wav");
         let crowd = directory.join(format!("crowd-{CROWD_SOUND_ID}.wav"));
         std::fs::write(&construction, CONSTRUCTION_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
@@ -8554,6 +9970,11 @@ impl NativeSounds {
         {
             std::fs::write(path, bytes.bytes()?).map_err(|error| error.to_string())?;
         }
+        // SimTower has no separate escalator WAVE resource. Its elevator motor
+        // recording is the closest original mechanical cue, so use a quieter
+        // copy and only trigger it when a rider steps onto an escalator.
+        let escalator_bytes = attenuate_unsigned_pcm8_wav(ELEVATOR_MOVE_WAV.bytes()?, 0.28);
+        std::fs::write(&escalator_move, escalator_bytes).map_err(|error| error.to_string())?;
         std::fs::write(&crowd, CROWD_1_WAV.bytes()?).map_err(|error| error.to_string())?;
         Ok(Self {
             construction,
@@ -8565,6 +9986,7 @@ impl NativeSounds {
             fire_response,
             elevator_move,
             elevator_open,
+            escalator_move,
             crowd,
             muted: Cell::new(false),
         })
@@ -8646,6 +10068,13 @@ impl NativeSounds {
         play_native_sound_async(self.elevator_open[variant % self.elevator_open.len()].clone());
     }
 
+    fn play_escalator_move(&self) {
+        if self.is_muted() {
+            return;
+        }
+        play_native_sound_async(self.escalator_move.clone());
+    }
+
     fn play_crowd(&self) {
         if self.is_muted() {
             return;
@@ -8656,6 +10085,32 @@ impl NativeSounds {
 
 fn play_native_sound_async(path: PathBuf) {
     let _ = std::thread::spawn(move || play_native_sound(path));
+}
+
+fn attenuate_unsigned_pcm8_wav(bytes: &[u8], gain: f32) -> Vec<u8> {
+    let mut quiet = bytes.to_vec();
+    let mut cursor = 12_usize;
+    while cursor + 8 <= quiet.len() {
+        let chunk_size = u32::from_le_bytes([
+            quiet[cursor + 4],
+            quiet[cursor + 5],
+            quiet[cursor + 6],
+            quiet[cursor + 7],
+        ]) as usize;
+        let data_start = cursor + 8;
+        let data_end = data_start.saturating_add(chunk_size).min(quiet.len());
+        if &quiet[cursor..cursor + 4] == b"data" {
+            for sample in &mut quiet[data_start..data_end] {
+                let centered = f32::from(*sample) - 128.0;
+                *sample = (128.0 + centered * gain.clamp(0.0, 1.0))
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            break;
+        }
+        cursor = data_end + (chunk_size & 1);
+    }
+    quiet
 }
 
 #[cfg(target_os = "macos")]
@@ -9682,6 +11137,7 @@ mod tests {
             fire_response: PathBuf::new(),
             elevator_move: PathBuf::new(),
             elevator_open: [PathBuf::new(), PathBuf::new()],
+            escalator_move: PathBuf::new(),
             crowd: PathBuf::new(),
             muted: Cell::new(false),
         };
@@ -9766,17 +11222,112 @@ mod tests {
     }
 
     #[test]
+    fn tenant_information_uses_original_business_names_and_evaluations() {
+        assert_eq!(
+            default_tenant_name(FacilityKind::Restaurant, Some(0)),
+            "English Pub"
+        );
+        assert_eq!(
+            default_tenant_name(FacilityKind::FastFood, Some(1)),
+            "Chinese Cafe"
+        );
+        assert_eq!(
+            default_tenant_name(FacilityKind::Shop, Some(10)),
+            "Sports Gear"
+        );
+
+        let facility = Facility {
+            id: 7,
+            kind: FacilityKind::FastFood,
+            position: GridPosition { x: 10, floor: 2 },
+            occupancy: simtower_core::FacilityOccupancy::Occupied,
+            price_level: 1,
+            stories: 1,
+        };
+        assert_eq!(
+            tenant_evaluation(&facility, false, 48, 12),
+            "No transportation connected"
+        );
+        assert_eq!(
+            tenant_evaluation(&facility, true, 48, 12),
+            "Business is very good!"
+        );
+        assert_eq!(
+            tenant_evaluation(&facility, true, 0, 0),
+            "Very few customers"
+        );
+    }
+
+    #[test]
+    fn residential_tenant_panels_show_literal_original_headcounts() {
+        let occupied = |kind| Facility {
+            id: kind as u64 + 1,
+            kind,
+            position: GridPosition { x: 10, floor: 2 },
+            occupancy: simtower_core::FacilityOccupancy::Occupied,
+            price_level: 1,
+            stories: 1,
+        };
+
+        let single = tenant_info_details(&occupied(FacilityKind::HotelSingle), 0, 1, 0);
+        assert_eq!(single.fields[0].1, "1 / 1");
+        assert_eq!(single.people_icons, 1);
+
+        let twin = tenant_info_details(&occupied(FacilityKind::HotelTwin), 0, 2, 0);
+        assert_eq!(twin.fields[0].1, "2 / 2");
+        assert_eq!(twin.people_icons, 2);
+
+        let suite = tenant_info_details(&occupied(FacilityKind::HotelSuite), 0, 1, 0);
+        assert_eq!(suite.fields[0].1, "1 / 2");
+        assert_eq!(suite.people_icons, 1);
+
+        let condo = tenant_info_details(&occupied(FacilityKind::Condo), 0, 0, 0);
+        assert_eq!(condo.people_icons, 3);
+
+        assert_eq!(FacilityKind::Office.population_capacity(), 6);
+        assert_eq!(FacilityKind::Condo.population_capacity(), 3);
+        assert_eq!(FacilityKind::HotelSingle.population_capacity(), 1);
+        assert_eq!(FacilityKind::HotelTwin.population_capacity(), 2);
+        assert_eq!(FacilityKind::HotelSuite.population_capacity(), 2);
+        assert_eq!(proportional_people_icons(24, 48), 15);
+    }
+
+    #[test]
+    fn tenant_information_rolls_income_into_yesterdays_profit() {
+        let mut finances = HashMap::new();
+        let event = IncomeEvent {
+            facility_id: 42,
+            kind: FacilityKind::Restaurant,
+            amount: 6_000,
+        };
+        record_tenant_finances(&mut finances, 3, &[event]);
+        assert_eq!(finances[&42].current_profit, 6_000);
+        assert_eq!(finances[&42].previous_profit, 0);
+
+        record_tenant_finances(&mut finances, 4, &[]);
+        assert_eq!(finances[&42].current_profit, 0);
+        assert_eq!(finances[&42].previous_profit, 6_000);
+    }
+
+    #[test]
     fn narrow_topbar_controls_push_the_clock_to_the_right() {
         assert_eq!(topbar_clock_x(1_200.0, 160.0, 430.0), 520.0);
         assert_eq!(topbar_clock_x(800.0, 160.0, 430.0), 442.0);
     }
 
     #[test]
-    fn game_menu_exposes_file_actions_and_automatic_report_toggle() {
-        assert_eq!(GAME_MENU_ACTIONS.len(), 5);
+    fn game_menu_exposes_file_actions_report_toggle_and_ux_scales() {
+        assert_eq!(GAME_MENU_ACTIONS.len(), 6);
         assert_eq!(
             GAME_MENU_ACTIONS.map(|(_, label)| label),
-            ["New", "Save", "Load", "Automatic reports", "Quit"]
+            [
+                "New",
+                "Save",
+                "Load",
+                "Automatic reports",
+                "UX scale",
+                "Quit",
+            ]
         );
         for (index, (action, _)) in GAME_MENU_ACTIONS.iter().enumerate() {
             assert_eq!(
@@ -9785,6 +11336,32 @@ mod tests {
             );
         }
         assert_eq!(game_menu_button_rect().x, 6.0);
+        assert_eq!(GAME_MENU_ACTIONS[4].0, GameMenuAction::UxScale);
+        for (index, scale) in UX_SCALE_CHOICES.iter().copied().enumerate() {
+            assert_eq!(
+                ux_scale_menu_choice_at(ux_scale_menu_entry_rect(index).center()),
+                Some(scale)
+            );
+        }
+    }
+
+    #[test]
+    fn ux_scale_supports_fractional_choices_and_transforms_only_ui_coordinates() {
+        assert_eq!(UxScale::One.factor(), 1.0);
+        assert_eq!(UxScale::OneAndQuarter.factor(), 1.25);
+        assert_eq!(UxScale::OneAndHalf.factor(), 1.5);
+        assert_eq!(UxScale::Two.factor(), 2.0);
+        assert_eq!(
+            UxScale::from_preference("1.25"),
+            Some(UxScale::OneAndQuarter)
+        );
+        assert_eq!(UxScale::from_preference("1.5x"), Some(UxScale::OneAndHalf));
+        assert_eq!(UxScale::from_preference("3"), Some(UxScale::Two));
+        assert_eq!(UxScale::from_preference("bogus"), None);
+        assert_eq!(
+            physical_to_ui(vec2(1_000.0, 500.0), UxScale::OneAndQuarter),
+            vec2(800.0, 400.0)
+        );
     }
 
     #[test]
@@ -9806,8 +11383,8 @@ mod tests {
     }
 
     #[test]
-    fn save_dialog_always_starts_with_selected_tower_default() {
-        let mut dialog = SaveNameDialog::with_default_name();
+    fn save_dialog_starts_with_the_current_tower_name_selected() {
+        let mut dialog = SaveNameDialog::with_default_name(DEFAULT_SAVE_NAME);
         assert_eq!(dialog.name, "Tower");
         assert!(dialog.replace_default_on_input);
 
@@ -9816,10 +11393,33 @@ mod tests {
         assert_eq!(dialog.name, "My");
         assert!(!dialog.replace_default_on_input);
 
-        let mut dialog = SaveNameDialog::with_default_name();
+        let mut dialog = SaveNameDialog::with_default_name("Loaded Tower");
+        assert_eq!(dialog.name, "Loaded Tower");
+        assert!(dialog.replace_default_on_input);
         dialog.backspace();
         assert!(dialog.name.is_empty());
         assert!(!dialog.replace_default_on_input);
+
+        assert_eq!(
+            save_default_name_for_path(Path::new("/tmp/My Tower.smtower")),
+            "My Tower"
+        );
+    }
+
+    #[test]
+    fn save_name_text_repeat_waits_then_repeats_at_a_steady_rate() {
+        let mut repeat = TextKeyRepeat {
+            key: KeyCode::Backspace,
+            action: TextEditAction::Backspace,
+            elapsed: 0.0,
+            next_repeat: TEXT_REPEAT_DELAY_SECONDS,
+        };
+        assert_eq!(repeat.advance(0.40), 0);
+        assert_eq!(repeat.advance(0.03), 1);
+        assert_eq!(repeat.advance(TEXT_REPEAT_INTERVAL_SECONDS * 3.0), 3);
+        assert_eq!(key_for_text_character('A'), Some(KeyCode::A));
+        assert_eq!(key_for_text_character('_'), Some(KeyCode::Minus));
+        assert_eq!(key_for_text_character(' '), Some(KeyCode::Space));
     }
 
     #[test]
@@ -9849,6 +11449,9 @@ mod tests {
             automatic_finance_reports: false,
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
+            tenant_names: HashMap::new(),
+            tenant_finances: HashMap::new(),
+            hotel_guest_stays: HashSet::new(),
         };
         let json = serde_json::to_vec(&save).expect("save should encode");
         let decoded: SaveGame = serde_json::from_slice(&json).expect("save should decode");
@@ -9955,7 +11558,7 @@ mod tests {
         let shifted = sky_tile_origin_x(1.0);
         assert_eq!(shifted - origin, -CELL_WIDTH);
         assert_eq!(VERTICAL_WHEEL_FLOORS_PER_STEP, 0.5);
-        assert_eq!(HORIZONTAL_WHEEL_COLUMNS_PER_STEP, 2.0);
+        assert_eq!(HORIZONTAL_WHEEL_COLUMNS_PER_STEP, 2.5);
     }
 
     #[test]
@@ -10379,10 +11982,22 @@ mod tests {
         assert_eq!(office_sprite_frame(12 * 60), 0);
         assert_eq!(office_sprite_frame(20 * 60), 1);
         assert_eq!(tenant_variant_count(FacilityKind::Office), Some(6));
-        assert_eq!(hotel_sprite_frame(12 * 60, 1), 0);
-        assert_eq!(hotel_sprite_frame(20 * 60, 1), 1);
-        assert_eq!(hotel_sprite_frame(12 * 60, 0), 2);
-        assert_eq!(hotel_sprite_frame(20 * 60, 0), 3);
+        assert_eq!(hotel_sprite_frame(12 * 60, 1, false, false), 0);
+        assert_eq!(hotel_sprite_frame(20 * 60, 1, false, false), 1);
+        assert_eq!(hotel_sprite_frame(12 * 60, 0, false, false), 2);
+        assert_eq!(hotel_sprite_frame(20 * 60, 0, false, false), 3);
+        assert_eq!(hotel_sprite_frame(12 * 60, 0, true, false), 4);
+        assert_eq!(hotel_sprite_frame(20 * 60, 0, true, false), 5);
+        assert_eq!(hotel_sprite_frame(12 * 60, 0, false, true), 6);
+        assert_eq!(hotel_sprite_frame(20 * 60, 0, false, true), 7);
+        let checkout_times = (1..=512).map(hotel_checkout_minute).collect::<Vec<_>>();
+        assert!(
+            checkout_times
+                .iter()
+                .all(|minute| { (6 * 60 + 30..=12 * 60).contains(minute) })
+        );
+        assert!(checkout_times.iter().copied().min().unwrap() < 7 * 60);
+        assert!(checkout_times.iter().copied().max().unwrap() > 11 * 60 + 30);
     }
 
     #[test]
@@ -10428,11 +12043,13 @@ mod tests {
             people: 2,
             moving_cars: 0,
             passengers: 0,
+            escalator_riders: 0,
         };
         let arriving = TrafficAudioSnapshot {
             people: 3,
             moving_cars: 1,
             passengers: 0,
+            escalator_riders: 0,
         };
         assert_eq!(
             traffic_sound_events(idle, arriving),
@@ -10443,11 +12060,36 @@ mod tests {
             people: 3,
             moving_cars: 0,
             passengers: 1,
+            escalator_riders: 1,
         };
         assert_eq!(
             traffic_sound_events(arriving, boarded),
-            vec![TrafficSoundEvent::ElevatorOpen]
+            vec![
+                TrafficSoundEvent::ElevatorOpen,
+                TrafficSoundEvent::EscalatorMove
+            ]
         );
+    }
+
+    #[test]
+    fn escalator_rider_art_tracks_progress_in_both_directions() {
+        assert_eq!(escalator_frame_for_position(3, 3, 2.0), 0);
+        assert_eq!(escalator_frame_for_position(3, 3, 2.5), 4);
+        assert_eq!(escalator_frame_for_position(3, 3, 3.0), 7);
+        assert_eq!(escalator_frame_for_position(3, 4, 3.0), 0);
+        assert_eq!(escalator_frame_for_position(3, 4, 2.5), 4);
+        assert_eq!(escalator_frame_for_position(3, 4, 2.0), 7);
+    }
+
+    #[test]
+    fn escalator_motor_copy_is_quieter_without_changing_wave_headers() {
+        let source = ELEVATOR_MOVE_WAV
+            .bytes()
+            .expect("elevator sound should load");
+        let quiet = attenuate_unsigned_pcm8_wav(source, 0.25);
+        assert_eq!(&quiet[..12], &source[..12]);
+        assert_eq!(quiet.len(), source.len());
+        assert_ne!(quiet, source);
     }
 
     #[test]

@@ -14,6 +14,8 @@
     <string>OpenTower</string>
     <key>CFBundleDisplayName</key>
     <string>OpenTower</string>
+    <key>CFBundleIconFile</key>
+    <string>OpenTower.icns</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

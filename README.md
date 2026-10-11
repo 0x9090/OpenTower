@@ -78,17 +78,20 @@ the ground lobby to the appropriate sky lobby.
 ## Build from source
 
 If a packaged build is not available for your platform, install the current
-Rust toolchain and run:
+Rust toolchain and use the launcher in the repository root:
+
+```sh
+./OpenTower.sh
+```
+
+On Windows, double-click `OpenTower.cmd` instead. These source-tree launchers
+build the current checkout and start the game with the original SimTower icon.
+
+Public builds ask for your original `SimTower.exe`. To test that behavior from
+source instead of using the development resources, run:
 
 ```sh
 cargo run -p simtower-desktop --no-default-features
-```
-
-The app will ask for your original `SimTower.exe`. Contributors working from a
-checkout with locally extracted resources can use the default Cargo features:
-
-```sh
-cargo run -p simtower-desktop
 ```
 
 Please report gameplay problems and platform-specific issues through the

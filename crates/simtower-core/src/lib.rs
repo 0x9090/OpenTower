@@ -147,6 +147,9 @@ impl FacilityKind {
     /// Maximum population contribution used by SimTower's rating counter.
     /// Commercial population is the venue's peak patron count; the original
     /// carries the most recently observed value between opening periods.
+    /// The executable's removal routine confirms the residential values: it
+    /// subtracts one person for unit type 3 (single hotel), two for types 4/5
+    /// (twin/suite), and three for type 9 (condominium).
     pub const fn population_capacity(self) -> u32 {
         match self {
             Self::Office => 6,
@@ -197,6 +200,15 @@ pub enum FacilityOccupancy {
     NotApplicable,
     VacantUntil(u64),
     Occupied,
+    /// A hotel room that has checked a guest out but has not yet been cleaned.
+    /// The day is retained so rooms left dirty for three days can become
+    /// permanently infested, matching the original hotel's maintenance loop.
+    HotelDirty {
+        since_day: u32,
+    },
+    /// A cockroach-infested hotel room. It cannot accept guests and must be
+    /// demolished before the space can be used again.
+    HotelInfested,
     /// The room was destroyed by an emergency and remains unusable until it
     /// is demolished and rebuilt.
     Burned,
@@ -226,6 +238,14 @@ impl Facility {
 
     pub const fn is_burned(&self) -> bool {
         matches!(self.occupancy, FacilityOccupancy::Burned)
+    }
+
+    pub const fn is_hotel_dirty(&self) -> bool {
+        matches!(self.occupancy, FacilityOccupancy::HotelDirty { .. })
+    }
+
+    pub const fn is_hotel_infested(&self) -> bool {
+        matches!(self.occupancy, FacilityOccupancy::HotelInfested)
     }
 
     pub fn height(&self) -> u16 {
@@ -380,6 +400,67 @@ impl Tower {
         true
     }
 
+    /// Marks an occupied hotel room dirty after checkout. Calling this more
+    /// than once preserves the first missed-cleaning day.
+    pub fn mark_hotel_dirty(&mut self, facility_id: u64, day: u32) -> bool {
+        let Some(facility) = self
+            .facilities
+            .iter_mut()
+            .find(|item| item.id == facility_id)
+        else {
+            return false;
+        };
+        if !matches!(
+            facility.kind,
+            FacilityKind::HotelSingle | FacilityKind::HotelTwin | FacilityKind::HotelSuite
+        ) {
+            return false;
+        }
+        if facility.occupancy == FacilityOccupancy::Occupied {
+            facility.occupancy = FacilityOccupancy::HotelDirty {
+                since_day: day.max(1),
+            };
+            return true;
+        }
+        facility.is_hotel_dirty()
+    }
+
+    /// Returns a dirty hotel room to service after housekeeping reaches it.
+    pub fn clean_hotel_room(&mut self, facility_id: u64) -> bool {
+        let Some(facility) = self
+            .facilities
+            .iter_mut()
+            .find(|item| item.id == facility_id)
+        else {
+            return false;
+        };
+        if !facility.is_hotel_dirty() {
+            return false;
+        }
+        facility.occupancy = FacilityOccupancy::Occupied;
+        true
+    }
+
+    /// Permanently takes a hotel room out of service after a cockroach
+    /// infestation. Demolition is intentionally the only recovery path.
+    pub fn mark_hotel_infested(&mut self, facility_id: u64) -> bool {
+        let Some(facility) = self
+            .facilities
+            .iter_mut()
+            .find(|item| item.id == facility_id)
+        else {
+            return false;
+        };
+        if !matches!(
+            facility.occupancy,
+            FacilityOccupancy::Occupied | FacilityOccupancy::HotelDirty { .. }
+        ) {
+            return false;
+        }
+        facility.occupancy = FacilityOccupancy::HotelInfested;
+        true
+    }
+
     pub fn facilities(&self) -> &[Facility] {
         &self.facilities
     }
@@ -416,6 +497,13 @@ impl Tower {
                 || (facility.kind != FacilityKind::Lobby
                     && facility.stories != facility.kind.spec().height as u8)
                 || (facility.is_burned() && !facility.kind.has_tenant_occupancy())
+                || ((facility.is_hotel_dirty() || facility.is_hotel_infested())
+                    && !matches!(
+                        facility.kind,
+                        FacilityKind::HotelSingle
+                            | FacilityKind::HotelTwin
+                            | FacilityKind::HotelSuite
+                    ))
             {
                 return Err("save contains invalid facility data".to_owned());
             }
@@ -2127,6 +2215,30 @@ mod tests {
         assert!(tower.facilities()[0].is_burned());
 
         tower.demolish(office).unwrap();
+        assert!(tower.facilities().is_empty());
+    }
+
+    #[test]
+    fn hotel_rooms_move_from_dirty_to_clean_or_permanent_infestation() {
+        let mut tower = Tower::new(16, 1_000_000);
+        build_supported_floor(&mut tower, 1, 0..10);
+        let room = tower
+            .place(FacilityKind::HotelSingle, GridPosition { x: 0, floor: 1 })
+            .unwrap();
+        tower.facilities[0].occupancy = FacilityOccupancy::Occupied;
+
+        assert!(tower.mark_hotel_dirty(room, 2));
+        assert!(tower.facilities()[0].is_hotel_dirty());
+        assert_eq!(tower.population(), 0);
+        assert!(tower.clean_hotel_room(room));
+        assert!(tower.facilities()[0].is_occupied());
+
+        assert!(tower.mark_hotel_dirty(room, 3));
+        assert!(tower.mark_hotel_infested(room));
+        assert!(tower.facilities()[0].is_hotel_infested());
+        assert!(!tower.clean_hotel_room(room));
+        assert_eq!(tower.population(), 0);
+        tower.demolish(room).unwrap();
         assert!(tower.facilities().is_empty());
     }
 

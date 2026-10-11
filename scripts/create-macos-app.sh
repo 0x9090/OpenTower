@@ -4,14 +4,20 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "$0")/.." && pwd)"
 binary_path="${1:-${repository_root}/target/debug/simtower}"
 bundle_path="${2:-${repository_root}/target/debug/OpenTower.app}"
+icon_source="${repository_root}/assets/original/icons/1.bmp"
 
 if [[ ! -x "${binary_path}" ]]; then
     echo "OpenTower executable not found: ${binary_path}" >&2
     exit 1
 fi
 
-mkdir -p "${bundle_path}/Contents/MacOS"
+mkdir -p "${bundle_path}/Contents/MacOS" "${bundle_path}/Contents/Resources"
 install -m 755 "${binary_path}" "${bundle_path}/Contents/MacOS/OpenTower"
 install -m 644 "${repository_root}/packaging/macos/Info.plist" "${bundle_path}/Contents/Info.plist"
+
+if command -v sips >/dev/null 2>&1 && [[ -f "${icon_source}" ]]; then
+    sips -s format icns "${icon_source}" \
+        --out "${bundle_path}/Contents/Resources/OpenTower.icns" >/dev/null
+fi
 
 echo "Created ${bundle_path}"

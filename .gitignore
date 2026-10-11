@@ -10,7 +10,6 @@
 /ghidra_*/
 /third_party/
 /tools/
-/Play SimTower.command
 /assets/reference/
 
 # Never track source binaries, disc images, Ghidra databases, or local secrets.
