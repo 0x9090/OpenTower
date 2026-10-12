@@ -162,6 +162,17 @@ enum ElevatorAccess {
     Housekeeping,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopologySync {
+    Full,
+    Additive,
+    RemovedWalkway {
+        kind: FacilityKind,
+        x: u16,
+        floor: i16,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrafficSimulation {
     people: Vec<Person>,
@@ -403,7 +414,7 @@ impl TrafficSimulation {
     }
 
     pub fn sync_with_tower(&mut self, tower: &Tower) {
-        self.sync_with_tower_internal(tower, false);
+        self.sync_with_tower_internal(tower, TopologySync::Full);
     }
 
     /// Synchronizes after construction that only adds route infrastructure.
@@ -411,10 +422,27 @@ impl TrafficSimulation {
     /// unreachable destinations need pathfinding. Destructive edits continue
     /// to use `sync_with_tower` and rebuild every route.
     pub fn sync_with_tower_after_addition(&mut self, tower: &Tower) {
-        self.sync_with_tower_internal(tower, true);
+        self.sync_with_tower_internal(tower, TopologySync::Additive);
     }
 
-    fn sync_with_tower_internal(&mut self, tower: &Tower, additive_topology: bool) {
+    /// Synchronizes after removing one facility. A stair or escalator flight
+    /// can invalidate only routes that use its column and cross that flight,
+    /// so preserve every unrelated cached tenant route instead of rebuilding
+    /// the entire tower synchronously on the demolition click.
+    pub fn sync_with_tower_after_removal(&mut self, tower: &Tower, removed: &Facility) {
+        let mode = if matches!(removed.kind, FacilityKind::Stairs | FacilityKind::Escalator) {
+            TopologySync::RemovedWalkway {
+                kind: removed.kind,
+                x: removed.position.x,
+                floor: removed.position.floor,
+            }
+        } else {
+            TopologySync::Full
+        };
+        self.sync_with_tower_internal(tower, mode);
+    }
+
+    fn sync_with_tower_internal(&mut self, tower: &Tower, mode: TopologySync) {
         let signature = tower_topology_signature(tower);
         let destinations = tower
             .facilities()
@@ -499,7 +527,7 @@ impl TrafficSimulation {
             self.elevators = synchronized;
         }
 
-        if topology_changed && !additive_topology {
+        if topology_changed && mode == TopologySync::Full {
             self.routes_from_lobby = destinations
                 .iter()
                 .filter_map(|facility| {
@@ -513,12 +541,34 @@ impl TrafficSimulation {
                 })
                 .collect();
         } else {
-            // Tenant placement does not change corridors or transport.
-            // Additive construction cannot invalidate a working path either,
-            // so preserve existing routes and retry only new or unreachable
-            // destinations instead of rebuilding the whole tower graph.
+            // Tenant placement does not change corridors or transport, and
+            // additive construction cannot invalidate a working path. A
+            // removed walkway invalidates only routes that cross that exact
+            // flight. Preserve everything else and retry only new, affected,
+            // or previously unreachable destinations.
             self.routes_from_lobby
                 .retain(|facility_id, _| destination_ids.contains(facility_id));
+            if let TopologySync::RemovedWalkway { kind, x, floor } = mode {
+                let affected = destinations
+                    .iter()
+                    .filter(|facility| {
+                        self.routes_from_lobby
+                            .get(&facility.id)
+                            .is_some_and(|route| {
+                                route_uses_removed_walkway(
+                                    *route,
+                                    facility.position.floor,
+                                    kind,
+                                    x,
+                                    floor,
+                                )
+                            })
+                    })
+                    .map(|facility| facility.id)
+                    .collect::<HashSet<_>>();
+                self.routes_from_lobby
+                    .retain(|facility_id, _| !affected.contains(facility_id));
+            }
             for facility in &destinations {
                 let route_needs_refresh = !self.known_destinations.contains(&facility.id)
                     || !self.routes_from_lobby.contains_key(&facility.id);
@@ -1168,6 +1218,29 @@ fn route_from_first_floor_lobby(
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(route, _)| route)
+}
+
+fn route_uses_removed_walkway(
+    route: TravelMode,
+    destination_floor: i16,
+    removed_kind: FacilityKind,
+    removed_x: u16,
+    removed_floor: i16,
+) -> bool {
+    let TravelMode::Stairs { x: route_x } = route else {
+        return false;
+    };
+    let walkway_x = f32::from(removed_x) + f32::from(removed_kind.spec().width) * 0.5;
+    if (route_x - walkway_x).abs() > f32::EPSILON {
+        return false;
+    }
+
+    // A flight based on N joins ordinal N to N + 1. First floor is ordinal
+    // zero, while B1 is -1, so this also handles the B1/first-floor join.
+    let origin = floor_ordinal(1);
+    let destination = floor_ordinal(destination_floor);
+    let flight_base = floor_ordinal(removed_floor);
+    origin.min(destination) <= flight_base && origin.max(destination) >= flight_base + 1
 }
 
 fn tower_topology_signature(tower: &Tower) -> u64 {
@@ -1853,6 +1926,51 @@ mod tests {
             traffic.routes_from_lobby.get(&office_id),
             Some(TravelMode::Elevator { .. })
         ));
+    }
+
+    #[test]
+    fn stair_demolition_rebuilds_only_routes_that_cross_the_removed_flight() {
+        let mut tower = Tower::new(64, 10_000_000);
+        place_floor_run(&mut tower, 1, 64);
+        place_floor_run(&mut tower, 2, 64);
+        tower
+            .place(FacilityKind::Lobby, GridPosition { x: 0, floor: 1 })
+            .unwrap();
+        let stairs = tower
+            .place(FacilityKind::Stairs, GridPosition { x: 8, floor: 1 })
+            .unwrap();
+        let lower_office = tower
+            .place(FacilityKind::Office, GridPosition { x: 20, floor: 1 })
+            .unwrap();
+        let upper_office = tower
+            .place(FacilityKind::Office, GridPosition { x: 20, floor: 2 })
+            .unwrap();
+
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        assert!(matches!(
+            traffic.routes_from_lobby.get(&upper_office),
+            Some(TravelMode::Stairs { .. })
+        ));
+
+        // A sentinel on an unrelated route makes an unnecessary global
+        // rebuild observable rather than relying on timing in the test.
+        let sentinel = TravelMode::Elevator {
+            shaft_id: u64::MAX,
+            x: 999.0,
+        };
+        traffic.routes_from_lobby.insert(lower_office, sentinel);
+
+        let removed = tower.demolish(stairs).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        assert_eq!(
+            traffic.routes_from_lobby.get(&lower_office),
+            Some(&sentinel)
+        );
+        assert!(!traffic.routes_from_lobby.contains_key(&upper_office));
+        assert!(traffic.reachable_facilities.contains(&lower_office));
+        assert!(!traffic.reachable_facilities.contains(&upper_office));
     }
 
     #[test]

@@ -3069,7 +3069,8 @@ impl App {
             ToolMode::Demolish => match self.demolition_target_at(point) {
                 Some(DemolitionTarget::Facility(id)) => match self.tower.demolish(id) {
                     Ok(facility) => {
-                        self.traffic.sync_with_tower(&self.tower);
+                        self.traffic
+                            .sync_with_tower_after_removal(&self.tower, &facility);
                         self.assets.play_demolition();
                         self.status = format!("Demolished {} #{}", facility.kind.spec().name, id)
                     }
@@ -4427,9 +4428,11 @@ impl App {
         }) {
             self.draw_facility(facility);
         }
-        self.draw_disabled_elevator_outlines();
         self.draw_elevator_endcaps();
         self.draw_elevator_cars();
+        // Hidden shafts retain a crisp outer border. Draw it after cars so a
+        // car at either edge cannot cover the shaft silhouette.
+        self.draw_disabled_elevator_outlines();
         self.draw_roof_crane();
         self.draw_people();
         self.draw_fire_response();
@@ -5951,12 +5954,7 @@ impl App {
     }
 
     fn draw_elevator_cars(&self) {
-        for shaft in self
-            .traffic
-            .elevators()
-            .iter()
-            .filter(|shaft| shaft.visible)
-        {
+        for shaft in self.traffic.elevators() {
             let (texture, frame_width, load_frames) = match shaft.kind {
                 FacilityKind::Elevator => (&self.assets.elevator_cars, 32.0, 4),
                 FacilityKind::ServiceElevator => {
@@ -5998,7 +5996,7 @@ impl App {
                     car_texture,
                     x,
                     y,
-                    WHITE,
+                    Color::new(1.0, 1.0, 1.0, elevator_infrastructure_alpha(shaft.visible)),
                     DrawTextureParams {
                         dest_size: Some(vec2(frame_width, FLOOR_HEIGHT)),
                         source: Some(source),
@@ -6024,7 +6022,7 @@ impl App {
             let height = f32::from(
                 simtower_core::floor_ordinal(top) - simtower_core::floor_ordinal(bottom) + 1,
             ) * FLOOR_HEIGHT;
-            draw_rectangle_lines(x, y, width, height, 1.0, Color::new(0.55, 0.58, 0.66, 0.5));
+            draw_rectangle_lines(x, y, width, height, 1.0, hidden_elevator_outline_color());
         }
     }
 
@@ -6039,7 +6037,7 @@ impl App {
             let bottom = *shaft.served_floors.first().expect("checked above");
             let x = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
             let width = f32::from(shaft.kind.spec().width) * CELL_WIDTH;
-            let tint = Color::new(1.0, 1.0, 1.0, elevator_display_alpha(shaft.visible));
+            let tint = Color::new(1.0, 1.0, 1.0, elevator_infrastructure_alpha(shaft.visible));
             let (texture, frame_width, up_frame, down_frame) = match shaft.kind {
                 FacilityKind::Elevator => (&self.assets.elevator_cars, 32.0, 4.0, 5.0),
                 FacilityKind::ExpressElevator => (
@@ -8968,6 +8966,14 @@ const fn elevator_display_alpha(visible: bool) -> f32 {
     if visible { 1.0 } else { 0.22 }
 }
 
+const fn elevator_infrastructure_alpha(_visible: bool) -> f32 {
+    1.0
+}
+
+const fn hidden_elevator_outline_color() -> Color {
+    Color::new(0.0, 0.0, 0.0, 1.0)
+}
+
 const fn elevator_number_texture_indices(default_waiting_floor: bool) -> (usize, usize, usize) {
     if default_waiting_floor {
         (3, 4, 5)
@@ -11308,9 +11314,12 @@ mod tests {
     }
 
     #[test]
-    fn hidden_elevator_display_keeps_faint_infrastructure() {
+    fn hidden_elevator_display_only_fades_the_shaft_interior() {
         assert_eq!(elevator_display_alpha(true), 1.0);
         assert_eq!(elevator_display_alpha(false), 0.22);
+        assert_eq!(elevator_infrastructure_alpha(true), 1.0);
+        assert_eq!(elevator_infrastructure_alpha(false), 1.0);
+        assert_eq!(hidden_elevator_outline_color(), BLACK);
     }
 
     #[test]
