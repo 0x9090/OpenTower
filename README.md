@@ -63,7 +63,10 @@ basement levels, the ground-floor lobby, and connected sky lobbies.
 - `5`: 10x speed
 - Space: pause or resume
 
-The Menu button contains New, Save, Load, automatic report, and Quit options.
+The Menu button contains New, Save, Load, automatic report, UX scale, and Quit
+options. UX scale changes only menus, dialogs, controls, and cursors; the tower
+keeps its original pixel-art scale. Choose 1.25x, 1.5x, or 2x for high-resolution
+displays.
 The speaker button on the top bar mutes or restores game audio. Saved towers
 are stored in the `SimTower` folder in your user home directory.
 

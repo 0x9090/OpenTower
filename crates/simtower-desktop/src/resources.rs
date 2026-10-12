@@ -164,11 +164,19 @@ pub(crate) const GROUND_BMP: AssetRef = bitmap_asset!(849);
 pub(crate) const PALETTE_BMP: AssetRef = bitmap_asset!(300);
 pub(crate) const PALETTE_SELECTED_BMP: AssetRef = bitmap_asset!(301);
 pub(crate) const PALETTE_DISABLED_BMP: AssetRef = bitmap_asset!(302);
+// Kept in the catalog for extraction/reverse-engineering parity. Runtime UX
+// controls now use resolution-independent geometry instead of these 32px cels.
+#[allow(dead_code)]
 pub(crate) const PLAY_BMP: AssetRef = bitmap_asset!(600);
+#[allow(dead_code)]
 pub(crate) const PLAY_SELECTED_BMP: AssetRef = bitmap_asset!(601);
+#[allow(dead_code)]
 pub(crate) const PAUSE_BMP: AssetRef = bitmap_asset!(602);
+#[allow(dead_code)]
 pub(crate) const PAUSE_SELECTED_BMP: AssetRef = bitmap_asset!(603);
+#[allow(dead_code)] // retained as the original pointer-tool reference sheet
 pub(crate) const POINTER_TOOLS_BMP: AssetRef = bitmap_asset!(604);
+#[allow(dead_code)]
 pub(crate) const POINTER_TOOLS_SELECTED_BMP: AssetRef = bitmap_asset!(605);
 pub(crate) const SCAFFOLD_BMP: AssetRef = bitmap_asset!(3624);
 pub(crate) const FLOOR_STRIP_BMP: AssetRef = bitmap_asset!(5000);
@@ -350,7 +358,9 @@ pub(crate) const CITY_BMP: AssetRef = bitmap_asset!(905);
 pub(crate) const INTRO_STORE_BMP: AssetRef = bitmap_asset!(256);
 pub(crate) const INTRO_TITLE_BMP: AssetRef = bitmap_asset!(257);
 pub(crate) const INTRO_MAXIS_BMP: AssetRef = bitmap_asset!(128);
+#[cfg(test)]
 pub(crate) const STAR_ON_BMP: AssetRef = bitmap_asset!(322);
+#[cfg(test)]
 pub(crate) const STAR_OFF_BMP: AssetRef = bitmap_asset!(323);
 pub(crate) const TOWER_LOGO_BMP: AssetRef = bitmap_asset!(327);
 pub(crate) const FINANCE_DIALOG_BMP: AssetRef = bitmap_asset!(500);
@@ -363,7 +373,11 @@ pub(crate) const FIRE_LARGE_BMPS: [AssetRef; 4] = [
 pub(crate) const FIRE_SMALL_BMP: AssetRef = bitmap_asset!(3948);
 pub(crate) const FIRE_HELICOPTER_BMP: AssetRef = bitmap_asset!(3949);
 pub(crate) const FIRE_ALERT_BMP: AssetRef = bitmap_asset!(10004);
-pub(crate) const FIRE_AFTERMATH_BMP: AssetRef = bitmap_asset!(10005);
+// The original burned-tenant strip is wide enough to cover every burnable unit
+// from a single hotel room through a cinema. Bitmap 10005 is the fire-result
+// dialog illustration, not the in-tower ruin artwork.
+pub(crate) const FIRE_AFTERMATH_BMP: AssetRef = bitmap_asset!(4008);
+#[allow(dead_code)] // replaced by a scalable recreation in the promotion dialog
 pub(crate) const STAR_AWARD_BMP: AssetRef = bitmap_asset!(10006);
 pub(crate) const TERRORIST_PORTRAIT_BMP: AssetRef = bitmap_asset!(10000);
 pub(crate) const FIRE_DISPATCH_BMP: AssetRef = bitmap_asset!(10001);

@@ -46,6 +46,7 @@ const RATING_STAR_WIDTH: f32 = 22.0;
 const RATING_STAR_HEIGHT: f32 = 18.0;
 const RATING_STAR_GAP: f32 = 2.0;
 const RATING_ROW_WIDTH: f32 = 128.0;
+const UI_TEXTURE_SCALE: f32 = 4.0;
 const SAVE_FORMAT_VERSION: u32 = 1;
 const SAVE_EXTENSION: &str = "smtower";
 const DEFAULT_SAVE_NAME: &str = "Tower";
@@ -712,31 +713,125 @@ fn window_conf() -> Conf {
 
 #[cfg(feature = "bundled-resources")]
 fn original_window_icon() -> Result<Icon, String> {
-    let image =
-        DibImage::decode_bmp(SIMTOWER_ICON_BMP.bytes()?).map_err(|error| error.to_string())?;
+    // Keep validating the bundled icon so a damaged resource package still
+    // fails early, but render the desktop icon from resolution-independent
+    // geometry. Enlarging the original 32-pixel icon made the 64-pixel dock
+    // and taskbar versions visibly blocky on high-DPI displays.
+    DibImage::decode_bmp(SIMTOWER_ICON_BMP.bytes()?).map_err(|error| error.to_string())?;
     Ok(Icon {
-        small: resize_icon::<{ 16 * 16 * 4 }>(&image, 16),
-        medium: resize_icon::<{ 32 * 32 * 4 }>(&image, 32),
-        big: resize_icon::<{ 64 * 64 * 4 }>(&image, 64),
+        small: render_opentower_icon::<{ 16 * 16 * 4 }>(16),
+        medium: render_opentower_icon::<{ 32 * 32 * 4 }>(32),
+        big: render_opentower_icon::<{ 64 * 64 * 4 }>(64),
     })
 }
 
 #[cfg(feature = "bundled-resources")]
-fn resize_icon<const LEN: usize>(image: &DibImage, side: usize) -> [u8; LEN] {
+fn render_opentower_icon<const LEN: usize>(side: usize) -> [u8; LEN] {
     assert_eq!(LEN, side * side * 4);
     let mut output = [0_u8; LEN];
-    let source_width = image.width() as usize;
-    let source_height = image.height() as usize;
+    const SAMPLES: usize = 4;
     for y in 0..side {
         for x in 0..side {
-            let source_x = x * source_width / side;
-            let source_y = y * source_height / side;
-            let source = (source_y * source_width + source_x) * 4;
             let target = (y * side + x) * 4;
-            output[target..target + 4].copy_from_slice(&image.rgba()[source..source + 4]);
+            let mut accumulated = [0_u16; 4];
+            for sample_y in 0..SAMPLES {
+                for sample_x in 0..SAMPLES {
+                    let px = (x as f32 + (sample_x as f32 + 0.5) / SAMPLES as f32) / side as f32;
+                    let py = (y as f32 + (sample_y as f32 + 0.5) / SAMPLES as f32) / side as f32;
+                    let color = opentower_icon_sample(px, py);
+                    for channel in 0..4 {
+                        accumulated[channel] += u16::from(color[channel]);
+                    }
+                }
+            }
+            for channel in 0..4 {
+                output[target + channel] =
+                    (accumulated[channel] / (SAMPLES * SAMPLES) as u16) as u8;
+            }
         }
     }
     output
+}
+
+#[cfg(feature = "bundled-resources")]
+fn opentower_icon_sample(x: f32, y: f32) -> [u8; 4] {
+    let inside = |left: f32, top: f32, right: f32, bottom: f32| {
+        x >= left && x <= right && y >= top && y <= bottom
+    };
+    let black = [12, 12, 16, 255];
+    let yellow = [255, 238, 0, 255];
+    let red = [238, 34, 24, 255];
+    let white = [248, 248, 244, 255];
+
+    // Black frame and ground preserve the original SimTower icon's visual
+    // weight even at the 16-pixel system-icon size.
+    if x < 0.035 || x > 0.965 || y < 0.035 || y > 0.965 || y > 0.88 {
+        return black;
+    }
+
+    let mut color = white;
+    // Distant yellow skyline.
+    if y > 0.39
+        || inside(0.06, 0.31, 0.13, 0.88)
+        || inside(0.17, 0.36, 0.24, 0.88)
+        || inside(0.28, 0.28, 0.35, 0.88)
+        || inside(0.72, 0.32, 0.79, 0.88)
+        || inside(0.84, 0.27, 0.91, 0.88)
+    {
+        color = yellow;
+    }
+    // Near red skyline.
+    if y > 0.62
+        || inside(0.08, 0.55, 0.17, 0.88)
+        || inside(0.22, 0.58, 0.31, 0.88)
+        || inside(0.68, 0.57, 0.78, 0.88)
+        || inside(0.82, 0.52, 0.93, 0.88)
+    {
+        color = red;
+    }
+
+    // Central OpenTower silhouette with a narrow antenna crown.
+    if inside(0.46, 0.10, 0.54, 0.23)
+        || inside(0.40, 0.22, 0.60, 0.88)
+        || inside(0.35, 0.34, 0.65, 0.88)
+    {
+        color = black;
+        let window_column = if x < 0.47 {
+            0
+        } else if x > 0.53 {
+            2
+        } else {
+            1
+        };
+        let window_row = ((y - 0.39) / 0.105).floor() as i32;
+        let window_center_x = [0.425, 0.5, 0.575][window_column];
+        let window_center_y = 0.42 + window_row as f32 * 0.105;
+        if (x - window_center_x).abs() < 0.024
+            && (y - window_center_y).abs() < 0.022
+            && (0..5).contains(&window_row)
+        {
+            color = yellow;
+        }
+    }
+
+    // A few square lights keep the two background layers legible at 32/64px.
+    for (window_x, window_y) in [
+        (0.12, 0.48),
+        (0.23, 0.44),
+        (0.31, 0.53),
+        (0.72, 0.46),
+        (0.86, 0.42),
+    ] {
+        if (x - window_x).abs() < 0.018 && (y - window_y).abs() < 0.018 {
+            color = white;
+        }
+    }
+    for (window_x, window_y) in [(0.13, 0.70), (0.26, 0.75), (0.73, 0.69), (0.87, 0.73)] {
+        if (x - window_x).abs() < 0.019 && (y - window_y).abs() < 0.019 {
+            color = yellow;
+        }
+    }
+    color
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4528,16 +4623,7 @@ impl App {
             1.0,
             CLASSIC_SHADOW,
         );
-        draw_texture_ex(
-            &self.assets.star_award,
-            rect.x + 17.0,
-            rect.y + 20.0,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(110.0, 110.0)),
-                ..Default::default()
-            },
-        );
+        draw_promotion_award(Rect::new(rect.x + 17.0, rect.y + 20.0, 110.0, 110.0));
         draw_text(
             "Congratulations!",
             rect.x + 139.0,
@@ -4842,6 +4928,10 @@ impl App {
             }
             return;
         }
+        if facility.is_burned() {
+            self.draw_burned_facility(facility, x, y, width);
+            return;
+        }
         let crowd = self.facility_crowd(facility);
         let (sprite, sprite_source) = self.assets.facility_sprite_for(
             facility,
@@ -4896,11 +4986,7 @@ impl App {
             &sprite.texture,
             x,
             draw_y,
-            if facility.is_burned() {
-                Color::new(0.15, 0.12, 0.1, 1.0)
-            } else {
-                facility_light_tint(facility.kind, crowd)
-            },
+            facility_light_tint(facility.kind, crowd),
             DrawTextureParams {
                 dest_size: Some(vec2(width, draw_height)),
                 source: Some(sprite_source),
@@ -4913,6 +4999,33 @@ impl App {
             y
         };
         self.draw_facility_state_overlay(facility, x, overlay_base_y, width);
+    }
+
+    fn draw_burned_facility(&self, facility: &Facility, x: f32, y: f32, width: f32) {
+        let source_size = vec2(
+            self.assets.fire_aftermath.width(),
+            self.assets.fire_aftermath.height(),
+        );
+        for story in 0..facility.height() {
+            let story_top_y = y - f32::from(story) * FLOOR_HEIGHT;
+            let room_y = if facility.position.floor > 0 {
+                story_top_y + FLOOR_HEIGHT - ROOM_HEIGHT
+            } else {
+                story_top_y
+            };
+            let (destination, source) = burned_unit_frame(x, room_y, width, source_size);
+            draw_texture_ex(
+                &self.assets.fire_aftermath,
+                destination.x,
+                destination.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(destination.w, destination.h)),
+                    source: Some(source),
+                    ..Default::default()
+                },
+            );
+        }
     }
 
     fn facility_crowd(&self, facility: &Facility) -> FacilityCrowd {
@@ -4990,43 +5103,6 @@ impl App {
     }
 
     fn draw_facility_state_overlay(&self, facility: &Facility, x: f32, base_y: f32, width: f32) {
-        if facility.is_burned() {
-            let room_y = tenant_room_top_y(self.ground_y(), facility.position.floor);
-            draw_rectangle(
-                x,
-                room_y,
-                width,
-                ROOM_HEIGHT,
-                Color::new(0.035, 0.025, 0.02, 0.68),
-            );
-            draw_rectangle(x, room_y, width, 3.0, Color::new(0.01, 0.008, 0.006, 0.95));
-            draw_rectangle(
-                x,
-                room_y + ROOM_HEIGHT - 4.0,
-                width,
-                4.0,
-                Color::new(0.01, 0.008, 0.006, 0.92),
-            );
-            let scorch_count = (width / 24.0).ceil() as usize;
-            for scorch in 0..scorch_count {
-                let center_x = x + 10.0 + scorch as f32 * 24.0;
-                draw_circle(
-                    center_x.min(x + width - 5.0),
-                    room_y + 12.0 + (scorch % 2) as f32 * 5.0,
-                    7.0 + (scorch % 3) as f32,
-                    Color::new(0.008, 0.006, 0.004, 0.9),
-                );
-                draw_line(
-                    (center_x - 7.0).max(x),
-                    room_y + 4.0,
-                    (center_x + 6.0).min(x + width),
-                    room_y + ROOM_HEIGHT - 3.0,
-                    2.0,
-                    Color::new(0.12, 0.075, 0.04, 0.9),
-                );
-            }
-        }
-
         if facility.kind == FacilityKind::Office {
             let worker_count = office_visible_worker_count(self.traffic.visitors_at(facility.id));
             if worker_count > 0 {
@@ -5561,59 +5637,57 @@ impl App {
     }
 
     fn draw_demolition_cursor(&self, mouse: Vec2) {
-        const RADIUS: f32 = 9.0;
+        let scale = self.ux_scale.factor();
+        let radius = 9.0 * scale;
         // The intersection is the hotspot: demolition hit-testing uses this
         // exact mouse pixel rather than the surrounding grid cell.
-        for thickness in [5.0, 2.0] {
-            let color = if thickness > 2.0 { BLACK } else { RED };
+        for (thickness, color) in [(5.0 * scale, BLACK), (2.0 * scale, RED)] {
             draw_line(
-                mouse.x - RADIUS,
-                mouse.y - RADIUS,
-                mouse.x + RADIUS,
-                mouse.y + RADIUS,
+                mouse.x - radius,
+                mouse.y - radius,
+                mouse.x + radius,
+                mouse.y + radius,
                 thickness,
                 color,
             );
             draw_line(
-                mouse.x + RADIUS,
-                mouse.y - RADIUS,
-                mouse.x - RADIUS,
-                mouse.y + RADIUS,
+                mouse.x + radius,
+                mouse.y - radius,
+                mouse.x - radius,
+                mouse.y + radius,
                 thickness,
                 color,
             );
         }
-        draw_circle(mouse.x, mouse.y, 1.25, WHITE);
+        draw_circle(mouse.x, mouse.y, 1.25 * scale, WHITE);
     }
 
     fn draw_magnifier_cursor(&self, mouse: Vec2) {
-        const CURSOR_WIDTH: f32 = 22.0;
-        const CURSOR_HEIGHT: f32 = 21.0;
-        const LENS_CENTER: Vec2 = Vec2::new(7.0, 7.0);
-        // Hit-testing uses `mouse` itself, so align the center of the glass
-        // with that exact pixel rather than using the bitmap's upper-left.
-        let top_left = mouse - LENS_CENTER;
+        let scale = self.ux_scale.factor();
+        let lens_center = vec2(7.0, 7.0) * scale;
+        let size = vec2(22.0, 21.0) * scale;
+        // Hit-testing uses `mouse` itself, so the original lens is centered on
+        // that exact physical pixel. The source is a 4x edge-aware upscale.
+        let top_left = mouse - lens_center;
         draw_texture_ex(
             &self.assets.magnifier_cursor,
             top_left.x,
             top_left.y,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(vec2(CURSOR_WIDTH, CURSOR_HEIGHT)),
+                dest_size: Some(size),
                 ..Default::default()
             },
         );
     }
 
     fn draw_elevator_resize_cursor(&self, mouse: Vec2, direction: i8) {
-        const CURSOR_SIZE: f32 = 25.0;
+        let cursor_size = 25.0 * self.ux_scale.factor();
         // The mouse hotspot is the fingertip, matching the original cursor.
-        // Keeping the image centered on the mouse put the clickable point half
-        // a floor away from where the hand appeared to point.
         let top_left = if direction > 0 {
-            mouse - vec2(CURSOR_SIZE * 0.5, 0.0)
+            mouse - vec2(cursor_size * 0.5, 0.0)
         } else {
-            mouse - vec2(CURSOR_SIZE * 0.5, CURSOR_SIZE)
+            mouse - vec2(cursor_size * 0.5, cursor_size)
         };
         draw_texture_ex(
             &self.assets.elevator_cursor,
@@ -5621,7 +5695,7 @@ impl App {
             top_left.y,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(vec2(CURSOR_SIZE, CURSOR_SIZE)),
+                dest_size: Some(vec2(cursor_size, cursor_size)),
                 flip_y: direction < 0,
                 ..Default::default()
             },
@@ -6471,20 +6545,7 @@ impl App {
         let rating = self.star_rating();
         for star in 0..5 {
             let rect = rating_star_rect(star);
-            draw_texture_ex(
-                if star < usize::from(rating) {
-                    &self.assets.star_on
-                } else {
-                    &self.assets.star_off
-                },
-                rect.x,
-                rect.y,
-                WHITE,
-                DrawTextureParams {
-                    dest_size: Some(rect.size()),
-                    ..Default::default()
-                },
-            );
+            draw_scalable_star(rect, star < usize::from(rating));
         }
         let star_row = rating_row_rect();
         let controls_right = star_row.x + star_row.w;
@@ -6796,17 +6857,15 @@ impl App {
             match button.icon {
                 ToolIcon::Pause => {
                     let paused = self.tower.clock.speed == SimulationSpeed::Paused;
-                    let texture = match (paused, selected) {
-                        (true, true) => &self.assets.play_selected,
-                        (true, false) => &self.assets.play,
-                        (false, true) => &self.assets.pause_selected,
-                        (false, false) => &self.assets.pause,
-                    };
-                    draw_cropped_icon(
-                        texture,
-                        Rect::new(16.0, 0.0, 32.0, 32.0),
-                        button_rect,
-                        WHITE,
+                    draw_play_pause_glyph(
+                        Rect::new(
+                            button_rect.x + 7.0,
+                            button_rect.y + 5.0,
+                            button_rect.w - 14.0,
+                            button_rect.h - 12.0,
+                        ),
+                        paused,
+                        BLACK,
                     );
                     let speed = speed_label(self.tower.clock.speed);
                     let width = measure_text(speed, None, 11, 1.0).width;
@@ -6834,7 +6893,12 @@ impl App {
                     };
                     draw_cropped_icon(
                         texture,
-                        Rect::new(f32::from(index) * icon_width, 0.0, icon_width, 21.0),
+                        Rect::new(
+                            f32::from(index) * icon_width * UI_TEXTURE_SCALE,
+                            0.0,
+                            icon_width * UI_TEXTURE_SCALE,
+                            21.0 * UI_TEXTURE_SCALE,
+                        ),
                         button_rect,
                         WHITE,
                     );
@@ -6926,9 +6990,14 @@ impl App {
             if selected {
                 draw_menu_checkmark(row, WHITE);
             }
+            draw_speed_choice_glyph(
+                Rect::new(row.x + 25.0, row.y + 5.0, 14.0, 14.0),
+                speed,
+                if selected { WHITE } else { BLACK },
+            );
             draw_text(
                 speed_label(speed),
-                row.x + 25.0,
+                row.x + 44.0,
                 row.y + 17.0,
                 14.0,
                 if selected { WHITE } else { BLACK },
@@ -7620,7 +7689,7 @@ fn speed_menu_rect() -> Rect {
     Rect::new(
         button.x + button.w + 4.0,
         button.y,
-        84.0,
+        100.0,
         4.0 + SPEED_CHOICES.len() as f32 * 25.0,
     )
 }
@@ -8305,6 +8374,165 @@ fn draw_menu_checkmark(row: Rect, color: Color) {
     draw_line(x + 4.0, y + 4.0, x + 12.0, y - 5.0, 2.0, color);
 }
 
+fn star_points(rect: Rect) -> [Vec2; 10] {
+    let center = rect.center();
+    let outer = rect.h * 0.5;
+    let inner = outer * 0.43;
+    let x_scale = rect.w / rect.h;
+    std::array::from_fn(|index| {
+        let radius = if index % 2 == 0 { outer } else { inner };
+        let angle = -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::PI / 5.0;
+        vec2(
+            center.x + angle.cos() * radius * x_scale,
+            center.y + angle.sin() * radius,
+        )
+    })
+}
+
+fn draw_scalable_star(rect: Rect, earned: bool) {
+    let colors = if earned {
+        [
+            Color::from_rgba(255, 255, 70, 255),
+            Color::from_rgba(242, 218, 0, 255),
+        ]
+    } else {
+        [
+            Color::from_rgba(164, 164, 164, 255),
+            Color::from_rgba(126, 126, 126, 255),
+        ]
+    };
+    let outline = if earned {
+        Color::from_rgba(145, 132, 0, 255)
+    } else {
+        Color::from_rgba(94, 94, 94, 255)
+    };
+    draw_star_with_palette(rect, colors, outline);
+}
+
+fn draw_star_with_palette(rect: Rect, colors: [Color; 2], outline: Color) {
+    let points = star_points(rect);
+    let center = rect.center();
+    for index in 0..points.len() {
+        draw_triangle(
+            center,
+            points[index],
+            points[(index + 1) % points.len()],
+            colors[index % 2],
+        );
+    }
+    for index in 0..points.len() {
+        draw_line(
+            points[index].x,
+            points[index].y,
+            points[(index + 1) % points.len()].x,
+            points[(index + 1) % points.len()].y,
+            0.8,
+            outline,
+        );
+    }
+}
+
+fn draw_promotion_award(rect: Rect) {
+    let center = rect.center();
+    let orbit = rect.w.min(rect.h) * 0.40;
+    for index in 0..12 {
+        let angle = -std::f32::consts::FRAC_PI_2 + index as f32 * std::f32::consts::TAU / 12.0;
+        let size = if index % 3 == 0 { 15.0 } else { 11.0 };
+        let small = Rect::new(
+            center.x + angle.cos() * orbit - size * 0.5,
+            center.y + angle.sin() * orbit - size * 0.5,
+            size,
+            size,
+        );
+        if index % 3 == 0 {
+            draw_star_with_palette(
+                small,
+                [WHITE, Color::from_rgba(225, 225, 225, 255)],
+                Color::from_rgba(170, 170, 170, 255),
+            );
+        } else {
+            draw_star_with_palette(
+                small,
+                [
+                    Color::from_rgba(185, 215, 215, 255),
+                    Color::from_rgba(135, 180, 180, 255),
+                ],
+                Color::from_rgba(110, 150, 150, 255),
+            );
+        }
+    }
+    let large_size = rect.w.min(rect.h) * 0.58;
+    draw_scalable_star(
+        Rect::new(
+            center.x - large_size * 0.5,
+            center.y - large_size * 0.5,
+            large_size,
+            large_size,
+        ),
+        true,
+    );
+}
+
+fn draw_play_pause_glyph(rect: Rect, show_play: bool, color: Color) {
+    if show_play {
+        draw_triangle(
+            vec2(rect.x + rect.w * 0.24, rect.y + rect.h * 0.12),
+            vec2(rect.x + rect.w * 0.24, rect.y + rect.h * 0.88),
+            vec2(rect.x + rect.w * 0.82, rect.y + rect.h * 0.5),
+            color,
+        );
+    } else {
+        let bar_width = (rect.w * 0.23).max(2.0);
+        draw_rectangle(
+            rect.x + rect.w * 0.22,
+            rect.y + rect.h * 0.14,
+            bar_width,
+            rect.h * 0.72,
+            color,
+        );
+        draw_rectangle(
+            rect.x + rect.w * 0.58,
+            rect.y + rect.h * 0.14,
+            bar_width,
+            rect.h * 0.72,
+            color,
+        );
+    }
+}
+
+fn draw_speed_choice_glyph(rect: Rect, speed: SimulationSpeed, color: Color) {
+    if speed == SimulationSpeed::Paused {
+        draw_play_pause_glyph(rect, false, color);
+        return;
+    }
+    let triangle_width = rect.w * 0.58;
+    draw_triangle(
+        vec2(rect.x, rect.y + rect.h * 0.12),
+        vec2(rect.x, rect.y + rect.h * 0.88),
+        vec2(rect.x + triangle_width, rect.y + rect.h * 0.5),
+        color,
+    );
+    let marks = match speed {
+        SimulationSpeed::Normal => 0,
+        SimulationSpeed::Fast => 1,
+        SimulationSpeed::Triple => 2,
+        SimulationSpeed::Quintuple => 3,
+        SimulationSpeed::Tenfold => 4,
+        SimulationSpeed::Paused => 0,
+    };
+    for index in 0..marks {
+        let x = rect.x + triangle_width + 1.5 + index as f32 * 1.8;
+        draw_line(
+            x,
+            rect.y + rect.h * 0.28,
+            x,
+            rect.y + rect.h * 0.72,
+            1.0,
+            color,
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SpeakerIconGeometry {
     body: Rect,
@@ -8775,10 +9003,10 @@ fn draw_atlas_icon(texture: &Texture2D, column: u8, row: u8, destination: Rect, 
         DrawTextureParams {
             dest_size: Some(vec2(destination.w - 6.0, destination.h - 6.0)),
             source: Some(Rect::new(
-                f32::from(column) * 32.0,
-                f32::from(row) * 32.0,
-                32.0,
-                32.0,
+                f32::from(column) * 32.0 * UI_TEXTURE_SCALE,
+                f32::from(row) * 32.0 * UI_TEXTURE_SCALE,
+                32.0 * UI_TEXTURE_SCALE,
+                32.0 * UI_TEXTURE_SCALE,
             )),
             ..Default::default()
         },
@@ -8865,10 +9093,6 @@ struct OriginalAssets {
     tool_palette: Texture2D,
     tool_palette_selected: Texture2D,
     tool_palette_disabled: Texture2D,
-    play: Texture2D,
-    play_selected: Texture2D,
-    pause: Texture2D,
-    pause_selected: Texture2D,
     pointer_tools: Texture2D,
     pointer_tools_selected: Texture2D,
     elevator_cursor: Texture2D,
@@ -8886,16 +9110,13 @@ struct OriginalAssets {
     elevator_cars: Texture2D,
     elevator_shaft: Texture2D,
     elevator_numbers: [Texture2D; 6],
-    star_on: Texture2D,
-    star_off: Texture2D,
     _tower_logo: Texture2D,
     finance_dialog: Texture2D,
     fire_large: [Texture2D; 4],
     fire_small: Texture2D,
     fire_helicopter: Texture2D,
     fire_alert: Texture2D,
-    _fire_aftermath: Texture2D,
-    star_award: Texture2D,
+    fire_aftermath: Texture2D,
     _terrorist_portrait: Texture2D,
     fire_dispatch: Texture2D,
     _vip_arrival: Texture2D,
@@ -9025,15 +9246,11 @@ impl OriginalAssets {
                 .try_into()
                 .map_err(|_| "cloud texture count mismatch".to_owned())?,
             city: texture_from_bmp_with_color_transparency(CITY_BMP, [138, 212, 255])?,
-            tool_palette: texture_from_bmp(PALETTE_BMP)?,
-            tool_palette_selected: texture_from_bmp(PALETTE_SELECTED_BMP)?,
-            tool_palette_disabled: texture_from_bmp(PALETTE_DISABLED_BMP)?,
-            play: texture_from_bmp(PLAY_BMP)?,
-            play_selected: texture_from_bmp(PLAY_SELECTED_BMP)?,
-            pause: texture_from_bmp(PAUSE_BMP)?,
-            pause_selected: texture_from_bmp(PAUSE_SELECTED_BMP)?,
-            pointer_tools: texture_from_bmp(POINTER_TOOLS_BMP)?,
-            pointer_tools_selected: texture_from_bmp(POINTER_TOOLS_SELECTED_BMP)?,
+            tool_palette: texture_from_bmp_for_ui(PALETTE_BMP)?,
+            tool_palette_selected: texture_from_bmp_for_ui(PALETTE_SELECTED_BMP)?,
+            tool_palette_disabled: texture_from_bmp_for_ui(PALETTE_DISABLED_BMP)?,
+            pointer_tools: texture_from_bmp_for_ui(POINTER_TOOLS_BMP)?,
+            pointer_tools_selected: texture_from_bmp_for_ui(POINTER_TOOLS_SELECTED_BMP)?,
             elevator_cursor: texture_from_hand_cursor(POINTER_TOOLS_BMP)?,
             magnifier_cursor: texture_from_magnifier_cursor(POINTER_TOOLS_BMP)?,
             scaffolding: texture_from_bmp(SCAFFOLD_BMP)?,
@@ -9071,10 +9288,8 @@ impl OriginalAssets {
                 texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[4])?,
                 texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[5])?,
             ],
-            star_on: texture_from_star_bmp(STAR_ON_BMP, true)?,
-            star_off: texture_from_star_bmp(STAR_OFF_BMP, false)?,
             _tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
-            finance_dialog: texture_from_bmp(FINANCE_DIALOG_BMP)?,
+            finance_dialog: texture_from_bmp_for_ui(FINANCE_DIALOG_BMP)?,
             fire_large: FIRE_LARGE_BMPS
                 .map(texture_from_bmp_with_white_transparency)
                 .into_iter()
@@ -9084,8 +9299,7 @@ impl OriginalAssets {
             fire_small: texture_from_bmp_with_white_transparency(FIRE_SMALL_BMP)?,
             fire_helicopter: texture_from_bmp_with_white_transparency(FIRE_HELICOPTER_BMP)?,
             fire_alert: texture_from_bmp_with_white_transparency(FIRE_ALERT_BMP)?,
-            _fire_aftermath: texture_from_bmp_with_white_transparency(FIRE_AFTERMATH_BMP)?,
-            star_award: texture_from_bmp_with_white_transparency(STAR_AWARD_BMP)?,
+            fire_aftermath: texture_from_bmp(FIRE_AFTERMATH_BMP)?,
             _terrorist_portrait: texture_from_bmp_with_white_transparency(TERRORIST_PORTRAIT_BMP)?,
             fire_dispatch: texture_from_bmp_with_white_transparency(FIRE_DISPATCH_BMP)?,
             _vip_arrival: texture_from_bmp_with_white_transparency(VIP_ARRIVAL_BMP)?,
@@ -10318,6 +10532,14 @@ fn fire_strip_segments(
     segments
 }
 
+fn burned_unit_frame(x: f32, y: f32, width: f32, source_size: Vec2) -> (Rect, Rect) {
+    debug_assert!(width <= source_size.x);
+    (
+        Rect::new(x, y, width, ROOM_HEIGHT),
+        Rect::new(0.0, 0.0, width.min(source_size.x), source_size.y),
+    )
+}
+
 fn facility_sprite_from_vertical_bmps(
     kind: FacilityKind,
     parts: &[AssetRef],
@@ -10451,17 +10673,7 @@ fn apply_elevator_glyph_transparency(rgba: &mut [u8]) {
     }
 }
 
-fn texture_from_star_bmp(asset: AssetRef, earned: bool) -> Result<Texture2D, String> {
-    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
-    let width = u16::try_from(image.width()).map_err(|_| "bitmap is too wide".to_owned())?;
-    let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
-    let mut rgba = image.rgba().to_vec();
-    apply_star_transparency(&mut rgba, earned);
-    let texture = Texture2D::from_rgba8(width, height, &rgba);
-    texture.set_filter(FilterMode::Nearest);
-    Ok(texture)
-}
-
+#[cfg(test)]
 fn apply_star_transparency(rgba: &mut [u8], earned: bool) {
     for pixel in rgba.chunks_exact_mut(4) {
         let is_star = if earned {
@@ -10532,17 +10744,59 @@ fn texture_from_pointer_cursor(
             let pixel = &mut rgba[target..target + 4];
             let maximum = pixel[0].max(pixel[1]).max(pixel[2]);
             let minimum = pixel[0].min(pixel[1]).min(pixel[2]);
-            // The toolbox cell uses several gray bevel shades, not white.
-            // Remove gray background pixels while retaining the black hand
-            // outline and its pink/red interior.
             if maximum - minimum <= 4 && maximum > 32 {
                 pixel[3] = 0;
             }
         }
     }
-    let texture = Texture2D::from_rgba8(CURSOR_WIDTH as u16, CURSOR_HEIGHT as u16, &rgba);
-    texture.set_filter(FilterMode::Nearest);
+    let (width, height, rgba) = scale_ui_rgba(CURSOR_WIDTH, CURSOR_HEIGHT, &rgba);
+    let width = u16::try_from(width).map_err(|_| "cursor is too wide".to_owned())?;
+    let height = u16::try_from(height).map_err(|_| "cursor is too tall".to_owned())?;
+    let texture = Texture2D::from_rgba8(width, height, &rgba);
+    texture.set_filter(FilterMode::Linear);
     Ok(texture)
+}
+
+fn scale2x_rgba(width: usize, height: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
+    debug_assert_eq!(rgba.len(), width * height * 4);
+    let output_width = width * 2;
+    let output_height = height * 2;
+    let mut output = vec![0_u8; output_width * output_height * 4];
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let offset = (y * width + x) * 4;
+        rgba[offset..offset + 4].try_into().expect("RGBA pixel")
+    };
+    for y in 0..height {
+        for x in 0..width {
+            let center = pixel(x, y);
+            let above = pixel(x, y.saturating_sub(1));
+            let below = pixel(x, (y + 1).min(height - 1));
+            let left = pixel(x.saturating_sub(1), y);
+            let right = pixel((x + 1).min(width - 1), y);
+            let scaled = if above != below && left != right {
+                [
+                    if left == above { left } else { center },
+                    if above == right { right } else { center },
+                    if left == below { left } else { center },
+                    if below == right { right } else { center },
+                ]
+            } else {
+                [center; 4]
+            };
+            for (index, color) in scaled.into_iter().enumerate() {
+                let target_x = x * 2 + index % 2;
+                let target_y = y * 2 + index / 2;
+                let target = (target_y * output_width + target_x) * 4;
+                output[target..target + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    (output_width, output_height, output)
+}
+
+fn scale_ui_rgba(width: usize, height: usize, rgba: &[u8]) -> (usize, usize, Vec<u8>) {
+    let (width, height, rgba) = scale2x_rgba(width, height, rgba);
+    scale2x_rgba(width, height, &rgba)
 }
 
 fn texture_from_bmp(asset: AssetRef) -> Result<Texture2D, String> {
@@ -10551,6 +10805,23 @@ fn texture_from_bmp(asset: AssetRef) -> Result<Texture2D, String> {
     let height = u16::try_from(image.height()).map_err(|_| "bitmap is too tall".to_owned())?;
     let texture = Texture2D::from_rgba8(width, height, image.rgba());
     texture.set_filter(FilterMode::Nearest);
+    Ok(texture)
+}
+
+fn texture_from_bmp_for_ui(asset: AssetRef) -> Result<Texture2D, String> {
+    let image = DibImage::decode_bmp(asset.bytes()?).map_err(|error| error.to_string())?;
+    let (width, height, rgba) = scale_ui_rgba(
+        image.width() as usize,
+        image.height() as usize,
+        image.rgba(),
+    );
+    let width = u16::try_from(width).map_err(|_| "UI bitmap is too wide".to_owned())?;
+    let height = u16::try_from(height).map_err(|_| "UI bitmap is too tall".to_owned())?;
+    let texture = Texture2D::from_rgba8(width, height, &rgba);
+    // UI bitmaps pass through the independent 1x/1.25x/1.5x/2x camera. Linear
+    // sampling prevents fractional-scale cells from alternating between thick
+    // and thin source pixels; tower/world textures remain nearest-neighbor.
+    texture.set_filter(FilterMode::Linear);
     Ok(texture)
 }
 
@@ -10945,6 +11216,30 @@ mod tests {
     }
 
     #[test]
+    fn burned_tenants_crop_the_original_wide_ruin_strip_to_their_footprint() {
+        let artwork = DibImage::decode_bmp(FIRE_AFTERMATH_BMP.bytes().unwrap()).unwrap();
+        assert_eq!((artwork.width(), artwork.height()), (248, 24));
+
+        let single_room = burned_unit_frame(120.0, 244.0, 32.0, vec2(248.0, 24.0));
+        assert_eq!(
+            single_room,
+            (
+                Rect::new(120.0, 244.0, 32.0, ROOM_HEIGHT),
+                Rect::new(0.0, 0.0, 32.0, 24.0),
+            )
+        );
+
+        let cinema = burned_unit_frame(40.0, 100.0, 248.0, vec2(248.0, 24.0));
+        assert_eq!(
+            cinema,
+            (
+                Rect::new(40.0, 100.0, 248.0, ROOM_HEIGHT),
+                Rect::new(0.0, 0.0, 248.0, 24.0),
+            )
+        );
+    }
+
+    #[test]
     fn top_level_toolbox_matches_the_original_three_by_three_layout() {
         assert_eq!(PALETTE_COLUMNS, 3);
         assert_eq!(PALETTE_BUTTONS.len(), 9);
@@ -11127,6 +11422,15 @@ mod tests {
         assert_eq!(first.w, 22.0);
         assert_eq!(first.h, 18.0);
         assert!(((first.x - row.x) - (row.x + row.w - last.x - last.w)).abs() < f32::EPSILON);
+        let points = star_points(first);
+        assert!((points[0].x - first.center().x).abs() < f32::EPSILON);
+        assert!((points[0].y - first.y).abs() < f32::EPSILON);
+        assert!(points.iter().all(|point| {
+            point.x >= first.x - f32::EPSILON
+                && point.x <= first.x + first.w + f32::EPSILON
+                && point.y >= first.y - f32::EPSILON
+                && point.y <= first.y + first.h + f32::EPSILON
+        }));
         let sounds = NativeSounds {
             construction: PathBuf::new(),
             lobby_segment: PathBuf::new(),
@@ -11146,6 +11450,52 @@ mod tests {
         assert!(sounds.is_muted());
         assert!(!sounds.toggle_muted());
         assert!(!sounds.is_muted());
+    }
+
+    #[cfg(feature = "bundled-resources")]
+    #[test]
+    fn desktop_icon_is_rendered_independently_at_each_system_size() {
+        let small = render_opentower_icon::<{ 16 * 16 * 4 }>(16);
+        let medium = render_opentower_icon::<{ 32 * 32 * 4 }>(32);
+        let large = render_opentower_icon::<{ 64 * 64 * 4 }>(64);
+        assert_eq!(small.len(), 16 * 16 * 4);
+        assert_eq!(medium.len(), 32 * 32 * 4);
+        assert_eq!(large.len(), 64 * 64 * 4);
+        assert!(
+            large
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3] == [255, 238, 0])
+        );
+        assert!(
+            large
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3] == [238, 34, 24])
+        );
+        assert!(
+            large.chunks_exact(4).any(|pixel| {
+                pixel[0] > 12 && pixel[0] < 248 && pixel[1] > 12 && pixel[1] < 248
+            })
+        );
+    }
+
+    #[test]
+    fn edge_aware_ui_upscale_preserves_pixel_art_corners() {
+        let white = [255, 255, 255, 255];
+        let black = [0, 0, 0, 255];
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let mut input = vec![white; 9];
+        input[1] = black;
+        input[3] = black;
+        input[5] = blue;
+        input[7] = red;
+        let input = input.into_iter().flatten().collect::<Vec<_>>();
+        let (width, height, output) = scale2x_rgba(3, 3, &input);
+        assert_eq!((width, height), (6, 6));
+        let center_top_left = (2 * width + 2) * 4;
+        assert_eq!(&output[center_top_left..center_top_left + 4], &black);
+        let center_top_right = (2 * width + 3) * 4;
+        assert_eq!(&output[center_top_right..center_top_right + 4], &white);
     }
 
     #[test]
