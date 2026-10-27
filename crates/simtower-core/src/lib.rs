@@ -13,13 +13,20 @@ pub use traffic::{
     ABANDON_ELEVATOR_WAIT_SECONDS, ANGRY_WAIT_SECONDS, CONCERNED_WAIT_SECONDS, ELEVATOR_CAPACITY,
     EXPRESS_ELEVATOR_CAPACITY, ElevatorCar, ElevatorDirection, ElevatorMode, ElevatorSchedule,
     ElevatorShaft, MAX_ELEVATOR_CARS, MAX_ELEVATOR_QUEUE_PER_FLOOR, MAX_SIMULATED_PEOPLE, Person,
-    PersonActivity, PersonMood, TrafficSimulation, elevator_capacity, facility_is_open,
-    floor_from_ordinal, floor_ordinal, schedule_index, schedule_period,
+    PersonActivity, PersonMood, PersonRole, TrafficSimulation, elevator_capacity,
+    elevator_landing_is_valid, facility_is_open, facility_is_open_at, floor_from_ordinal,
+    floor_ordinal, is_weekend, schedule_index, schedule_period, vertical_walkway_story_span,
+    vertical_walkway_story_span_at,
 };
 
 pub const MIN_FLOOR: i16 = -9;
 pub const MAX_FLOOR: i16 = 100;
-pub const DEFAULT_TOWER_WIDTH: u16 = 256;
+/// Width of the original SimTower construction site in floor-tool units.
+///
+/// Original save files record a full-width floor as spanning 375 units. At
+/// eight pixels per unit this also produces the original 3,000-pixel-wide
+/// play space.
+pub const DEFAULT_TOWER_WIDTH: u16 = 375;
 pub const DEFAULT_STARTING_CASH: i64 = 2_000_000;
 pub const FLOOR_CONSTRUCTION_COST: i64 = 500;
 pub const MAX_ELEVATOR_SHAFTS: usize = 24;
@@ -264,6 +271,14 @@ pub struct SecretDiscovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TowerStatusProgress {
+    Ineligible,
+    WaitingForWedding { day: u32 },
+    WeddingInProgress { day: u32 },
+    Awarded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IncomeEvent {
     pub facility_id: u64,
     pub kind: FacilityKind,
@@ -335,6 +350,12 @@ pub struct Tower {
     treasure_position: GridPosition,
     treasure_found: bool,
     recent_secret: Option<SecretDiscovery>,
+    #[serde(default)]
+    tower_status_awarded: bool,
+    #[serde(default)]
+    cathedral_wedding_day: Option<u32>,
+    #[serde(default)]
+    vip_approved: bool,
     pub clock: Clock,
 }
 
@@ -360,12 +381,26 @@ impl Tower {
             },
             treasure_found: false,
             recent_secret: None,
+            tower_status_awarded: false,
+            cathedral_wedding_day: None,
+            vip_approved: false,
             clock: Clock::default(),
         }
     }
 
     pub fn width(&self) -> u16 {
         self.width
+    }
+
+    /// Widens an existing construction site without moving anything already
+    /// built. This is used to bring saves made by early OpenTower builds up to
+    /// the original game's 375-unit site width.
+    pub fn expand_site_width(&mut self, width: u16) -> bool {
+        if width <= self.width {
+            return false;
+        }
+        self.width = width;
+        true
     }
 
     pub fn cash(&self) -> i64 {
@@ -558,6 +593,67 @@ impl Tower {
             .sum()
     }
 
+    pub const fn tower_status_awarded(&self) -> bool {
+        self.tower_status_awarded
+    }
+
+    pub const fn cathedral_wedding_day(&self) -> Option<u32> {
+        self.cathedral_wedding_day
+    }
+
+    pub const fn vip_approved(&self) -> bool {
+        self.vip_approved
+    }
+
+    pub fn approve_vip_visit(&mut self) {
+        self.vip_approved = true;
+    }
+
+    pub fn cathedral_wedding_active(&self) -> bool {
+        self.cathedral_wedding_day == Some(self.clock.day)
+            && (10 * 60..14 * 60).contains(&self.clock.minute_of_day)
+    }
+
+    /// Runs the original final-rank sequence. A five-star tower with at least
+    /// 15,000 occupants and a cathedral on floor 100 schedules the ceremony
+    /// for Sunday. TOWER status is permanent once that ceremony finishes.
+    pub fn update_tower_status_for_population(&mut self, population: u32) -> TowerStatusProgress {
+        if self.tower_status_awarded {
+            return TowerStatusProgress::Awarded;
+        }
+        let has_rooftop_cathedral = self.facilities.iter().any(|facility| {
+            facility.kind == FacilityKind::Cathedral && facility.position.floor == MAX_FLOOR
+        });
+        if population < 15_000
+            || !has_rooftop_cathedral
+            || self.star_rating_for_population(population) < 5
+        {
+            self.cathedral_wedding_day = None;
+            return TowerStatusProgress::Ineligible;
+        }
+
+        let scheduled_day = *self.cathedral_wedding_day.get_or_insert_with(|| {
+            let weekday = (self.clock.day.saturating_sub(1) % 7) + 1;
+            let days_until_sunday = 7 - weekday;
+            if days_until_sunday == 0 && self.clock.minute_of_day >= 14 * 60 {
+                self.clock.day.saturating_add(7)
+            } else {
+                self.clock.day.saturating_add(days_until_sunday)
+            }
+        });
+        if self.clock.day > scheduled_day
+            || (self.clock.day == scheduled_day && self.clock.minute_of_day >= 14 * 60)
+        {
+            self.tower_status_awarded = true;
+            return TowerStatusProgress::Awarded;
+        }
+        if self.clock.day == scheduled_day && self.clock.minute_of_day >= 10 * 60 {
+            TowerStatusProgress::WeddingInProgress { day: scheduled_day }
+        } else {
+            TowerStatusProgress::WaitingForWedding { day: scheduled_day }
+        }
+    }
+
     pub fn advance_time(&mut self, real_seconds: f32) -> Vec<IncomeEvent> {
         self.advance_time_with_visitors(real_seconds, &[])
     }
@@ -714,9 +810,28 @@ impl Tower {
         true
     }
 
-    /// Current tower grade using the original cumulative population and
-    /// buildable facility gates. The VIP visit and medical/recycling demand
-    /// events are not simulated yet, so their built prerequisites are used.
+    /// Returns a poorly evaluated tenant to the market. Evaluation-driven
+    /// vacancies reuse the normal leasing delay rather than immediately
+    /// replacing the tenant on the same quarterly boundary.
+    pub fn vacate_tenant(&mut self, facility_id: u64, delay_minutes: u64) -> bool {
+        let Some(facility) = self
+            .facilities
+            .iter_mut()
+            .find(|item| item.id == facility_id)
+        else {
+            return false;
+        };
+        if !facility.kind.has_tenant_occupancy() || !facility.is_occupied() {
+            return false;
+        }
+        facility.occupancy = FacilityOccupancy::VacantUntil(
+            self.clock.absolute_minute().saturating_add(delay_minutes),
+        );
+        true
+    }
+
+    /// Current tower grade using the original cumulative population, facility
+    /// gates, and the persisted result of the VIP evaluation.
     pub fn star_rating(&self) -> u8 {
         self.star_rating_for_population(self.population())
     }
@@ -726,6 +841,9 @@ impl Tower {
     /// population is their actual patron count rather than their maximum
     /// capacity.
     pub fn star_rating_for_population(&self, population: u32) -> u8 {
+        if self.tower_status_awarded {
+            return 6;
+        }
         if population < 300 {
             return 1;
         }
@@ -744,7 +862,7 @@ impl Tower {
             && has(FacilityKind::Medical)
             && has(FacilityKind::Recycling)
             && has(FacilityKind::Parking);
-        if population < 5_000 || !four_star_services {
+        if population < 5_000 || !four_star_services || !self.vip_approved {
             return 3;
         }
         if population < 10_000 || !has(FacilityKind::Metro) {
@@ -845,6 +963,9 @@ impl Tower {
             return Err(PlacementError::InvalidLobbyFloor {
                 floor: position.floor,
             });
+        }
+        if kind == FacilityKind::Cathedral && position.floor != MAX_FLOOR {
+            return Err(PlacementError::CathedralOnlyOnTopFloor);
         }
         self.check_facility_limit(kind, position)?;
         if (position.x..position.x + spec.width).any(|x| {
@@ -1179,7 +1300,11 @@ impl Tower {
         if self.facilities[index].kind == FacilityKind::Lobby {
             return Err(DemolitionError::LobbyIsPermanent);
         }
-        Ok(self.facilities.remove(index))
+        let removed = self.facilities.remove(index);
+        if removed.kind == FacilityKind::Cathedral && !self.tower_status_awarded {
+            self.cathedral_wedding_day = None;
+        }
+        Ok(removed)
     }
 
     /// Removes one structural floor cell after all objects drawn above it
@@ -1412,6 +1537,7 @@ pub enum PlacementError {
     FloorOutOfRange { floor: i16 },
     OutsideTower,
     InvalidLobbyFloor { floor: i16 },
+    CathedralOnlyOnTopFloor,
     InvalidLobbyHeight { stories: u8 },
     SuperLobbyOnlyOnFirstFloor,
     SuperLobbyMustBeFirst,
@@ -1433,6 +1559,9 @@ impl fmt::Display for PlacementError {
             Self::OutsideTower => write!(f, "facility extends outside the tower"),
             Self::InvalidLobbyFloor { floor } => {
                 write!(f, "a lobby cannot be placed on floor {floor}")
+            }
+            Self::CathedralOnlyOnTopFloor => {
+                write!(f, "the cathedral can only be placed on floor 100")
             }
             Self::InvalidLobbyHeight { stories } => {
                 write!(f, "a lobby cannot be {stories} stories tall")
@@ -1600,8 +1729,10 @@ mod tests {
 
     #[test]
     fn tenfold_speed_advances_twenty_game_minutes_per_second() {
-        let mut clock = Clock::default();
-        clock.speed = SimulationSpeed::Tenfold;
+        let mut clock = Clock {
+            speed: SimulationSpeed::Tenfold,
+            ..Clock::default()
+        };
         clock.advance(3.0);
         assert_eq!(clock.minute_of_day, 9 * 60);
     }
@@ -1804,8 +1935,22 @@ mod tests {
     }
 
     #[test]
-    fn default_site_is_wide_enough_for_horizontal_expansion() {
-        assert_eq!(Tower::default().width(), 256);
+    fn default_site_matches_the_original_375_unit_width() {
+        assert_eq!(Tower::default().width(), 375);
+    }
+
+    #[test]
+    fn existing_sites_can_be_widened_without_moving_their_contents() {
+        let mut tower = Tower::new(256, 1_000_000);
+        tower
+            .place_floor(GridPosition { x: 255, floor: 1 })
+            .unwrap();
+
+        assert!(tower.expand_site_width(DEFAULT_TOWER_WIDTH));
+        assert_eq!(tower.width(), 375);
+        assert!(tower.floors().contains(&GridPosition { x: 255, floor: 1 }));
+        assert!(!tower.expand_site_width(256));
+        assert_eq!(tower.width(), 375);
     }
 
     #[test]
@@ -1854,10 +1999,72 @@ mod tests {
         ] {
             add_rating_facility(&mut tower, kind, id);
         }
+        assert_eq!(
+            tower.star_rating(),
+            3,
+            "four stars waits for the VIP review"
+        );
+        tower.approve_vip_visit();
         assert_eq!(tower.star_rating(), 4);
 
         add_rating_facility(&mut tower, FacilityKind::Metro, 91);
         assert_eq!(tower.star_rating(), 5);
+    }
+
+    #[test]
+    fn cathedral_is_restricted_to_floor_100() {
+        let mut tower = Tower::new(32, 10_000_000);
+        build_supported_floor(&mut tower, 1, 0..28);
+        assert_eq!(
+            tower.place(FacilityKind::Cathedral, GridPosition { x: 0, floor: 1 }),
+            Err(PlacementError::CathedralOnlyOnTopFloor)
+        );
+    }
+
+    #[test]
+    fn sunday_cathedral_wedding_awards_permanent_tower_status() {
+        let mut tower = Tower::new(256, 100_000_000);
+        for id in 1..=126 {
+            add_rating_facility(&mut tower, FacilityKind::Cinema, id);
+        }
+        for (id, kind) in [
+            (127, FacilityKind::Security),
+            (128, FacilityKind::HotelSuite),
+            (129, FacilityKind::HotelSuite),
+            (130, FacilityKind::Medical),
+            (131, FacilityKind::Recycling),
+            (132, FacilityKind::Parking),
+            (133, FacilityKind::Metro),
+        ] {
+            add_rating_facility(&mut tower, kind, id);
+        }
+        tower.approve_vip_visit();
+        tower.facilities.push(Facility {
+            id: 134,
+            kind: FacilityKind::Cathedral,
+            position: GridPosition { x: 0, floor: 100 },
+            occupancy: FacilityOccupancy::NotApplicable,
+            price_level: 1,
+            stories: 5,
+        });
+        let population = tower.population();
+        assert!(population >= 15_000);
+        assert_eq!(
+            tower.update_tower_status_for_population(population),
+            TowerStatusProgress::WaitingForWedding { day: 7 }
+        );
+        tower.clock.day = 7;
+        tower.clock.minute_of_day = 10 * 60;
+        assert_eq!(
+            tower.update_tower_status_for_population(population),
+            TowerStatusProgress::WeddingInProgress { day: 7 }
+        );
+        tower.clock.minute_of_day = 14 * 60;
+        assert_eq!(
+            tower.update_tower_status_for_population(population),
+            TowerStatusProgress::Awarded
+        );
+        assert_eq!(tower.star_rating_for_population(population), 6);
     }
 
     #[test]

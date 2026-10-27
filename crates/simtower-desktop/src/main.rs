@@ -7,17 +7,19 @@ use macroquad::prelude::*;
 use serde::{Deserialize, Serialize};
 use simtower_core::{
     Clock, ElevatorDirection, ElevatorMode, FLOOR_CONSTRUCTION_COST, Facility, FacilityKind,
-    GridPosition, IncomeEvent, MAX_ELEVATOR_QUEUE_PER_FLOOR, MIN_FLOOR, PersonActivity, PersonMood,
-    PlacementError, SimulationSpeed, Tower, TrafficSimulation, elevator_car_cost, facility_is_open,
+    GridPosition, IncomeEvent, MAX_ELEVATOR_QUEUE_PER_FLOOR, MAX_FLOOR, MIN_FLOOR, Person,
+    PersonActivity, PersonMood, PersonRole, PlacementError, SimulationSpeed, Tower,
+    TowerStatusProgress, TrafficSimulation, elevator_car_cost, elevator_landing_is_valid,
+    facility_is_open_at, is_weekend, vertical_walkway_story_span, vertical_walkway_story_span_at,
 };
 use simtower_formats::DibImage;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicU8, Ordering},
+    process::{Child, Command},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 mod resources;
@@ -51,7 +53,13 @@ const SAVE_FORMAT_VERSION: u32 = 1;
 const SAVE_EXTENSION: &str = "smtower";
 const DEFAULT_SAVE_NAME: &str = "Tower";
 const UX_SCALE_SETTINGS_FILE: &str = "OpenTower.ux-scale";
+const INTRO_MAXIS_SECONDS: f32 = 1.5;
+const INTRO_TITLE_SECONDS: f32 = 1.5;
+const INTRO_TOTAL_SECONDS: f32 = INTRO_MAXIS_SECONDS + INTRO_TITLE_SECONDS;
+const TITLE_SCREEN_WIDTH: f32 = 640.0;
+const TITLE_SCREEN_HEIGHT: f32 = 480.0;
 static ACTIVE_UX_SCALE: AtomicU8 = AtomicU8::new(UxScale::One as u8);
+static UI_CAMERA_ACTIVE: AtomicBool = AtomicBool::new(false);
 const SPEED_CHOICES: [SimulationSpeed; 6] = [
     SimulationSpeed::Normal,
     SimulationSpeed::Fast,
@@ -67,6 +75,13 @@ const HORIZONTAL_WHEEL_COLUMNS_PER_STEP: f32 = 2.5;
 const LOBBY_HEIGHT_HELP: &str =
     "first lobby: Ctrl/Option = 2 stories; Ctrl/Option+Shift = 3; build upper floors first";
 const EMERGENCY_STAIR_HALF_WIDTH: f32 = 24.0;
+const BOMB_RANSOM_COST: i64 = 300_000;
+const BOMB_SEARCH_SECONDS_PER_FLOOR: f32 = 2.5;
+const BOMB_FUSE_SECONDS: f32 = 60.0;
+// Each original Security Office supplies six search units. Deploy them one per
+// floor so offices at different heights cover their neighboring floors in
+// parallel instead of stacking several guards into the same search strip.
+const BOMB_GUARDS_PER_SECURITY_OFFICE: usize = 6;
 const PALETTE_X: f32 = 12.0;
 const PALETTE_Y: f32 = 78.0;
 const PALETTE_TITLE_HEIGHT: f32 = 20.0;
@@ -76,6 +91,10 @@ const PALETTE_COLUMNS: usize = 3;
 const SUBMENU_WIDTH: f32 = 164.0;
 const SUBMENU_HEADER_HEIGHT: f32 = 19.0;
 const SUBMENU_ROW_HEIGHT: f32 = 28.0;
+const SUBMENU_ICON_SIZE: f32 = 26.0;
+const SUBMENU_ICON_PADDING: f32 = 1.0;
+const OVERVIEW_PANEL_WIDTH: f32 = 238.0;
+const OVERVIEW_PANEL_HEIGHT: f32 = 390.0;
 
 const HOTEL_SINGLE_VARIANT_IDS: [u16; 2] = [1192, 1194];
 const HOTEL_TWIN_VARIANT_IDS: [u16; 4] = [1256, 1258, 1260, 1262];
@@ -323,6 +342,39 @@ enum FireResponse {
     Helicopter,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct VipVisitState {
+    suite_id: u64,
+    person_id: u64,
+    started_minute: u64,
+    worst_mood: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VipDialogKind {
+    Arrival,
+    Approved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct BombEventState {
+    facility_id: u64,
+    bomb_floor: i16,
+    security_floor: i16,
+    elapsed: f32,
+    #[serde(default)]
+    decision_elapsed: f32,
+    response: BombResponse,
+    resume_speed: SimulationSpeed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum BombResponse {
+    AwaitingDecision,
+    Searching,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct FinanceLedger {
     tenant_income: i64,
@@ -368,8 +420,10 @@ struct SaveGame {
     last_running_speed: SimulationSpeed,
     next_fire_minute: u64,
     finance_ledger: FinanceLedger,
-    #[serde(default = "default_true")]
-    automatic_finance_reports: bool,
+    #[serde(default)]
+    options: SaveOptions,
+    #[serde(default, rename = "automatic_finance_reports", skip_serializing)]
+    legacy_automatic_finance_reports: Option<bool>,
     #[serde(default)]
     tenant_variants: HashMap<u64, usize>,
     #[serde(default)]
@@ -377,9 +431,27 @@ struct SaveGame {
     #[serde(default)]
     tenant_names: HashMap<u64, String>,
     #[serde(default)]
+    person_names: HashMap<u64, String>,
+    #[serde(default)]
     tenant_finances: HashMap<u64, TenantFinanceState>,
     #[serde(default)]
     hotel_guest_stays: HashSet<u64>,
+    #[serde(default)]
+    vip_visit: Option<VipVisitState>,
+    #[serde(default)]
+    last_vip_attempt_day: u32,
+    #[serde(default)]
+    bomb_event: Option<BombEventState>,
+}
+
+impl SaveGame {
+    fn resolved_options(&self) -> SaveOptions {
+        let mut options = self.options;
+        if let Some(automatic_finance_reports) = self.legacy_automatic_finance_reports {
+            options.automatic_finance_reports = automatic_finance_reports;
+        }
+        options
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -394,6 +466,31 @@ struct TenantPanelState {
     renaming: bool,
     rename_draft: String,
     original_name: String,
+}
+
+struct PersonPanelState {
+    person_id: u64,
+    renaming: bool,
+    rename_draft: String,
+    original_name: String,
+}
+
+struct ParkingState {
+    connected: HashSet<u64>,
+    occupied: HashSet<u64>,
+    last_absolute_minute: u64,
+    layout_dirty: bool,
+}
+
+impl Default for ParkingState {
+    fn default() -> Self {
+        Self {
+            connected: HashSet::new(),
+            occupied: HashSet::new(),
+            last_absolute_minute: u64::MAX,
+            layout_dirty: true,
+        }
+    }
 }
 
 struct SaveNameDialog {
@@ -496,7 +593,7 @@ impl SaveNameDialog {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 enum UxScale {
     One = 4,
@@ -555,6 +652,24 @@ impl UxScale {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct SaveOptions {
+    muted: bool,
+    ux_scale: UxScale,
+    automatic_finance_reports: bool,
+}
+
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self {
+            muted: false,
+            ux_scale: UxScale::One,
+            automatic_finance_reports: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GameMenuAction {
     New,
@@ -565,6 +680,19 @@ enum GameMenuAction {
     Quit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WelcomeAction {
+    NewTower,
+    LoadSavedTower,
+    ExitProgram,
+}
+
+const WELCOME_ACTIONS: [(WelcomeAction, &str); 3] = [
+    (WelcomeAction::NewTower, "New Tower"),
+    (WelcomeAction::LoadSavedTower, "Load Saved Tower"),
+    (WelcomeAction::ExitProgram, "Quit"),
+];
+
 const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 6] = [
     (GameMenuAction::New, "New"),
     (GameMenuAction::Save, "Save"),
@@ -573,10 +701,6 @@ const GAME_MENU_ACTIONS: [(GameMenuAction, &str); 6] = [
     (GameMenuAction::UxScale, "UX scale"),
     (GameMenuAction::Quit, "Quit"),
 ];
-
-const fn default_true() -> bool {
-    true
-}
 
 impl FinanceLedger {
     fn new(starting_balance: i64) -> Self {
@@ -765,7 +889,7 @@ fn opentower_icon_sample(x: f32, y: f32) -> [u8; 4] {
 
     // Black frame and ground preserve the original SimTower icon's visual
     // weight even at the 16-pixel system-icon size.
-    if x < 0.035 || x > 0.965 || y < 0.035 || y > 0.965 || y > 0.88 {
+    if !(0.035..=0.965).contains(&x) || !(0.035..=0.88).contains(&y) {
         return black;
     }
 
@@ -1082,6 +1206,12 @@ enum FacilityCrowd {
     Heavy,
 }
 
+struct TenantEvaluationContext {
+    mood_penalties: HashMap<u64, i32>,
+    noisy_sources: Vec<(i32, i16)>,
+    recycling_capacity: usize,
+}
+
 struct ConstructionAnimation {
     facility_id: u64,
     remaining: f32,
@@ -1220,9 +1350,14 @@ fn escalator_rider_count(tower: &Tower, traffic: &TrafficSimulation) -> usize {
         .count()
 }
 
-fn escalator_frame_for_position(base_floor: i16, origin_floor: i16, floor_position: f32) -> usize {
+fn escalator_frame_for_position(
+    base_floor: i16,
+    origin_floor: i16,
+    floor_position: f32,
+    flights: u16,
+) -> usize {
     let base = f32::from(simtower_core::floor_ordinal(base_floor));
-    let progress_upward = (floor_position - base).clamp(0.0, 1.0);
+    let progress_upward = ((floor_position - base) / f32::from(flights.max(1))).clamp(0.0, 1.0);
     let descending =
         simtower_core::floor_ordinal(origin_floor) > simtower_core::floor_ordinal(base_floor);
     let travel_progress = if descending {
@@ -1339,14 +1474,18 @@ struct App {
     elevator_drag: Option<ElevatorDrag>,
     elevator_panel: Option<ElevatorPanelState>,
     simulation_sounds: SimulationSoundState,
+    parking_state: ParkingState,
     visual_people_x: HashMap<u64, f32>,
     tenant_variants: HashMap<u64, usize>,
     tenant_variant_bags: HashMap<FacilityKind, TenantVariantBag>,
     tenant_names: HashMap<u64, String>,
+    person_names: HashMap<u64, String>,
     tenant_finances: HashMap<u64, TenantFinanceState>,
     hotel_guest_stays: HashSet<u64>,
     tenant_panel: Option<TenantPanelState>,
     tenant_panel_resume_speed: Option<SimulationSpeed>,
+    person_panel: Option<PersonPanelState>,
+    person_panel_resume_speed: Option<SimulationSpeed>,
     people_animation_seconds: f64,
     view_mode: ViewMode,
     speed_menu_open: bool,
@@ -1355,6 +1494,11 @@ struct App {
     treasure_popup: Option<TreasurePopup>,
     fire_event: Option<FireEventState>,
     next_fire_minute: u64,
+    vip_visit: Option<VipVisitState>,
+    last_vip_attempt_day: u32,
+    vip_dialog: Option<VipDialogKind>,
+    vip_dialog_resume_speed: Option<SimulationSpeed>,
+    bomb_event: Option<BombEventState>,
     last_star_rating: u8,
     promotion_dialog_open: bool,
     promotion_resume_speed: Option<SimulationSpeed>,
@@ -1365,6 +1509,8 @@ struct App {
     automatic_finance_reports: bool,
     ux_scale: UxScale,
     intro_remaining: f32,
+    welcome_dialog_open: bool,
+    welcome_selection: usize,
     game_menu_open: bool,
     ux_scale_menu_open: bool,
     mode_menu_open: bool,
@@ -1379,6 +1525,7 @@ impl App {
         let cached_star_rating = tower.star_rating_for_population(0);
         let ux_scale = load_ux_scale_preference();
         set_active_ux_scale(ux_scale);
+        assets.sounds.play_opening_theme();
         Self {
             tower,
             traffic: TrafficSimulation::new(),
@@ -1397,14 +1544,18 @@ impl App {
             elevator_drag: None,
             elevator_panel: None,
             simulation_sounds: SimulationSoundState::default(),
+            parking_state: ParkingState::default(),
             visual_people_x: HashMap::new(),
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
             tenant_names: HashMap::new(),
+            person_names: HashMap::new(),
             tenant_finances: HashMap::new(),
             hotel_guest_stays: HashSet::new(),
             tenant_panel: None,
             tenant_panel_resume_speed: None,
+            person_panel: None,
+            person_panel_resume_speed: None,
             people_animation_seconds: 0.0,
             view_mode: ViewMode::Edit,
             speed_menu_open: false,
@@ -1414,6 +1565,11 @@ impl App {
             treasure_popup: None,
             fire_event: None,
             next_fire_minute: 11 * 60,
+            vip_visit: None,
+            last_vip_attempt_day: 0,
+            vip_dialog: None,
+            vip_dialog_resume_speed: None,
+            bomb_event: None,
             last_star_rating: 1,
             promotion_dialog_open: false,
             promotion_resume_speed: None,
@@ -1423,7 +1579,9 @@ impl App {
             finance_resume_speed: None,
             automatic_finance_reports: true,
             ux_scale,
-            intro_remaining: 2.4,
+            intro_remaining: INTRO_TOTAL_SECONDS,
+            welcome_dialog_open: false,
+            welcome_selection: 0,
             game_menu_open: false,
             ux_scale_menu_open: false,
             mode_menu_open: false,
@@ -1449,14 +1607,18 @@ impl App {
         self.elevator_drag = None;
         self.elevator_panel = None;
         self.simulation_sounds = SimulationSoundState::default();
+        self.parking_state = ParkingState::default();
         self.visual_people_x.clear();
         self.tenant_variants.clear();
         self.tenant_variant_bags.clear();
         self.tenant_names.clear();
+        self.person_names.clear();
         self.tenant_finances.clear();
         self.hotel_guest_stays.clear();
         self.tenant_panel = None;
         self.tenant_panel_resume_speed = None;
+        self.person_panel = None;
+        self.person_panel_resume_speed = None;
         self.people_animation_seconds = 0.0;
         self.view_mode = ViewMode::Edit;
         self.speed_menu_open = false;
@@ -1466,6 +1628,11 @@ impl App {
         self.treasure_popup = None;
         self.fire_event = None;
         self.next_fire_minute = 11 * 60;
+        self.vip_visit = None;
+        self.last_vip_attempt_day = 0;
+        self.vip_dialog = None;
+        self.vip_dialog_resume_speed = None;
+        self.bomb_event = None;
         self.last_star_rating = 1;
         self.promotion_dialog_open = false;
         self.promotion_resume_speed = None;
@@ -1474,6 +1641,9 @@ impl App {
         self.finance_panel_open = false;
         self.finance_resume_speed = None;
         self.intro_remaining = 0.0;
+        self.welcome_dialog_open = false;
+        self.welcome_selection = 0;
+        self.assets.sounds.stop_opening_theme();
         self.game_menu_open = false;
         self.ux_scale_menu_open = false;
         self.mode_menu_open = false;
@@ -1482,6 +1652,7 @@ impl App {
     }
 
     fn begin_save_name_dialog(&mut self) {
+        discard_queued_text_input();
         self.save_name_dialog = Some(SaveNameDialog::with_default_name(&self.current_save_name));
         self.status = "Enter a save-game name".to_owned();
     }
@@ -1603,13 +1774,143 @@ impl App {
                 }
                 self.close_tenant_panel();
             } else if tenant_info_rename_rect().contains(point) {
-                if self
+                let facility_id = self
+                    .tenant_panel
+                    .as_ref()
+                    .map(|panel| panel.facility_id)
+                    .unwrap_or_default();
+                let is_cinema = self.tower.facilities().iter().any(|facility| {
+                    facility.id == facility_id && facility.kind == FacilityKind::Cinema
+                });
+                if is_cinema {
+                    if self.traffic.change_cinema_program(facility_id) {
+                        self.status = "The cinema is now showing a new movie".to_owned();
+                    }
+                } else if self
                     .tenant_panel
                     .as_ref()
                     .is_some_and(|panel| panel.renaming)
                 {
                     self.commit_tenant_rename();
                 } else if let Some(panel) = &mut self.tenant_panel {
+                    panel.renaming = true;
+                }
+            }
+        }
+    }
+
+    fn open_person_panel(&mut self, person_id: u64) {
+        let Some(person) = self
+            .traffic
+            .people()
+            .iter()
+            .find(|person| person.id == person_id)
+        else {
+            return;
+        };
+        let name = self
+            .person_names
+            .get(&person_id)
+            .cloned()
+            .unwrap_or_else(|| person_role(person, &self.tower).to_owned());
+        if self.tower.clock.speed != SimulationSpeed::Paused {
+            self.person_panel_resume_speed = Some(self.tower.clock.speed);
+            self.tower.clock.speed = SimulationSpeed::Paused;
+        } else {
+            self.person_panel_resume_speed = None;
+        }
+        self.open_menu = None;
+        self.speed_menu_open = false;
+        self.game_menu_open = false;
+        self.ux_scale_menu_open = false;
+        self.mode_menu_open = false;
+        self.person_panel = Some(PersonPanelState {
+            person_id,
+            renaming: false,
+            rename_draft: name.clone(),
+            original_name: name,
+        });
+        self.status = format!("Inspecting person #{person_id}");
+    }
+
+    fn close_person_panel(&mut self) {
+        self.person_panel = None;
+        if let Some(speed) = self.person_panel_resume_speed.take() {
+            self.tower.clock.speed = speed;
+        }
+        self.status = "Selection cursor".to_owned();
+    }
+
+    fn commit_person_rename(&mut self) {
+        let Some(panel) = &mut self.person_panel else {
+            return;
+        };
+        let name = panel.rename_draft.trim().to_owned();
+        if !name.is_empty() {
+            self.person_names.insert(panel.person_id, name.clone());
+            panel.rename_draft.clone_from(&name);
+            panel.original_name = name;
+        }
+        panel.renaming = false;
+    }
+
+    fn update_person_panel(&mut self) {
+        let Some(panel) = &mut self.person_panel else {
+            return;
+        };
+        if !self
+            .traffic
+            .people()
+            .iter()
+            .any(|person| person.id == panel.person_id)
+        {
+            self.close_person_panel();
+            return;
+        }
+
+        if panel.renaming {
+            if is_key_pressed(KeyCode::Escape) {
+                panel.renaming = false;
+                panel.rename_draft.clone_from(&panel.original_name);
+                return;
+            }
+            if is_key_pressed(KeyCode::Backspace) {
+                panel.rename_draft.pop();
+            }
+            while let Some(character) = get_char_pressed() {
+                if !character.is_control() && panel.rename_draft.chars().count() < 20 {
+                    panel.rename_draft.push(character);
+                }
+            }
+            if is_key_pressed(KeyCode::Enter) {
+                self.commit_person_rename();
+                return;
+            }
+        } else if is_key_pressed(KeyCode::Escape) || is_key_pressed(KeyCode::Enter) {
+            self.close_person_panel();
+            return;
+        }
+
+        if is_mouse_button_pressed(MouseButton::Left) {
+            let point = ui_mouse_position();
+            if person_info_ok_rect().contains(point) {
+                if self
+                    .person_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.renaming)
+                {
+                    self.commit_person_rename();
+                }
+                self.close_person_panel();
+            } else if person_info_rename_rect().contains(point) {
+                if self
+                    .person_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.renaming)
+                {
+                    self.commit_person_rename();
+                } else if let Some(panel) = &mut self.person_panel {
+                    discard_queued_text_input();
                     panel.renaming = true;
                 }
             }
@@ -1742,12 +2043,21 @@ impl App {
             last_running_speed: self.last_running_speed,
             next_fire_minute: self.next_fire_minute,
             finance_ledger: self.finance_ledger.clone(),
-            automatic_finance_reports: self.automatic_finance_reports,
+            options: SaveOptions {
+                muted: self.assets.sounds.is_muted(),
+                ux_scale: self.ux_scale,
+                automatic_finance_reports: self.automatic_finance_reports,
+            },
+            legacy_automatic_finance_reports: None,
             tenant_variants: self.tenant_variants.clone(),
             tenant_variant_bags: self.tenant_variant_bags.clone(),
             tenant_names: self.tenant_names.clone(),
+            person_names: self.person_names.clone(),
             tenant_finances: self.tenant_finances.clone(),
             hotel_guest_stays: self.hotel_guest_stays.clone(),
+            vip_visit: self.vip_visit,
+            last_vip_attempt_day: self.last_vip_attempt_day,
+            bomb_event: self.bomb_event,
         };
         let bytes = serde_json::to_vec_pretty(&save)
             .map_err(|error| format!("Could not encode the save game: {error}"))?;
@@ -1788,6 +2098,12 @@ impl App {
         if !save.camera_x.is_finite() || !save.camera_floor.is_finite() {
             return Err("save contains an invalid camera position".to_owned());
         }
+        // Saves written before OpenTower matched the original game's site
+        // dimensions used a 256-unit construction area. Widen them in place;
+        // existing floors, tenants, traffic, and the camera remain untouched.
+        save.tower
+            .expand_site_width(simtower_core::DEFAULT_TOWER_WIDTH);
+        let options = save.resolved_options();
         save.traffic.sync_with_tower(&save.tower);
         self.tower = save.tower;
         self.traffic = save.traffic;
@@ -1802,7 +2118,10 @@ impl App {
         };
         self.next_fire_minute = save.next_fire_minute;
         self.finance_ledger = save.finance_ledger;
-        self.automatic_finance_reports = save.automatic_finance_reports;
+        self.automatic_finance_reports = options.automatic_finance_reports;
+        self.ux_scale = options.ux_scale;
+        set_active_ux_scale(options.ux_scale);
+        self.assets.sounds.set_muted(options.muted);
         self.finance_ledger.ensure_initialized(self.tower.cash());
         self.tool = ToolMode::Inspect;
         self.view_mode = ViewMode::Edit;
@@ -1821,11 +2140,20 @@ impl App {
         self.tenant_variants = save.tenant_variants;
         self.tenant_variant_bags = save.tenant_variant_bags;
         self.tenant_names = save.tenant_names;
+        self.person_names = save.person_names;
         self.tenant_finances = save.tenant_finances;
         self.hotel_guest_stays = save.hotel_guest_stays;
+        self.vip_visit = save.vip_visit;
+        self.last_vip_attempt_day = save.last_vip_attempt_day;
+        self.vip_dialog = None;
+        self.vip_dialog_resume_speed = None;
+        self.bomb_event = save.bomb_event;
         self.tenant_panel = None;
         self.tenant_panel_resume_speed = None;
+        self.person_panel = None;
+        self.person_panel_resume_speed = None;
         self.simulation_sounds = SimulationSoundState::default();
+        self.parking_state = ParkingState::default();
         self.treasure_popup = None;
         self.fire_event = None;
         self.promotion_dialog_open = false;
@@ -1834,13 +2162,75 @@ impl App {
         self.last_star_rating = self.star_rating();
         self.promotion_rating = self.last_star_rating;
         self.intro_remaining = 0.0;
+        self.welcome_dialog_open = false;
+        self.welcome_selection = 0;
+        self.assets.sounds.stop_opening_theme();
         self.current_save_name = save_default_name_for_path(path);
         self.sync_tenant_variants();
         Ok(())
     }
 
+    fn open_welcome_dialog(&mut self) {
+        if self.welcome_dialog_open {
+            return;
+        }
+        self.welcome_dialog_open = true;
+        self.welcome_selection = 0;
+    }
+
+    fn update_welcome_dialog(&mut self) {
+        let point = physical_to_ui(vec2(mouse_position().0, mouse_position().1), self.ux_scale);
+        let viewport = vec2(ui_screen_width(), ui_screen_height());
+        let tab_pressed = is_key_pressed(KeyCode::Tab);
+        if is_key_pressed(KeyCode::Down) || (tab_pressed && !shift_modifier_down()) {
+            self.welcome_selection = (self.welcome_selection + 1) % WELCOME_ACTIONS.len();
+        }
+        if is_key_pressed(KeyCode::Up) || (tab_pressed && shift_modifier_down()) {
+            self.welcome_selection =
+                (self.welcome_selection + WELCOME_ACTIONS.len() - 1) % WELCOME_ACTIONS.len();
+        }
+        let clicked_action = is_mouse_button_pressed(MouseButton::Left)
+            .then(|| welcome_action_at(viewport, point))
+            .flatten();
+        let keyboard_action = if is_key_pressed(KeyCode::Enter) {
+            Some(WELCOME_ACTIONS[self.welcome_selection].0)
+        } else if is_key_pressed(KeyCode::N) {
+            Some(WelcomeAction::NewTower)
+        } else if is_key_pressed(KeyCode::L) {
+            Some(WelcomeAction::LoadSavedTower)
+        } else if is_key_pressed(KeyCode::Q) {
+            Some(WelcomeAction::ExitProgram)
+        } else {
+            None
+        };
+        match clicked_action.or(keyboard_action) {
+            Some(WelcomeAction::NewTower) => self.start_new_tower(),
+            Some(WelcomeAction::LoadSavedTower) => self.load_from_picker(),
+            Some(WelcomeAction::ExitProgram) => {
+                self.assets.sounds.stop_opening_theme();
+                std::process::exit(0);
+            }
+            None => {}
+        }
+    }
+
     fn update(&mut self) {
         let dt = get_frame_time();
+        let save_name_entry_active = self
+            .save_name_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.overwrite_path.is_none());
+        let tenant_name_entry_active = self
+            .tenant_panel
+            .as_ref()
+            .is_some_and(|panel| panel.renaming);
+        let person_name_entry_active = self
+            .person_panel
+            .as_ref()
+            .is_some_and(|panel| panel.renaming);
+        if !save_name_entry_active && !tenant_name_entry_active && !person_name_entry_active {
+            discard_queued_text_input();
+        }
         if self.intro_remaining > 0.0 {
             self.intro_remaining = (self.intro_remaining - dt).max(0.0);
             if is_key_pressed(KeyCode::Escape)
@@ -1849,6 +2239,13 @@ impl App {
             {
                 self.intro_remaining = 0.0;
             }
+            if self.intro_remaining <= 0.0 {
+                self.open_welcome_dialog();
+            }
+            return;
+        }
+        if self.welcome_dialog_open {
+            self.update_welcome_dialog();
             return;
         }
         if self.save_name_dialog.is_some() {
@@ -1857,6 +2254,10 @@ impl App {
         }
         if self.tenant_panel.is_some() {
             self.update_tenant_panel();
+            return;
+        }
+        if self.person_panel.is_some() {
+            self.update_person_panel();
             return;
         }
         if self.finance_panel_open {
@@ -1879,6 +2280,26 @@ impl App {
                     self.tower.clock.speed = speed;
                 }
             }
+            return;
+        }
+        if self.vip_dialog.is_some() {
+            let dismiss = is_key_pressed(KeyCode::Escape)
+                || is_key_pressed(KeyCode::Enter)
+                || (is_mouse_button_pressed(MouseButton::Left)
+                    && vip_dialog_ok_rect().contains(ui_mouse_position()));
+            if dismiss {
+                self.vip_dialog = None;
+                if let Some(speed) = self.vip_dialog_resume_speed.take() {
+                    self.tower.clock.speed = speed;
+                }
+            }
+            return;
+        }
+        if self
+            .bomb_event
+            .is_some_and(|event| event.response == BombResponse::AwaitingDecision)
+        {
+            self.update_bomb_response_dialog(dt);
             return;
         }
         if self
@@ -1912,7 +2333,6 @@ impl App {
             0.0
         };
         let simulation_dt = dt * traffic_scale;
-        self.traffic.sync_with_tower(&self.tower);
         self.capture_hotel_guest_stays();
         let reachable_lookup = self.traffic.reachable_facility_set().clone();
         let reachable_facilities = reachable_lookup.iter().copied().collect::<Vec<_>>();
@@ -1953,9 +2373,26 @@ impl App {
             self.tower.clock.absolute_minute(),
         );
         self.traffic.advance_after_sync(&self.tower, simulation_dt);
+        self.complete_housekeeping_visits();
         self.capture_hotel_guest_stays();
         self.refresh_tower_metrics();
+        self.update_parking_state();
+        let tower_status = self
+            .tower
+            .update_tower_status_for_population(self.cached_population);
+        if self.tower.tower_status_awarded() {
+            self.cached_star_rating = 6;
+        } else if let TowerStatusProgress::WeddingInProgress { .. } = tower_status {
+            self.status = "The Cathedral wedding is in progress".to_owned();
+        }
+        self.update_vip_visit();
+        if self.tower.vip_approved() && self.cached_population >= 5_000 {
+            self.cached_star_rating = self
+                .tower
+                .star_rating_for_population(self.cached_population);
+        }
         if let Some((year, quarter)) = closed_quarter {
+            let vacancies = self.apply_quarterly_evaluation();
             self.finance_ledger.close_quarter(
                 year,
                 quarter,
@@ -1970,7 +2407,14 @@ impl App {
                 }
                 self.finance_panel_open = true;
             }
+            if vacancies > 0 {
+                self.status = format!(
+                    "{vacancies} poorly evaluated tenant{} moved out",
+                    if vacancies == 1 { "" } else { "s" }
+                );
+            }
         }
+        self.update_bomb_event(simulation_dt);
         self.update_fire_event(simulation_dt);
         let current_rating = self.star_rating();
         if current_rating > self.last_star_rating {
@@ -1979,7 +2423,11 @@ impl App {
             self.promotion_resume_speed = (self.tower.clock.speed != SimulationSpeed::Paused)
                 .then_some(self.tower.clock.speed);
             self.tower.clock.speed = SimulationSpeed::Paused;
-            self.status = format!("Tower promoted to {current_rating} stars");
+            self.status = if current_rating >= 6 {
+                "Your building has earned TOWER status".to_owned()
+            } else {
+                format!("Tower promoted to {current_rating} stars")
+            };
         }
         self.last_star_rating = current_rating;
         // Visual interpolation uses wall-clock frame time, not accelerated
@@ -2265,12 +2713,25 @@ impl App {
             .filter(|facility| facility.kind == FacilityKind::Housekeeping)
             .map(|facility| facility.id)
             .collect::<Vec<_>>();
+        let mut assigned_rooms = self
+            .traffic
+            .people()
+            .iter()
+            .filter(|person| housekeeping_ids.contains(&person.home_facility_id))
+            .map(|person| person.destination_facility_id)
+            .collect::<HashSet<_>>();
         for housekeeping_id in housekeeping_ids {
             // The original assigns at most one worker from a housekeeping
             // office to any one floor. Six workers can therefore cover six
             // floors in parallel, but cannot pile onto a single long floor.
             let mut serviced_floors = HashSet::new();
-            for _ in 0..6 {
+            let active_workers = self
+                .traffic
+                .people()
+                .iter()
+                .filter(|person| person.home_facility_id == housekeeping_id)
+                .count();
+            for _ in active_workers..6 {
                 let Some((housekeeping_floor, housekeeping_x)) = self
                     .tower
                     .facilities()
@@ -2285,6 +2746,7 @@ impl App {
                     .facilities()
                     .iter()
                     .filter(|facility| facility.is_hotel_dirty())
+                    .filter(|facility| !assigned_rooms.contains(&facility.id))
                     .filter(|facility| !serviced_floors.contains(&facility.position.floor))
                     .filter(|facility| {
                         self.traffic.housekeeping_route_available(
@@ -2309,13 +2771,46 @@ impl App {
                 let Some((facility_id, floor, _, _)) = candidates.first().copied() else {
                     break;
                 };
-                self.tower.clean_hotel_room(facility_id);
+                if self
+                    .traffic
+                    .dispatch_housekeeper(&self.tower, housekeeping_id, facility_id, 8.0)
+                    .is_none()
+                {
+                    break;
+                }
+                assigned_rooms.insert(facility_id);
                 serviced_floors.insert(floor);
             }
         }
     }
 
+    fn complete_housekeeping_visits(&mut self) {
+        let housekeeping_ids = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Housekeeping)
+            .map(|facility| facility.id)
+            .collect::<HashSet<_>>();
+        let cleaned_rooms = self
+            .traffic
+            .people()
+            .iter()
+            .filter(|person| {
+                housekeeping_ids.contains(&person.home_facility_id)
+                    && person.activity == PersonActivity::Visiting
+            })
+            .map(|person| person.destination_facility_id)
+            .collect::<Vec<_>>();
+        for room_id in cleaned_rooms {
+            self.tower.clean_hotel_room(room_id);
+        }
+    }
+
     fn update_fire_event(&mut self, dt: f32) {
+        if self.bomb_event.is_some() {
+            return;
+        }
         if let Some(event) = &mut self.fire_event {
             if event.response == FireResponse::AwaitingDecision {
                 return;
@@ -2393,6 +2888,10 @@ impl App {
         }
         let index = (u64::from(self.tower.clock.day).wrapping_mul(17) as usize) % candidates.len();
         let facility_id = candidates[index];
+        if self.tower.clock.day.is_multiple_of(2) {
+            self.start_bomb_event(facility_id);
+            return;
+        }
         self.traffic.evacuate_facility(facility_id);
         self.center_camera_on_facility(facility_id);
         let resume_speed = apply_emergency_speed(&mut self.tower.clock);
@@ -2411,6 +2910,141 @@ impl App {
             "Fire reported in tenant #{facility_id}; choose emergency response — speed set to 1x"
         );
         self.assets.sounds.play_fire_alert();
+    }
+
+    fn start_bomb_event(&mut self, facility_id: u64) {
+        let Some(target) = self
+            .tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == facility_id)
+        else {
+            return;
+        };
+        let bomb_floor = target.position.floor;
+        let security_floor = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Security)
+            .min_by_key(|facility| {
+                (simtower_core::floor_ordinal(facility.position.floor)
+                    - simtower_core::floor_ordinal(bomb_floor))
+                .unsigned_abs()
+            })
+            .map_or(1, |facility| facility.position.floor);
+        let resume_speed = apply_emergency_speed(&mut self.tower.clock);
+        self.bomb_event = Some(BombEventState {
+            facility_id,
+            bomb_floor,
+            security_floor,
+            elapsed: 0.0,
+            decision_elapsed: 0.0,
+            response: BombResponse::AwaitingDecision,
+            resume_speed,
+        });
+        self.status =
+            "A terrorist claims a bomb is hidden in the tower — speed set to 1x".to_owned();
+        self.assets.sounds.play_bomb_threat();
+    }
+
+    fn update_bomb_response_dialog(&mut self, dt: f32) {
+        if let Some(event) = &mut self.bomb_event {
+            event.decision_elapsed =
+                (event.decision_elapsed + dt).min(FIRE_RESPONSE_DECISION_SECONDS);
+        }
+        let mouse = ui_mouse_position();
+        let pay = is_key_pressed(KeyCode::P)
+            || (is_mouse_button_pressed(MouseButton::Left)
+                && bomb_pay_button_rect().contains(mouse));
+        let search = is_key_pressed(KeyCode::S)
+            || is_key_pressed(KeyCode::Escape)
+            || self
+                .bomb_event
+                .is_some_and(|event| event.decision_elapsed >= FIRE_RESPONSE_DECISION_SECONDS)
+            || (is_mouse_button_pressed(MouseButton::Left)
+                && bomb_search_button_rect().contains(mouse));
+        if pay {
+            if !self.tower.try_spend(BOMB_RANSOM_COST) {
+                self.assets.play_no_money();
+                self.status = format!("The ransom is ${BOMB_RANSOM_COST}; insufficient funds");
+                return;
+            }
+            self.finance_ledger
+                .record_emergency_charge(BOMB_RANSOM_COST, self.tower.cash());
+            if let Some(event) = self.bomb_event.take() {
+                restore_emergency_speed(&mut self.tower.clock, event.resume_speed);
+            }
+            self.status = "The ransom was paid and the bomb threat withdrawn".to_owned();
+            return;
+        }
+        if search {
+            if let Some(event) = &mut self.bomb_event {
+                event.response = BombResponse::Searching;
+                event.elapsed = 0.0;
+            }
+            let personnel = bomb_security_personnel_count(&self.tower);
+            self.status = format!(
+                "{personnel} security personnel are searching separate floors for the bomb"
+            );
+            self.assets.sounds.play_bomb_armed();
+        }
+    }
+
+    fn update_bomb_event(&mut self, dt: f32) {
+        let Some(mut event) = self.bomb_event else {
+            return;
+        };
+        if event.response == BombResponse::AwaitingDecision {
+            return;
+        }
+        event.elapsed += dt;
+        let floors = bomb_search_floor_order(&self.tower, event.security_floor);
+        let personnel = bomb_security_personnel_count(&self.tower);
+        let searched = bomb_search_completed_floor_count(event.elapsed, personnel, floors.len());
+        if floors
+            .iter()
+            .take(searched)
+            .any(|floor| *floor == event.bomb_floor)
+        {
+            self.bomb_event = None;
+            restore_emergency_speed(&mut self.tower.clock, event.resume_speed);
+            self.status = format!(
+                "Security found and disarmed the bomb on floor {}",
+                format_floor(event.bomb_floor)
+            );
+            self.assets.sounds.play_fire_response();
+            return;
+        }
+        if event.elapsed >= BOMB_FUSE_SECONDS || searched >= floors.len() {
+            let bomb_ordinal = simtower_core::floor_ordinal(event.bomb_floor);
+            let damaged = self
+                .tower
+                .facilities()
+                .iter()
+                .filter(|facility| {
+                    let base = simtower_core::floor_ordinal(facility.position.floor);
+                    let top = base + i16::try_from(facility.height()).unwrap_or(1) - 1;
+                    facility.kind.has_tenant_occupancy()
+                        && base <= bomb_ordinal + 2
+                        && top >= bomb_ordinal - 2
+                })
+                .map(|facility| facility.id)
+                .collect::<Vec<_>>();
+            for facility_id in &damaged {
+                self.tower.mark_facility_burned(*facility_id);
+                self.traffic.evacuate_facility(*facility_id);
+            }
+            self.bomb_event = None;
+            restore_emergency_speed(&mut self.tower.clock, event.resume_speed);
+            self.status = format!(
+                "The bomb exploded across five floors; {} tenant spaces must be rebuilt",
+                damaged.len()
+            );
+            self.assets.sounds.play_bomb_explosion();
+            return;
+        }
+        self.bomb_event = Some(event);
     }
 
     fn update_fire_response_dialog(&mut self, dt: f32) {
@@ -2500,6 +3134,106 @@ impl App {
         }
     }
 
+    fn update_vip_visit(&mut self) {
+        if self.tower.vip_approved() {
+            self.vip_visit = None;
+            return;
+        }
+        if let Some(mut visit) = self.vip_visit {
+            if let Some(person) = self
+                .traffic
+                .people()
+                .iter()
+                .find(|person| person.id == visit.person_id)
+            {
+                visit.worst_mood = visit.worst_mood.max(match person.mood {
+                    PersonMood::Calm => 0,
+                    PersonMood::Concerned => 1,
+                    PersonMood::Angry => 2,
+                });
+                self.vip_visit = Some(visit);
+                return;
+            }
+
+            let suite_score = self
+                .tower
+                .facilities()
+                .iter()
+                .find(|facility| facility.id == visit.suite_id)
+                .map_or(0, |facility| self.tenant_evaluation_score(facility));
+            let approved = visit.worst_mood < 2 && suite_score >= 55;
+            if approved {
+                self.tower.approve_vip_visit();
+                self.status = "The VIP rated the tower favorably".to_owned();
+                self.open_vip_dialog(VipDialogKind::Approved);
+            } else {
+                self.status = "The VIP left without recommending the tower".to_owned();
+                self.open_vip_dialog(VipDialogKind::Failed);
+            }
+            self.vip_visit = None;
+            return;
+        }
+
+        if self.cached_population < 5_000
+            || self.tower.clock.day <= self.last_vip_attempt_day
+            || !(9 * 60..17 * 60).contains(&self.tower.clock.minute_of_day)
+        {
+            return;
+        }
+        let has_required_services = [
+            FacilityKind::Medical,
+            FacilityKind::Recycling,
+            FacilityKind::Parking,
+        ]
+        .into_iter()
+        .all(|kind| {
+            self.tower
+                .facilities()
+                .iter()
+                .any(|facility| facility.kind == kind)
+        });
+        if !has_required_services {
+            return;
+        }
+        let suite_id = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| {
+                facility.kind == FacilityKind::HotelSuite
+                    && facility.is_occupied()
+                    && self.traffic.reachable_facility_set().contains(&facility.id)
+            })
+            .map(|facility| facility.id)
+            .nth(1);
+        let Some(suite_id) = suite_id else {
+            return;
+        };
+        let Some(person_id) = self
+            .traffic
+            .spawn_special_visitor(&self.tower, suite_id, 24.0)
+        else {
+            return;
+        };
+        self.last_vip_attempt_day = self.tower.clock.day;
+        self.vip_visit = Some(VipVisitState {
+            suite_id,
+            person_id,
+            started_minute: self.tower.clock.absolute_minute(),
+            worst_mood: 0,
+        });
+        self.center_camera_on_facility(suite_id);
+        self.status = "A VIP has arrived to evaluate the tower".to_owned();
+        self.open_vip_dialog(VipDialogKind::Arrival);
+    }
+
+    fn open_vip_dialog(&mut self, kind: VipDialogKind) {
+        self.vip_dialog = Some(kind);
+        self.vip_dialog_resume_speed =
+            (self.tower.clock.speed != SimulationSpeed::Paused).then_some(self.tower.clock.speed);
+        self.tower.clock.speed = SimulationSpeed::Paused;
+    }
+
     fn update_camera(&mut self) {
         let speed = 14.0 * get_frame_time();
         if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
@@ -2572,6 +3306,7 @@ impl App {
             .collect::<HashSet<_>>();
         self.visual_people_x
             .retain(|id, _| live_people.contains(id));
+        self.person_names.retain(|id, _| live_people.contains(id));
         let blend = 1.0 - (-10.0 * dt).exp();
         for person in self.traffic.people() {
             let visual_x = self.visual_people_x.entry(person.id).or_insert(person.x);
@@ -2587,13 +3322,47 @@ impl App {
         self.cached_population_by_kind.clone()
     }
 
+    fn update_parking_state(&mut self) {
+        let now = self.tower.clock.absolute_minute();
+        if !self.parking_state.layout_dirty && self.parking_state.last_absolute_minute == now {
+            return;
+        }
+        let layout_changed = self.parking_state.layout_dirty;
+        let initialized = self.parking_state.last_absolute_minute != u64::MAX;
+        let connected = connected_parking_spaces(self.tower.facilities());
+        let occupied =
+            occupied_parking_spaces(&self.tower, &connected, self.tower.clock.minute_of_day);
+        if initialized && !layout_changed {
+            let arrivals = occupied
+                .iter()
+                .filter(|id| !self.parking_state.occupied.contains(id))
+                .count();
+            let departures = self
+                .parking_state
+                .occupied
+                .iter()
+                .filter(|id| !occupied.contains(id))
+                .count();
+            if arrivals > departures {
+                self.assets.sounds.play_parking_arrival();
+            } else if departures > 0 {
+                self.assets.sounds.play_parking_departure();
+            }
+        }
+        self.parking_state.connected = connected;
+        self.parking_state.occupied = occupied;
+        self.parking_state.last_absolute_minute = now;
+        self.parking_state.layout_dirty = false;
+    }
+
     fn refresh_tower_metrics(&mut self) {
         let reachable = self.traffic.reachable_facility_set();
         let mut totals = HashMap::new();
         for facility in self.tower.facilities().iter().filter(|facility| {
             facility.is_occupied()
                 && reachable.contains(&facility.id)
-                && self.traffic.has_received_visitor(facility.id)
+                && (self.traffic.has_received_visitor(facility.id)
+                    || has_independent_population(facility.kind))
         }) {
             let population = match facility.kind {
                 FacilityKind::Restaurant
@@ -2623,7 +3392,10 @@ impl App {
     }
 
     fn economic_patronage(&self, facility: &Facility, reachable: bool) -> u32 {
-        if !facility.is_occupied() || !reachable || !self.traffic.has_received_visitor(facility.id)
+        if !facility.is_occupied()
+            || !reachable
+            || (!self.traffic.has_received_visitor(facility.id)
+                && !has_dedicated_patronage(facility.kind))
         {
             return 0;
         }
@@ -2631,9 +3403,11 @@ impl App {
             .traffic
             .daily_visitors_at(facility.id)
             .max(self.traffic.visitors_at(facility.id) as u32);
-        let weekday = (self.tower.clock.day.saturating_sub(1) % 7) + 1;
-        let weekend = weekday >= 6;
-        actual.max(settled_commercial_patronage(facility.kind, weekend))
+        actual.max(self.traffic.dedicated_patronage_at(
+            facility.id,
+            facility.kind,
+            is_weekend(self.tower.clock),
+        ))
     }
 
     fn star_rating(&self) -> u8 {
@@ -2772,6 +3546,10 @@ impl App {
                 "Game sounds unmuted"
             }
             .to_owned();
+            return;
+        }
+        if self.view_mode != ViewMode::Edit && overview_panel_rect().contains(ui_point) {
+            self.handle_overview_click(ui_point);
             return;
         }
         if let Some((menu, index)) = self.menu_entry_at(ui_point) {
@@ -2947,8 +3725,22 @@ impl App {
                         x: existing_shaft.map_or(position.x, |(shaft_x, _)| shaft_x),
                         floor: position.floor,
                     };
+                    let valid_landing = !is_elevator_kind(kind)
+                        || elevator_landing_is_valid(
+                            kind,
+                            placement.x,
+                            placement.floor,
+                            self.tower.facilities(),
+                        );
+                    if is_elevator_kind(kind) && existing_shaft.is_none() && !valid_landing {
+                        self.status =
+                            "Start the elevator at the bottom landing of the multi-story lobby"
+                                .to_owned();
+                        return;
+                    }
                     let adds_car_to_extension = existing_shaft.is_some()
-                        && self.tower.is_elevator_extension(kind, placement);
+                        && self.tower.is_elevator_extension(kind, placement)
+                        && valid_landing;
                     if adds_car_to_extension
                         && existing_shaft
                             .is_some_and(|(_, cars)| cars >= simtower_core::MAX_ELEVATOR_CARS)
@@ -2968,6 +3760,12 @@ impl App {
                     };
                     match result {
                         Ok(_) => {
+                            if matches!(
+                                kind,
+                                FacilityKind::Parking | FacilityKind::Ramp | FacilityKind::Lobby
+                            ) {
+                                self.parking_state.layout_dirty = true;
+                            }
                             self.assets.play_construction(kind);
                             self.traffic.sync_with_tower_after_addition(&self.tower);
                             if self.show_secret_discovery() {
@@ -2981,7 +3779,11 @@ impl App {
                                     .elevator_at(kind, shaft_x)
                                     .map(|shaft| shaft.id)
                                     .is_some_and(|shaft_id| {
-                                        self.traffic.add_elevator_car(shaft_id, placement.floor)
+                                        self.traffic.add_elevator_car(
+                                            &self.tower,
+                                            shaft_id,
+                                            placement.floor,
+                                        )
                                     });
                                 self.status = if added {
                                     format!(
@@ -2993,6 +3795,11 @@ impl App {
                                 } else {
                                     format!("Extended {} shaft", kind.spec().name)
                                 };
+                            } else if is_elevator_kind(kind) && existing_shaft.is_some() {
+                                self.status = format!(
+                                    "Extended {} through the open lobby; this floor is not a stop",
+                                    kind.spec().name
+                                );
                             } else if is_elevator_kind(kind) {
                                 self.status = format!(
                                     "Built {} with 1 car waiting on floor {}",
@@ -3018,6 +3825,10 @@ impl App {
                 }
             }
             ToolMode::Inspect => {
+                if let Some(person_id) = self.person_at_screen_point(point) {
+                    self.open_person_panel(person_id);
+                    return;
+                }
                 let selected = self
                     .facility_at_screen_point(point)
                     .map(|facility| (facility.id, facility.kind, facility.position));
@@ -3026,11 +3837,11 @@ impl App {
                 }) {
                     return;
                 }
-                if let Some((id, kind, _)) = selected {
-                    if kind.has_tenant_occupancy() {
-                        self.open_tenant_panel(id);
-                        return;
-                    }
+                if let Some((id, kind, _)) = selected
+                    && kind.has_tenant_occupancy()
+                {
+                    self.open_tenant_panel(id);
+                    return;
                 }
                 self.status = selected.map_or_else(
                     || {
@@ -3069,6 +3880,12 @@ impl App {
             ToolMode::Demolish => match self.demolition_target_at(point) {
                 Some(DemolitionTarget::Facility(id)) => match self.tower.demolish(id) {
                     Ok(facility) => {
+                        if matches!(
+                            facility.kind,
+                            FacilityKind::Parking | FacilityKind::Ramp | FacilityKind::Lobby
+                        ) {
+                            self.parking_state.layout_dirty = true;
+                        }
                         self.traffic
                             .sync_with_tower_after_removal(&self.tower, &facility);
                         self.assets.play_demolition();
@@ -3079,6 +3896,8 @@ impl App {
                 Some(DemolitionTarget::Floor(position)) => {
                     match self.tower.demolish_floor(position) {
                         Ok(()) => {
+                            self.traffic
+                                .sync_with_tower_after_floor_removal(&self.tower, position);
                             self.assets.play_demolition();
                             self.status = format!(
                                 "Demolished floor {}, column {}",
@@ -3211,6 +4030,7 @@ impl App {
         self.paint_drag_last = None;
         self.lobby_drag_stories = stories;
         if built > 0 {
+            self.parking_state.layout_dirty = true;
             self.traffic.sync_with_tower_after_addition(&self.tower);
             self.assets.play_construction(FacilityKind::Lobby);
             self.status = format!(
@@ -3318,6 +4138,7 @@ impl App {
         self.paint_drag_last = Some(position);
         match self.tower.place_lobby(position, self.lobby_drag_stories) {
             Ok(id) => {
+                self.parking_state.layout_dirty = true;
                 self.traffic.sync_with_tower_after_addition(&self.tower);
                 self.construction.push(ConstructionAnimation {
                     facility_id: id,
@@ -3397,6 +4218,9 @@ impl App {
             self.assets.play_no_money();
         }
         if built > 0 {
+            if self.tool == ToolMode::Build(FacilityKind::Lobby) {
+                self.parking_state.layout_dirty = true;
+            }
             self.traffic.sync_with_tower_after_addition(&self.tower);
             self.status = match self.tool {
                 ToolMode::Floor => format!(
@@ -3489,11 +4313,22 @@ impl App {
             );
             return;
         }
+        if !self
+            .traffic
+            .elevator_can_stop_at(&self.tower, shaft_id, position.floor)
+        {
+            self.status =
+                "Elevator cars cannot wait in the middle of a multi-story lobby".to_owned();
+            return;
+        }
         if let Err(error) = self.tower.purchase_elevator_car(kind) {
             self.report_placement_error(error);
             return;
         }
-        if self.traffic.add_elevator_car(shaft_id, position.floor) {
+        if self
+            .traffic
+            .add_elevator_car(&self.tower, shaft_id, position.floor)
+        {
             self.assets.play_construction(kind);
             self.status = format!(
                 "Added car {} to {} with floor {} as its default waiting floor",
@@ -3611,19 +4446,19 @@ impl App {
             ViewMode::Edit => {}
             ViewMode::Evaluation => {
                 let visitors = self.traffic.visitors_at(id);
-                let evaluation = match facility_crowd_level(
-                    kind,
-                    occupied,
-                    visitors,
-                    facility_is_open(kind, self.tower.clock.minute_of_day),
-                ) {
-                    FacilityCrowd::Closed => "closed",
-                    FacilityCrowd::Empty => "needs attention",
-                    FacilityCrowd::Light => "average",
-                    FacilityCrowd::Heavy => "excellent",
+                let score = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .find(|facility| facility.id == id)
+                    .map_or(0, |facility| self.tenant_evaluation_score(facility));
+                let evaluation = match score {
+                    70..=100 => "excellent",
+                    40..=69 => "average",
+                    _ => "needs attention",
                 };
                 self.status = format!(
-                    "{} #{}: {} — {} people currently inside",
+                    "{} #{}: {} ({score}/100) — {} people currently inside",
                     kind.spec().name,
                     id,
                     evaluation,
@@ -3702,6 +4537,58 @@ impl App {
         None
     }
 
+    fn person_at_screen_point(&self, point: Vec2) -> Option<u64> {
+        let mut queued_per_stop = HashMap::<(u64, i16), usize>::new();
+        let queue_ranks = self
+            .traffic
+            .people()
+            .iter()
+            .filter_map(|person| {
+                let PersonActivity::WaitingForElevator { shaft_id } = person.activity else {
+                    return None;
+                };
+                let rank = queued_per_stop
+                    .entry((shaft_id, person.current_floor))
+                    .or_default();
+                let result = (person.id, *rank);
+                *rank += 1;
+                Some(result)
+            })
+            .collect::<HashMap<_, _>>();
+
+        self.traffic.people().iter().rev().find_map(|person| {
+            if matches!(
+                person.activity,
+                PersonActivity::Visiting
+                    | PersonActivity::RidingElevator { .. }
+                    | PersonActivity::UsingStairs
+            ) {
+                return None;
+            }
+            let visual_x = self
+                .visual_people_x
+                .get(&person.id)
+                .copied()
+                .unwrap_or(person.x);
+            let x = match person.activity {
+                PersonActivity::WaitingForElevator { shaft_id } => self
+                    .elevator_queue_draw_x(shaft_id, *queue_ranks.get(&person.id).unwrap_or(&0))
+                    .unwrap_or((visual_x - self.camera_x) * CELL_WIDTH - 4.0),
+                _ => (visual_x - self.camera_x) * CELL_WIDTH - 4.0,
+            };
+            let exterior_ground = person.current_floor == 1
+                && !self.person_has_floor_below(person.x, person.current_floor);
+            let y = if exterior_ground {
+                self.ground_y() - PERSON_SPRITE_HEIGHT
+            } else {
+                interior_person_top_y(self.ground_y(), person.floor_position)
+            };
+            Rect::new(x - 2.0, y, 12.0, PERSON_SPRITE_HEIGHT)
+                .contains(point)
+                .then_some(person.id)
+        })
+    }
+
     fn facility_pixel_contains(&self, facility: &Facility, point: Vec2) -> bool {
         if !self.facility_screen_rect(facility).contains(point) {
             return false;
@@ -3756,10 +4643,16 @@ impl App {
             FacilityKind::Stairs | FacilityKind::Escalator
         ) {
             source = self.stair_sprite_source(facility, sprite);
+            let stories = vertical_walkway_story_span(facility, self.tower.facilities());
             return sprite_pixel_is_opaque(
                 sprite,
                 source,
-                Rect::new(x, base_y - FLOOR_HEIGHT, width, FLOOR_HEIGHT * 2.0),
+                Rect::new(
+                    x,
+                    base_y - (f32::from(stories) - 1.0) * FLOOR_HEIGHT,
+                    width,
+                    FLOOR_HEIGHT * f32::from(stories),
+                ),
                 point,
             );
         }
@@ -3785,7 +4678,8 @@ impl App {
 
     fn stair_sprite_source(&self, facility: &Facility, sprite: &Sprite) -> Rect {
         let base_ordinal = simtower_core::floor_ordinal(facility.position.floor);
-        let upper_ordinal = base_ordinal + 1;
+        let stories = vertical_walkway_story_span(facility, self.tower.facilities());
+        let upper_ordinal = base_ordinal + stories.saturating_sub(1) as i16;
         let center_x = f32::from(facility.position.x) + f32::from(facility.kind.spec().width) * 0.5;
         let riders = self.traffic.people().iter().filter(|person| {
             person.activity == PersonActivity::UsingStairs
@@ -3799,6 +4693,7 @@ impl App {
                     facility.position.floor,
                     person.current_floor,
                     person.floor_position,
+                    stories.saturating_sub(1),
                 )
             })
         } else {
@@ -3882,7 +4777,7 @@ impl App {
         let Some(shaft) = self.traffic.elevator_at(kind, x) else {
             return false;
         };
-        let weekend = self.tower.clock.day.is_multiple_of(3);
+        let weekend = is_weekend(self.tower.clock);
         self.elevator_panel = Some(ElevatorPanelState {
             shaft_id: shaft.id,
             weekend,
@@ -3982,13 +4877,19 @@ impl App {
         let point = physical_to_ui(point, self.ux_scale);
         self.save_name_dialog.is_some()
             || self.tenant_panel.is_some()
+            || self.person_panel.is_some()
             || self.elevator_panel.is_some()
             || self.promotion_dialog_open
+            || self.vip_dialog.is_some()
+            || self
+                .bomb_event
+                .is_some_and(|event| event.response == BombResponse::AwaitingDecision)
             || self
                 .fire_event
                 .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             || point.y < TOPBAR_HEIGHT
             || palette_rect().contains(point)
+            || (self.view_mode != ViewMode::Edit && overview_panel_rect().contains(point))
             || (self.game_menu_open && game_menu_rect().contains(point))
             || (self.game_menu_open
                 && self.ux_scale_menu_open
@@ -4006,28 +4907,35 @@ impl App {
             && self.view_mode == ViewMode::Edit
             && self.elevator_panel.is_none()
             && self.tenant_panel.is_none()
+            && self.person_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
             && !self
                 .fire_event
                 .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             && self.intro_remaining <= 0.0
+            && !self.welcome_dialog_open
             && !self.point_is_ui(mouse);
         let inspect_cursor = self.tool == ToolMode::Inspect
             && self.view_mode == ViewMode::Edit
             && self.elevator_panel.is_none()
             && self.tenant_panel.is_none()
+            && self.person_panel.is_none()
             && !self.finance_panel_open
             && !self.promotion_dialog_open
             && !self
                 .fire_event
                 .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
             && self.intro_remaining <= 0.0
+            && !self.welcome_dialog_open
             && !self.point_is_ui(mouse);
-        let resize_handle =
-            (!self.promotion_dialog_open && !demolition_cursor && !self.point_is_ui(mouse))
-                .then(|| self.elevator_extension_at(mouse))
-                .flatten();
+        let resize_handle = (!self.promotion_dialog_open
+            && !self.welcome_dialog_open
+            && self.intro_remaining <= 0.0
+            && !demolition_cursor
+            && !self.point_is_ui(mouse))
+        .then(|| self.elevator_extension_at(mouse))
+        .flatten();
         window::show_mouse(resize_handle.is_none() && !demolition_cursor && !inspect_cursor);
         self.draw_world_background();
         self.draw_world();
@@ -4035,6 +4943,9 @@ impl App {
         begin_ui_camera(self.ux_scale);
         self.draw_topbar();
         self.draw_palette();
+        if self.view_mode != ViewMode::Edit {
+            self.draw_tower_overview();
+        }
         if let Some(menu) = self.open_menu {
             self.draw_submenu(menu);
         }
@@ -4059,6 +4970,9 @@ impl App {
         if self.tenant_panel.is_some() {
             self.draw_tenant_panel();
         }
+        if self.person_panel.is_some() {
+            self.draw_person_panel();
+        }
         self.draw_ui_tooltip(physical_to_ui(mouse, self.ux_scale));
         if self.save_name_dialog.is_some() {
             self.draw_save_name_dialog();
@@ -4066,12 +4980,22 @@ impl App {
         if self.promotion_dialog_open {
             self.draw_promotion_dialog();
         }
+        if self.vip_dialog.is_some() {
+            self.draw_vip_dialog();
+        }
+        if self
+            .bomb_event
+            .is_some_and(|event| event.response == BombResponse::AwaitingDecision)
+        {
+            self.draw_bomb_response_dialog();
+        }
         if self
             .fire_event
             .is_some_and(|event| event.response == FireResponse::AwaitingDecision)
         {
             self.draw_fire_response_dialog();
         }
+        UI_CAMERA_ACTIVE.store(false, Ordering::Relaxed);
         set_default_camera();
         if demolition_cursor {
             self.draw_demolition_cursor(mouse);
@@ -4080,18 +5004,37 @@ impl App {
         } else if inspect_cursor {
             self.draw_magnifier_cursor(mouse);
         }
-        if self.intro_remaining > 0.0 {
+        if self.intro_remaining > 0.0 || self.welcome_dialog_open {
             self.draw_intro();
         }
     }
 
     fn draw_intro(&self) {
         draw_rectangle(0.0, 0.0, screen_width(), screen_height(), BLACK);
-        if self.intro_remaining > 1.0 {
-            let scale = (screen_width() / 640.0).min(screen_height() / 480.0);
-            let size = vec2(640.0 * scale, 480.0 * scale);
+        let viewport = vec2(screen_width(), screen_height());
+        let (scale, origin) = title_screen_transform(viewport);
+        if self.welcome_dialog_open {
             draw_texture_ex(
                 &self.assets.intro_store,
+                origin.x,
+                origin.y,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(
+                        TITLE_SCREEN_WIDTH * scale,
+                        TITLE_SCREEN_HEIGHT * scale,
+                    )),
+                    ..Default::default()
+                },
+            );
+            begin_ui_camera(self.ux_scale);
+            self.draw_welcome_dialog(vec2(ui_screen_width(), ui_screen_height()));
+            UI_CAMERA_ACTIVE.store(false, Ordering::Relaxed);
+            set_default_camera();
+        } else if self.intro_remaining > INTRO_TITLE_SECONDS {
+            let size = vec2(236.0, 198.0) * scale;
+            draw_texture_ex(
+                &self.assets.intro_maxis,
                 (screen_width() - size.x) * 0.5,
                 (screen_height() - size.y) * 0.5,
                 WHITE,
@@ -4101,19 +5044,16 @@ impl App {
                 },
             );
         } else {
+            let size = vec2(334.0, 270.0) * scale;
             draw_texture_ex(
                 &self.assets.intro_title,
-                screen_width() * 0.5 - 167.0,
-                screen_height() * 0.5 - 150.0,
+                (screen_width() - size.x) * 0.5,
+                (screen_height() - size.y) * 0.5,
                 WHITE,
-                DrawTextureParams::default(),
-            );
-            draw_texture_ex(
-                &self.assets.intro_maxis,
-                screen_width() * 0.5 - 118.0,
-                screen_height() * 0.5 + 44.0,
-                WHITE,
-                DrawTextureParams::default(),
+                DrawTextureParams {
+                    dest_size: Some(size),
+                    ..Default::default()
+                },
             );
         }
     }
@@ -4246,6 +5186,25 @@ impl App {
                     dest_size: Some(vec2(texture.width(), texture.height())),
                     ..Default::default()
                 },
+            );
+        }
+    }
+
+    fn draw_welcome_dialog(&self, viewport: Vec2) {
+        let dialog = welcome_dialog_rect(viewport);
+        let mouse = ui_mouse_position();
+        let (scale, _) = title_screen_transform(viewport);
+        draw_title_screen_panel(dialog, scale);
+        for (index, (_, label)) in WELCOME_ACTIONS.iter().enumerate() {
+            let button = welcome_button_rect(viewport, index);
+            let pressed = button.contains(mouse) && is_mouse_button_down(MouseButton::Left);
+            draw_title_screen_button(button, scale, pressed, index == self.welcome_selection);
+            draw_centered_text(
+                label,
+                button.x + button.w * 0.5,
+                button.y + 19.0 * scale,
+                (16.0 * scale).round().max(9.0) as u16,
+                BLACK,
             );
         }
     }
@@ -4436,6 +5395,7 @@ impl App {
         self.draw_roof_crane();
         self.draw_people();
         self.draw_fire_response();
+        self.draw_bomb_search();
         self.draw_treasure_popup();
         self.draw_mode_overlays();
         let mouse = vec2(mouse_position().0, mouse_position().1);
@@ -4495,6 +5455,52 @@ impl App {
             }
             FireResponse::Security => self.draw_security_response_team(event, target),
             FireResponse::AwaitingDecision => {}
+        }
+    }
+
+    fn draw_bomb_search(&self) {
+        let Some(event) = self
+            .bomb_event
+            .filter(|event| event.response == BombResponse::Searching)
+        else {
+            return;
+        };
+        let floors = bomb_search_floor_order(&self.tower, event.security_floor);
+        let personnel = bomb_security_personnel_count(&self.tower);
+        let first_active =
+            bomb_search_completed_floor_count(event.elapsed, personnel, floors.len());
+        if floors.get(first_active).is_none() {
+            return;
+        }
+        let phase = (event.elapsed / BOMB_SEARCH_SECONDS_PER_FLOOR).fract();
+        for (guard, floor) in floors
+            .iter()
+            .skip(first_active)
+            .take(personnel)
+            .copied()
+            .enumerate()
+        {
+            let mut cells = self
+                .tower
+                .floors()
+                .iter()
+                .filter(|position| position.floor == floor)
+                .map(|position| position.x);
+            let Some(first) = cells.next() else {
+                continue;
+            };
+            let (left, right) = cells.fold((first, first), |(left, right), x| {
+                (left.min(x), right.max(x))
+            });
+            let world_x = f32::from(right + 1)
+                - phase * f32::from(right.saturating_sub(left).saturating_add(1));
+            let x = (world_x - self.camera_x) * CELL_WIDTH;
+            let y = floor_top_y(self.ground_y(), floor) + FLOOR_HEIGHT - PERSON_SPRITE_HEIGHT;
+            self.draw_security_team_frame(
+                80.0 + ((event.elapsed * 6.0 + guard as f32) as usize % 2) as f32 * 16.0,
+                x,
+                y,
+            );
         }
     }
 
@@ -4579,7 +5585,7 @@ impl App {
             fire_response_timeout_remaining(event.decision_elapsed)
         });
         draw_text(
-            &format!("Security dispatches automatically in {remaining} seconds."),
+            format!("Security dispatches automatically in {remaining} seconds."),
             panel.x + 116.0,
             panel.y + 137.0,
             15.0,
@@ -4602,6 +5608,66 @@ impl App {
             security.x + security.w * 0.5,
             security.y + 21.0,
             15,
+            BLACK,
+        );
+    }
+
+    fn draw_bomb_response_dialog(&self) {
+        let rect = bomb_response_dialog_rect();
+        draw_classic_panel(rect);
+        draw_rectangle(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, 23.0, TITLE_BLUE);
+        draw_text("Bomb Threat", rect.x + 10.0, rect.y + 19.0, 14.0, WHITE);
+        draw_texture_ex(
+            &self.assets.terrorist_portrait,
+            rect.x + 20.0,
+            rect.y + 42.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(84.0, 84.0)),
+                ..Default::default()
+            },
+        );
+        draw_text(
+            "A terrorist says a bomb is hidden in your tower.",
+            rect.x + 122.0,
+            rect.y + 59.0,
+            16.0,
+            BLACK,
+        );
+        draw_text(
+            "Pay the ransom, or order Security to search every floor.",
+            rect.x + 122.0,
+            rect.y + 87.0,
+            14.0,
+            BLACK,
+        );
+        draw_text(
+            "A missed bomb can destroy five floors.",
+            rect.x + 122.0,
+            rect.y + 111.0,
+            14.0,
+            BLACK,
+        );
+        let remaining = self.bomb_event.map_or(0, |event| {
+            fire_response_timeout_remaining(event.decision_elapsed)
+        });
+        draw_text(
+            format!("Security dispatches automatically in {remaining} seconds."),
+            rect.x + 122.0,
+            rect.y + 135.0,
+            14.0,
+            BLACK,
+        );
+        let pay = bomb_pay_button_rect();
+        let search = bomb_search_button_rect();
+        draw_classic_button(pay, false);
+        draw_classic_button(search, false);
+        draw_centered_text("Pay $300,000", pay.x + pay.w * 0.5, pay.y + 21.0, 14, BLACK);
+        draw_centered_text(
+            "Search with Security",
+            search.x + search.w * 0.5,
+            search.y + 21.0,
+            14,
             BLACK,
         );
     }
@@ -4658,6 +5724,49 @@ impl App {
             15.0,
             BLACK,
         );
+    }
+
+    fn draw_vip_dialog(&self) {
+        let Some(kind) = self.vip_dialog else {
+            return;
+        };
+        let rect = vip_dialog_rect();
+        draw_classic_panel(rect);
+        draw_rectangle(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, 23.0, TITLE_BLUE);
+        draw_text("VIP Evaluation", rect.x + 10.0, rect.y + 19.0, 14.0, WHITE);
+        draw_texture_ex(
+            &self.assets.vip_arrival,
+            rect.x + 20.0,
+            rect.y + 42.0,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(112.0, 82.0)),
+                ..Default::default()
+            },
+        );
+        let (heading, first, second) = match kind {
+            VipDialogKind::Arrival => (
+                "A VIP has arrived!",
+                "The guest will travel to a hotel suite",
+                "and judge access, waiting stress, and services.",
+            ),
+            VipDialogKind::Approved => (
+                "A favorable review!",
+                "The VIP enjoyed the visit.",
+                "Your tower may now qualify for four stars.",
+            ),
+            VipDialogKind::Failed => (
+                "The VIP was dissatisfied.",
+                "Improve transportation and tenant evaluation.",
+                "Another evaluator will visit on a later day.",
+            ),
+        };
+        draw_text(heading, rect.x + 150.0, rect.y + 55.0, 18.0, BLACK);
+        draw_text(first, rect.x + 150.0, rect.y + 82.0, 14.0, BLACK);
+        draw_text(second, rect.x + 150.0, rect.y + 104.0, 14.0, BLACK);
+        let ok = vip_dialog_ok_rect();
+        draw_classic_button(ok, false);
+        draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 19.0, 14, BLACK);
     }
 
     fn draw_tenant_panel(&self) {
@@ -4784,7 +5893,15 @@ impl App {
 
         let people_box = Rect::new(panel.x + 14.0, panel.y + 183.0, panel.w - 28.0, 39.0);
         draw_recessed_field(people_box);
-        draw_tenant_people_meter(people_box, details.people_icons);
+        if facility.kind == FacilityKind::Condo && details.people_icons > 0 {
+            draw_condo_family_meter(&self.assets.people, people_box);
+        } else {
+            draw_tenant_people_meter(
+                &self.assets.people_silhouette[0],
+                people_box,
+                details.people_icons,
+            );
+        }
 
         let evaluation_box = Rect::new(panel.x + 14.0, panel.y + 231.0, panel.w - 28.0, 55.0);
         draw_recessed_field(evaluation_box);
@@ -4803,6 +5920,8 @@ impl App {
         draw_centered_text(
             if panel_state.renaming {
                 "Save name"
+            } else if facility.kind == FacilityKind::Cinema {
+                "Change movie"
             } else {
                 "Rename"
             },
@@ -4814,6 +5933,127 @@ impl App {
         let ok = tenant_info_ok_rect();
         draw_classic_button(ok, false);
         draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 20.0, 15, BLACK);
+    }
+
+    fn draw_person_panel(&self) {
+        let Some(panel_state) = &self.person_panel else {
+            return;
+        };
+        let Some(person) = self
+            .traffic
+            .people()
+            .iter()
+            .find(|person| person.id == panel_state.person_id)
+        else {
+            return;
+        };
+        let panel = person_info_rect();
+        draw_classic_panel(panel);
+        draw_rectangle_lines(
+            panel.x + 5.0,
+            panel.y + 5.0,
+            panel.w - 10.0,
+            panel.h - 10.0,
+            1.0,
+            CLASSIC_SHADOW,
+        );
+
+        let portrait = Rect::new(panel.x + 14.0, panel.y + 14.0, 52.0, 72.0);
+        draw_recessed_field(portrait);
+        // The original inspector uses the same solid-black person artwork as
+        // its tenant meters, not the colored walking animation.
+        let portrait_source = Rect::new(0.0, 0.0, 16.0, 36.0);
+        draw_texture_ex(
+            &self.assets.people_silhouette[0],
+            portrait.x + 14.0,
+            portrait.y + 9.0,
+            WHITE,
+            DrawTextureParams {
+                source: Some(portrait_source),
+                dest_size: Some(vec2(24.0, 54.0)),
+                ..Default::default()
+            },
+        );
+
+        let name_field = Rect::new(panel.x + 78.0, panel.y + 14.0, panel.w - 92.0, 24.0);
+        draw_recessed_field(name_field);
+        let default_name = person_role(person, &self.tower);
+        let name = if panel_state.renaming {
+            format!("{}|", panel_state.rename_draft)
+        } else {
+            self.person_names
+                .get(&person.id)
+                .cloned()
+                .unwrap_or_else(|| default_name.to_owned())
+        };
+        draw_fitted_text(
+            &name,
+            name_field.x + 6.0,
+            name_field.y + 18.0,
+            name_field.w - 12.0,
+            16,
+            BLACK,
+        );
+
+        let (from, going_to) = person_trip_labels(person, &self.tower);
+        draw_right_aligned_text("From", panel.x + 116.0, panel.y + 66.0, 14, BLACK);
+        let from_field = Rect::new(panel.x + 122.0, panel.y + 47.0, panel.w - 136.0, 22.0);
+        draw_recessed_field(from_field);
+        draw_fitted_text(
+            &from,
+            from_field.x + 5.0,
+            from_field.y + 17.0,
+            from_field.w - 10.0,
+            14,
+            BLACK,
+        );
+
+        draw_right_aligned_text("Eval", panel.x + 116.0, panel.y + 96.0, 14, BLACK);
+        let evaluation_field = Rect::new(panel.x + 122.0, panel.y + 77.0, panel.w - 136.0, 22.0);
+        draw_person_status_meter(
+            evaluation_field,
+            person_evaluation_fraction(person),
+            Color::from_rgba(18, 42, 225, 255),
+            true,
+        );
+
+        draw_right_aligned_text("Going To", panel.x + 116.0, panel.y + 126.0, 14, BLACK);
+        let destination_field = Rect::new(panel.x + 122.0, panel.y + 107.0, panel.w - 136.0, 22.0);
+        draw_recessed_field(destination_field);
+        draw_fitted_text(
+            &going_to,
+            destination_field.x + 5.0,
+            destination_field.y + 17.0,
+            destination_field.w - 10.0,
+            14,
+            BLACK,
+        );
+
+        draw_right_aligned_text("Stress", panel.x + 116.0, panel.y + 156.0, 14, BLACK);
+        let stress_field = Rect::new(panel.x + 122.0, panel.y + 137.0, panel.w - 136.0, 22.0);
+        draw_person_status_meter(
+            stress_field,
+            person_stress_fraction(person),
+            Color::from_rgba(235, 25, 25, 255),
+            false,
+        );
+
+        let rename = person_info_rename_rect();
+        draw_classic_button(rename, false);
+        draw_centered_text(
+            if panel_state.renaming {
+                "Save name"
+            } else {
+                "Rename"
+            },
+            rename.x + rename.w * 0.5,
+            rename.y + 19.0,
+            14,
+            BLACK,
+        );
+        let ok = person_info_ok_rect();
+        draw_classic_button(ok, false);
+        draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 19.0, 14, BLACK);
     }
 
     fn draw_empty_floor_room(&self, position: GridPosition) {
@@ -4851,7 +6091,15 @@ impl App {
         let x = (f32::from(facility.position.x) - self.camera_x) * CELL_WIDTH;
         let width = f32::from(facility.kind.spec().width) * CELL_WIDTH;
         let bottom = floor_top_y(self.ground_y(), facility.position.floor) + FLOOR_HEIGHT;
-        let top = bottom - f32::from(facility.height()) * FLOOR_HEIGHT;
+        let stories = if matches!(
+            facility.kind,
+            FacilityKind::Stairs | FacilityKind::Escalator
+        ) {
+            vertical_walkway_story_span(facility, self.tower.facilities())
+        } else {
+            facility.height()
+        };
+        let top = bottom - f32::from(stories) * FLOOR_HEIGHT;
         x + width >= 0.0
             && x <= screen_width()
             && bottom >= TOPBAR_HEIGHT - FLOOR_HEIGHT
@@ -4926,7 +6174,15 @@ impl App {
             .iter()
             .any(|animation| animation.facility_id == facility.id)
         {
-            for story in 0..facility.height() {
+            let stories = if matches!(
+                facility.kind,
+                FacilityKind::Stairs | FacilityKind::Escalator
+            ) {
+                vertical_walkway_story_span(facility, self.tower.facilities())
+            } else {
+                facility.height()
+            };
+            for story in 0..stories {
                 self.draw_scaffolding(x, y - f32::from(story) * FLOOR_HEIGHT, width);
             }
             return;
@@ -5053,22 +6309,19 @@ impl App {
             facility.kind,
             facility.is_occupied(),
             visitors,
-            facility_is_open(facility.kind, self.tower.clock.minute_of_day),
+            facility_is_open_at(facility.kind, self.tower.clock),
         )
     }
 
     fn facility_visual_load(&self, facility: &Facility) -> usize {
         match facility.kind {
-            FacilityKind::Parking => {
-                let parking_count = self
-                    .tower
-                    .facilities()
-                    .iter()
-                    .filter(|other| other.kind == FacilityKind::Parking)
-                    .count()
-                    .max(1);
-                self.traffic.people().len().div_ceil(parking_count).min(14)
+            // Zero is a connected, vacant space; 1..=13 select one of the
+            // parked-car cels; 14 is the disconnected red-X warning cel.
+            FacilityKind::Parking if !self.parking_state.connected.contains(&facility.id) => 14,
+            FacilityKind::Parking if self.parking_state.occupied.contains(&facility.id) => {
+                parking_car_frame(facility)
             }
+            FacilityKind::Parking => 0,
             FacilityKind::Metro => usize::from(
                 self.traffic.people().len() >= 8
                     && matches!(self.tower.clock.minute_of_day, 390..=570 | 960..=1140),
@@ -5097,10 +6350,7 @@ impl App {
                 });
                 connected_parking.count().min(2)
             }
-            FacilityKind::Cathedral => usize::from(
-                self.tower.clock.day.is_multiple_of(7)
-                    && (10 * 60..14 * 60).contains(&self.tower.clock.minute_of_day),
-            ),
+            FacilityKind::Cathedral => usize::from(self.tower.cathedral_wedding_active()),
             _ => self.traffic.visitors_at(facility.id),
         }
     }
@@ -5268,6 +6518,21 @@ impl App {
         const CELL_WIDTH: f32 = 16.0;
         const GLYPH_INSET: f32 = 1.0;
         const GLYPH_WIDTH: f32 = 11.0;
+        // Compound labels use transparent glyph cels. Redraw frame zero from
+        // the single-number atlas first so the shaft's vertical ribs cannot
+        // show through the label as gray lines on floors 10 and above.
+        let backplate = elevator_compound_label_backplate(x, y, width);
+        draw_texture_ex(
+            &self.assets.elevator_numbers[single_atlas],
+            backplate.x,
+            backplate.y,
+            tint,
+            DrawTextureParams {
+                source: Some(Rect::new(0.0, 0.0, 32.0, 36.0)),
+                dest_size: Some(vec2(backplate.w, backplate.h)),
+                ..Default::default()
+            },
+        );
         let label = floor.unsigned_abs().to_string();
         let glyph_count = label.len() + usize::from(floor < 0);
         let total_width = GLYPH_WIDTH * glyph_count as f32;
@@ -5339,13 +6604,14 @@ impl App {
         width: f32,
         sprite: &Sprite,
     ) {
+        let stories = vertical_walkway_story_span(facility, self.tower.facilities());
         draw_texture_ex(
             &sprite.texture,
             x,
-            base_y - FLOOR_HEIGHT,
+            base_y - (f32::from(stories) - 1.0) * FLOOR_HEIGHT,
             WHITE,
             DrawTextureParams {
-                dest_size: Some(vec2(width, FLOOR_HEIGHT * 2.0)),
+                dest_size: Some(vec2(width, FLOOR_HEIGHT * f32::from(stories))),
                 source: Some(self.stair_sprite_source(facility, sprite)),
                 ..Default::default()
             },
@@ -5610,6 +6876,11 @@ impl App {
                             let valid = shaft.is_some_and(|shaft| {
                                 shaft.cars.len() < simtower_core::MAX_ELEVATOR_CARS
                                     && self.tower.cash() >= elevator_car_cost(kind)
+                                    && self.traffic.elevator_can_stop_at(
+                                        &self.tower,
+                                        shaft.id,
+                                        position.floor,
+                                    )
                             });
                             (facility.position, valid)
                         })
@@ -5622,11 +6893,21 @@ impl App {
                         valid,
                     )
                 } else {
+                    let preview_stories =
+                        vertical_walkway_story_span_at(kind, position, self.tower.facilities());
+                    let starts_invalid_elevator = is_elevator_kind(kind)
+                        && self.traffic.elevator_at(kind, position.x).is_none()
+                        && !elevator_landing_is_valid(
+                            kind,
+                            position.x,
+                            position.floor,
+                            self.tower.facilities(),
+                        );
                     (
                         position,
                         f32::from(kind.spec().width) * CELL_WIDTH,
-                        f32::from(kind.spec().height) * FLOOR_HEIGHT,
-                        self.tower.can_place(kind, position).is_ok(),
+                        f32::from(preview_stories) * FLOOR_HEIGHT,
+                        self.tower.can_place(kind, position).is_ok() && !starts_invalid_elevator,
                     )
                 }
             }
@@ -5706,7 +6987,7 @@ impl App {
     }
 
     fn draw_people(&self) {
-        let destination_kinds = self
+        let facility_kinds = self
             .tower
             .facilities()
             .iter()
@@ -5766,6 +7047,18 @@ impl App {
                 ),
                 PersonMood::Angry => Color::from_rgba(255, 35, 35, 255),
             };
+            if self
+                .vip_visit
+                .is_some_and(|visit| visit.person_id == person.id)
+            {
+                draw_triangle(
+                    vec2(x + 4.0, y - 5.0),
+                    vec2(x + 1.0, y - 10.0),
+                    vec2(x + 7.0, y - 10.0),
+                    YELLOW,
+                );
+                draw_circle_lines(x + 4.0, y + 11.0, 7.0, 1.0, YELLOW);
+            }
             if matches!(person.activity, PersonActivity::WaitingForElevator { .. }) {
                 self.draw_queue_person(person.mood, person.id, x, y);
                 continue;
@@ -5774,10 +7067,9 @@ impl App {
                 self.draw_silhouette_person(person.id, x, y);
                 continue;
             }
-            let destination_kind = destination_kinds
-                .get(&person.destination_facility_id)
-                .copied();
-            let sheet = person_sprite_sheet(destination_kind, person.id);
+            let destination_kind = facility_kinds.get(&person.destination_facility_id).copied();
+            let home_kind = facility_kinds.get(&person.home_facility_id).copied();
+            let sheet = traveler_sprite_sheet(person.role, home_kind, destination_kind, person.id);
             let pair_count = (self.assets.people[sheet].width() as u64 / 16).max(1);
             let pair = (person.id % pair_count) * 2;
             if matches!(
@@ -5827,45 +7119,16 @@ impl App {
         if self.view_mode == ViewMode::Edit {
             return;
         }
+        let evaluation =
+            (self.view_mode == ViewMode::Evaluation).then(|| self.tenant_evaluation_context());
         for facility in self
             .tower
             .facilities()
             .iter()
             .filter(|facility| self.facility_is_visible(facility))
         {
-            let color = match self.view_mode {
-                ViewMode::Edit => continue,
-                ViewMode::Evaluation => match self.facility_crowd(facility) {
-                    FacilityCrowd::Closed => Color::from_rgba(110, 115, 120, 255),
-                    FacilityCrowd::Empty => Color::from_rgba(220, 45, 45, 255),
-                    FacilityCrowd::Light => Color::from_rgba(235, 196, 35, 255),
-                    FacilityCrowd::Heavy => Color::from_rgba(45, 105, 225, 255),
-                },
-                ViewMode::Pricing => {
-                    if !facility.kind.has_tenant_occupancy() {
-                        continue;
-                    }
-                    match facility.price_level {
-                        0 => Color::from_rgba(45, 105, 225, 255),
-                        1 => Color::from_rgba(235, 196, 35, 255),
-                        2 => Color::from_rgba(235, 125, 35, 255),
-                        _ => Color::from_rgba(220, 45, 45, 255),
-                    }
-                }
-                ViewMode::Hotel => {
-                    if !is_hotel_room(facility.kind) {
-                        continue;
-                    }
-                    if facility.is_hotel_infested() {
-                        Color::from_rgba(35, 25, 20, 255)
-                    } else if facility.is_hotel_dirty() {
-                        Color::from_rgba(220, 45, 45, 255)
-                    } else if facility.is_occupied() {
-                        Color::from_rgba(45, 105, 225, 255)
-                    } else {
-                        Color::from_rgba(110, 115, 120, 255)
-                    }
-                }
+            let Some(color) = self.facility_mode_color(facility, evaluation.as_ref()) else {
+                continue;
             };
             let width = f32::from(facility.kind.spec().width) * CELL_WIDTH;
             let height = f32::from(facility.kind.spec().height) * FLOOR_HEIGHT;
@@ -5874,6 +7137,297 @@ impl App {
             draw_rectangle(x, y, width, height, with_alpha(color, 0.16));
             draw_rectangle_lines(x, y, width, height, 2.0, color);
         }
+    }
+
+    fn facility_mode_color(
+        &self,
+        facility: &Facility,
+        evaluation: Option<&TenantEvaluationContext>,
+    ) -> Option<Color> {
+        match self.view_mode {
+            ViewMode::Edit => None,
+            ViewMode::Evaluation if facility.kind.has_tenant_occupancy() => Some(match evaluation
+                .map_or_else(
+                    || self.tenant_evaluation_score(facility),
+                    |context| self.tenant_evaluation_score_with_context(facility, context),
+                ) {
+                70..=100 => Color::from_rgba(45, 105, 225, 255),
+                40..=69 => Color::from_rgba(235, 196, 35, 255),
+                _ => Color::from_rgba(220, 45, 45, 255),
+            }),
+            ViewMode::Evaluation => None,
+            ViewMode::Pricing if facility.kind.has_tenant_occupancy() => {
+                Some(match facility.price_level {
+                    0 => Color::from_rgba(45, 105, 225, 255),
+                    1 => Color::from_rgba(235, 196, 35, 255),
+                    2 => Color::from_rgba(235, 125, 35, 255),
+                    _ => Color::from_rgba(220, 45, 45, 255),
+                })
+            }
+            ViewMode::Pricing => None,
+            ViewMode::Hotel if is_hotel_room(facility.kind) => {
+                Some(if facility.is_hotel_infested() {
+                    Color::from_rgba(35, 25, 20, 255)
+                } else if facility.is_hotel_dirty() {
+                    Color::from_rgba(220, 45, 45, 255)
+                } else if facility.is_occupied() {
+                    Color::from_rgba(45, 105, 225, 255)
+                } else {
+                    Color::from_rgba(110, 115, 120, 255)
+                })
+            }
+            ViewMode::Hotel => None,
+        }
+    }
+
+    fn tenant_evaluation_score(&self, facility: &Facility) -> u8 {
+        let context = self.tenant_evaluation_context();
+        self.tenant_evaluation_score_with_context(facility, &context)
+    }
+
+    fn tenant_evaluation_context(&self) -> TenantEvaluationContext {
+        let mut mood_penalties = HashMap::new();
+        for person in self.traffic.people() {
+            *mood_penalties
+                .entry(person.destination_facility_id)
+                .or_insert(0) += match person.mood {
+                PersonMood::Calm => 0,
+                PersonMood::Concerned => 6,
+                PersonMood::Angry => 14,
+            };
+        }
+        let noisy_sources = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| {
+                matches!(
+                    facility.kind,
+                    FacilityKind::Cinema
+                        | FacilityKind::PartyHall
+                        | FacilityKind::Metro
+                        | FacilityKind::Recycling
+                )
+            })
+            .map(|facility| (i32::from(facility.position.x), facility.position.floor))
+            .collect();
+        let recycling_capacity = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Recycling)
+            .count()
+            * 2_500;
+        TenantEvaluationContext {
+            mood_penalties,
+            noisy_sources,
+            recycling_capacity,
+        }
+    }
+
+    fn tenant_evaluation_score_with_context(
+        &self,
+        facility: &Facility,
+        context: &TenantEvaluationContext,
+    ) -> u8 {
+        if facility.is_burned()
+            || facility.is_hotel_infested()
+            || facility.is_hotel_dirty()
+            || !facility.is_occupied()
+            || !self.traffic.reachable_facility_set().contains(&facility.id)
+        {
+            return 0;
+        }
+
+        let mut score = 80_i32;
+        score += match facility.price_level {
+            0 => 10,
+            1 => 0,
+            2 => -12,
+            _ => -28,
+        };
+        score -= context
+            .mood_penalties
+            .get(&facility.id)
+            .copied()
+            .unwrap_or(0);
+
+        let center = i32::from(facility.position.x) + i32::from(facility.kind.spec().width) / 2;
+        let noisy_neighbor = context.noisy_sources.iter().any(|(x, floor)| {
+            (*floor - facility.position.floor).abs() <= 1 && (*x - center).abs() <= 24
+        });
+        if noisy_neighbor {
+            score -= 18;
+        }
+
+        if self.cached_population as usize > context.recycling_capacity {
+            score -= 25;
+        }
+
+        score -= i32::from(
+            self.traffic
+                .access_distance_penalty(&self.tower, facility.id),
+        );
+
+        if facility.kind == FacilityKind::HotelSuite && self.parking_state.connected.is_empty() {
+            score -= 20;
+        }
+
+        if matches!(
+            facility.kind,
+            FacilityKind::Restaurant
+                | FacilityKind::FastFood
+                | FacilityKind::Shop
+                | FacilityKind::Cinema
+                | FacilityKind::PartyHall
+        ) {
+            let capacity = facility.kind.population_capacity().max(1);
+            let patronage = self.economic_patronage(facility, true);
+            if patronage.saturating_mul(100) / capacity < 20 {
+                score -= 25;
+            }
+        }
+        score.clamp(0, 100) as u8
+    }
+
+    fn apply_quarterly_evaluation(&mut self) -> usize {
+        let day = self.tower.clock.day;
+        let evaluation = self.tenant_evaluation_context();
+        let vacancies = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| {
+                facility.kind.has_tenant_occupancy()
+                    && !is_hotel_room(facility.kind)
+                    && facility.is_occupied()
+                    && self.tenant_evaluation_score_with_context(facility, &evaluation) < 25
+                    && (facility.id + u64::from(day)).is_multiple_of(3)
+            })
+            .map(|facility| facility.id)
+            .collect::<Vec<_>>();
+        for facility_id in &vacancies {
+            self.tower.vacate_tenant(*facility_id, 12 * 60);
+            self.traffic.evacuate_facility(*facility_id);
+        }
+        vacancies.len()
+    }
+
+    fn draw_tower_overview(&self) {
+        let panel = overview_panel_rect();
+        draw_classic_panel(panel);
+        draw_rectangle(
+            panel.x + 3.0,
+            panel.y + 3.0,
+            panel.w - 6.0,
+            21.0,
+            TITLE_BLUE,
+        );
+        draw_text("TOWER OVERVIEW", panel.x + 8.0, panel.y + 18.0, 13.0, WHITE);
+        for (index, label) in MODE_MENU_LABELS.iter().enumerate() {
+            let tab = overview_tab_rect(index);
+            let selected = self.view_mode.menu_index() == index;
+            draw_classic_button(tab, selected);
+            draw_centered_text(label, tab.x + tab.w * 0.5, tab.y + 16.0, 11, BLACK);
+        }
+
+        let map = overview_map_rect();
+        draw_rectangle(
+            map.x,
+            map.y,
+            map.w,
+            map.h,
+            Color::from_rgba(65, 178, 226, 255),
+        );
+        let x_scale = map.w / f32::from(self.tower.width());
+        let floor_count = (simtower_core::floor_ordinal(MAX_FLOOR)
+            - simtower_core::floor_ordinal(MIN_FLOOR)
+            + 1) as f32;
+        let y_scale = map.h / floor_count;
+        let top_ordinal = simtower_core::floor_ordinal(MAX_FLOOR);
+        for floor in self.tower.floors() {
+            let x = map.x + f32::from(floor.x) * x_scale;
+            let y = map.y
+                + f32::from(top_ordinal - simtower_core::floor_ordinal(floor.floor)) * y_scale;
+            draw_rectangle(
+                x,
+                y,
+                x_scale.max(1.0),
+                y_scale.max(1.0),
+                Color::from_rgba(38, 55, 61, 255),
+            );
+        }
+        let evaluation =
+            (self.view_mode == ViewMode::Evaluation).then(|| self.tenant_evaluation_context());
+        for facility in self.tower.facilities() {
+            let Some(color) = self.facility_mode_color(facility, evaluation.as_ref()) else {
+                continue;
+            };
+            let x = map.x + f32::from(facility.position.x) * x_scale;
+            let top = simtower_core::floor_ordinal(facility.position.floor)
+                + i16::try_from(facility.height()).unwrap_or(1)
+                - 1;
+            let y = map.y + f32::from(top_ordinal - top) * y_scale;
+            draw_rectangle(
+                x,
+                y,
+                (f32::from(facility.kind.spec().width) * x_scale).max(1.0),
+                (f32::from(facility.height()) * y_scale).max(1.0),
+                color,
+            );
+        }
+
+        let visible_columns = screen_width() / CELL_WIDTH;
+        let visible_floors = (screen_height() - TOPBAR_HEIGHT) / FLOOR_HEIGHT;
+        let viewport = Rect::new(
+            map.x + self.camera_x * x_scale,
+            map.y
+                + f32::from(
+                    top_ordinal - simtower_core::floor_ordinal(self.camera_floor.round() as i16),
+                ) * y_scale
+                - visible_floors * y_scale * 0.7,
+            (visible_columns * x_scale).min(map.w),
+            (visible_floors * y_scale).min(map.h),
+        );
+        draw_rectangle_lines(viewport.x, viewport.y, viewport.w, viewport.h, 1.0, WHITE);
+        draw_rectangle_lines(map.x, map.y, map.w, map.h, 1.0, CLASSIC_DARK);
+
+        let legend_y = panel.y + panel.h - 19.0;
+        for (index, (label, color)) in [
+            ("Good", Color::from_rgba(45, 105, 225, 255)),
+            ("Average", Color::from_rgba(235, 196, 35, 255)),
+            ("Poor", Color::from_rgba(220, 45, 45, 255)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let x = panel.x + 8.0 + index as f32 * 74.0;
+            draw_rectangle(x, legend_y - 9.0, 9.0, 9.0, *color);
+            draw_text(label, x + 12.0, legend_y, 10.0, BLACK);
+        }
+    }
+
+    fn handle_overview_click(&mut self, point: Vec2) {
+        for index in 0..MODE_MENU_LABELS.len() {
+            if overview_tab_rect(index).contains(point)
+                && let Some(mode) = ViewMode::from_menu_index(index)
+            {
+                self.select_view_mode(mode);
+                return;
+            }
+        }
+        let map = overview_map_rect();
+        if !map.contains(point) {
+            return;
+        }
+        let x_fraction = ((point.x - map.x) / map.w).clamp(0.0, 1.0);
+        self.camera_x = (x_fraction * f32::from(self.tower.width())
+            - screen_width() / CELL_WIDTH * 0.5)
+            .clamp(0.0, f32::from(self.tower.width()) - 1.0);
+        let top = f32::from(simtower_core::floor_ordinal(MAX_FLOOR));
+        let bottom = f32::from(simtower_core::floor_ordinal(MIN_FLOOR));
+        let ordinal = top - ((point.y - map.y) / map.h).clamp(0.0, 1.0) * (top - bottom);
+        self.camera_floor = f32::from(simtower_core::floor_from_ordinal(ordinal.round() as i16));
     }
 
     fn draw_person_frame(&self, sheet: usize, frame: u64, x: f32, y: f32, tint: Color) {
@@ -5926,7 +7480,7 @@ impl App {
     }
 
     fn draw_silhouette_person(&self, id: u64, x: f32, y: f32) {
-        let sheet = usize::from(id % 11 == 0);
+        let sheet = usize::from(id.is_multiple_of(11));
         let texture = &self.assets.people_silhouette[sheet];
         let frame_count = (texture.width() as u64 / 16).max(1);
         let frame = (id % frame_count) as f32;
@@ -6541,9 +8095,28 @@ impl App {
         draw_classic_button(sound_button, false);
         draw_sound_icon(sound_button, self.assets.sounds.is_muted());
         let rating = self.star_rating();
-        for star in 0..5 {
-            let rect = rating_star_rect(star);
-            draw_scalable_star(rect, star < usize::from(rating));
+        if rating >= 6 {
+            let row = rating_row_rect();
+            let source_width = self.assets.tower_logo.width();
+            let source_height = self.assets.tower_logo.height();
+            let scale = (row.h / source_height).min(row.w / source_width);
+            let width = source_width * scale;
+            let height = source_height * scale;
+            draw_texture_ex(
+                &self.assets.tower_logo,
+                row.x + (row.w - width) * 0.5,
+                row.y + (row.h - height) * 0.5,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(width, height)),
+                    ..Default::default()
+                },
+            );
+        } else {
+            for star in 0..5 {
+                let rect = rating_star_rect(star);
+                draw_scalable_star(rect, star < usize::from(rating));
+            }
         }
         let star_row = rating_row_rect();
         let controls_right = star_row.x + star_row.w;
@@ -6601,7 +8174,9 @@ impl App {
         );
 
         let mouse = ui_mouse_position();
-        if let Some(star) = (0..5).find(|star| rating_star_rect(*star).contains(mouse)) {
+        if rating < 6
+            && let Some(star) = (0..5).find(|star| rating_star_rect(*star).contains(mouse))
+        {
             self.draw_star_tooltip(star + 1, rating_star_rect(star).x, 31.0);
         }
     }
@@ -6725,7 +8300,7 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("Tower.smtower");
             draw_text(
-                &format!("{filename} already exists."),
+                format!("{filename} already exists."),
                 rect.x + 20.0,
                 rect.y + 58.0,
                 15.0,
@@ -6947,12 +8522,18 @@ impl App {
             } else {
                 &self.assets.tool_palette
             };
-            draw_atlas_icon(
+            draw_atlas_icon_with_padding(
                 icon_palette,
                 entry.atlas_column,
                 entry.atlas_row,
-                Rect::new(row.x + 2.0, row.y + 2.0, 24.0, 24.0),
+                Rect::new(
+                    row.x + 1.0,
+                    row.y + 1.0,
+                    SUBMENU_ICON_SIZE,
+                    SUBMENU_ICON_SIZE,
+                ),
                 WHITE,
+                SUBMENU_ICON_PADDING,
             );
             let color = if entry.is_available(rating) {
                 if hovered { WHITE } else { BLACK }
@@ -7349,27 +8930,19 @@ fn facility_crowd_level(
     }
 }
 
-const fn settled_commercial_patronage(kind: FacilityKind, weekend: bool) -> u32 {
-    match kind {
-        FacilityKind::FastFood => {
-            if weekend {
-                48
-            } else {
-                35
-            }
-        }
-        FacilityKind::Shop => {
-            if weekend {
-                30
-            } else {
-                25
-            }
-        }
-        FacilityKind::Restaurant => 35,
-        FacilityKind::Cinema => 120,
-        FacilityKind::PartyHall => 50,
-        _ => 0,
-    }
+const fn has_dedicated_patronage(kind: FacilityKind) -> bool {
+    matches!(
+        kind,
+        FacilityKind::FastFood
+            | FacilityKind::Restaurant
+            | FacilityKind::Shop
+            | FacilityKind::Cinema
+            | FacilityKind::PartyHall
+    )
+}
+
+const fn has_independent_population(kind: FacilityKind) -> bool {
+    matches!(kind, FacilityKind::Condo) || has_dedicated_patronage(kind)
 }
 
 fn facility_light_tint(kind: FacilityKind, crowd: FacilityCrowd) -> Color {
@@ -7396,6 +8969,26 @@ const fn person_sprite_sheet(destination: Option<FacilityKind>, person_id: u64) 
         Some(FacilityKind::Shop | FacilityKind::Restaurant | FacilityKind::Cinema) => 5,
         Some(FacilityKind::Housekeeping | FacilityKind::Recycling) => 6,
         _ => (person_id as usize % 2) * 5,
+    }
+}
+
+const fn traveler_sprite_sheet(
+    role: PersonRole,
+    home: Option<FacilityKind>,
+    destination: Option<FacilityKind>,
+    person_id: u64,
+) -> usize {
+    match role {
+        PersonRole::Salesman | PersonRole::Homebody => 0,
+        PersonRole::Woman | PersonRole::WomanWithChild => 5,
+        PersonRole::Child => 6,
+        PersonRole::Security => 2,
+        // Sheet 1513 contains the original housekeeping/room-service
+        // figures. Sheet 1518 is the child sheet and was previously selected
+        // here by mistake.
+        PersonRole::Housekeeper => 1,
+        PersonRole::Visitor if matches!(home, Some(FacilityKind::Housekeeping)) => 1,
+        PersonRole::Visitor => person_sprite_sheet(destination, person_id),
     }
 }
 
@@ -7507,7 +9100,7 @@ fn seasonal_event_for_system_date() -> Option<SeasonalEventKind> {
 }
 
 const fn weather_is_raining(day: u32) -> bool {
-    day % 5 == 0 || day % 7 == 3
+    day.is_multiple_of(5) || day % 7 == 3
 }
 
 fn rain_palette_index(minute_of_day: u16) -> usize {
@@ -7838,6 +9431,51 @@ fn game_menu_action_at(point: Vec2) -> Option<GameMenuAction> {
         .map(|(_, (action, _))| *action)
 }
 
+fn title_screen_transform(viewport: Vec2) -> (f32, Vec2) {
+    let scale = (viewport.x / TITLE_SCREEN_WIDTH)
+        .min(viewport.y / TITLE_SCREEN_HEIGHT)
+        .max(0.01);
+    let size = vec2(TITLE_SCREEN_WIDTH, TITLE_SCREEN_HEIGHT) * scale;
+    (scale, (viewport - size) * 0.5)
+}
+
+fn title_screen_rect(viewport: Vec2, source: Rect) -> Rect {
+    let (scale, origin) = title_screen_transform(viewport);
+    Rect::new(
+        origin.x + source.x * scale,
+        origin.y + source.y * scale,
+        source.w * scale,
+        source.h * scale,
+    )
+}
+
+fn welcome_dialog_rect(viewport: Vec2) -> Rect {
+    // Measured from the original 640x480 Windows title screen. Keeping this
+    // tied to the storefront canvas preserves its placement over the doors.
+    title_screen_rect(viewport, Rect::new(190.0, 182.0, 264.0, 119.0))
+}
+
+fn welcome_button_rect(viewport: Vec2, index: usize) -> Rect {
+    let source = match index {
+        0 => Rect::new(207.0, 192.0, 230.0, 27.0),
+        1 => Rect::new(207.0, 228.0, 230.0, 27.0),
+        _ => Rect::new(281.0, 264.0, 82.0, 27.0),
+    };
+    title_screen_rect(viewport, source)
+}
+
+fn welcome_action_index_at(viewport: Vec2, point: Vec2) -> Option<usize> {
+    WELCOME_ACTIONS
+        .iter()
+        .enumerate()
+        .find(|(index, _)| welcome_button_rect(viewport, *index).contains(point))
+        .map(|(index, _)| index)
+}
+
+fn welcome_action_at(viewport: Vec2, point: Vec2) -> Option<WelcomeAction> {
+    welcome_action_index_at(viewport, point).map(|index| WELCOME_ACTIONS[index].0)
+}
+
 fn ux_scale_menu_rect() -> Rect {
     let parent = game_menu_entry_rect(4);
     Rect::new(
@@ -7892,8 +9530,59 @@ fn ui_screen_height() -> f32 {
     screen_height() / active_ux_scale().factor()
 }
 
+fn ui_text_rasterization(font_size: f32, scale: f32) -> (u16, f32) {
+    let logical_size = font_size.max(1.0);
+    let raster_size = (logical_size * scale.max(1.0))
+        .round()
+        .clamp(1.0, u16::MAX as f32) as u16;
+    (raster_size, logical_size / f32::from(raster_size))
+}
+
+/// Macroquad's ordinary text helper rasterizes glyphs at their logical size.
+/// Enlarging those cached glyph quads with the UX camera loses most of the
+/// thin strokes on high-DPI displays. Rasterize at the final UX density and
+/// counter-scale the quad so its logical measurements remain unchanged.
+fn draw_text(
+    text: impl AsRef<str>,
+    x: f32,
+    y: f32,
+    font_size: f32,
+    color: Color,
+) -> TextDimensions {
+    if !UI_CAMERA_ACTIVE.load(Ordering::Relaxed) {
+        return macroquad::text::draw_text(text, x, y, font_size, color);
+    }
+    let (raster_size, font_scale) = ui_text_rasterization(font_size, active_ux_scale().factor());
+    macroquad::text::draw_text_ex(
+        text,
+        x,
+        y,
+        TextParams {
+            font_size: raster_size,
+            font_scale,
+            color,
+            ..Default::default()
+        },
+    )
+}
+
+fn measure_text(
+    text: &str,
+    font: Option<&Font>,
+    font_size: u16,
+    font_scale: f32,
+) -> TextDimensions {
+    if !UI_CAMERA_ACTIVE.load(Ordering::Relaxed) {
+        return macroquad::text::measure_text(text, font, font_size, font_scale);
+    }
+    let (raster_size, density_scale) =
+        ui_text_rasterization(f32::from(font_size), active_ux_scale().factor());
+    macroquad::text::measure_text(text, font, raster_size, font_scale * density_scale)
+}
+
 fn begin_ui_camera(scale: UxScale) {
     set_active_ux_scale(scale);
+    UI_CAMERA_ACTIVE.store(true, Ordering::Relaxed);
     let width = ui_screen_width();
     let height = ui_screen_height();
     // Camera2D's onscreen matrix applies its own Y inversion. A positive Y
@@ -8009,6 +9698,10 @@ fn save_default_name_for_path(path: &Path) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(DEFAULT_SAVE_NAME)
         .to_owned()
+}
+
+fn discard_queued_text_input() {
+    while get_char_pressed().is_some() {}
 }
 
 fn key_for_text_character(character: char) -> Option<KeyCode> {
@@ -8350,19 +10043,81 @@ fn draw_recessed_field(rect: Rect) {
     );
 }
 
-fn draw_tenant_people_meter(rect: Rect, people_icons: u32) {
-    let count = people_icons.min(30) as usize;
-    let spacing = ((rect.w - 16.0) / 30.0).max(6.0);
-    for index in 0..count {
-        let x = rect.x + 9.0 + index as f32 * spacing;
-        let y = rect.y + 11.0;
-        draw_circle(x, y, 2.2, BLACK);
-        draw_line(x, y + 2.0, x, y + 13.0, 2.0, BLACK);
-        draw_line(x, y + 5.0, x - 3.0, y + 10.0, 1.5, BLACK);
-        draw_line(x, y + 5.0, x + 3.0, y + 10.0, 1.5, BLACK);
-        draw_line(x, y + 13.0, x - 3.0, y + 20.0, 1.5, BLACK);
-        draw_line(x, y + 13.0, x + 3.0, y + 20.0, 1.5, BLACK);
+fn draw_tenant_people_meter(texture: &Texture2D, rect: Rect, people_icons: u32) {
+    let Some((source, destination)) =
+        tenant_people_strip_layout(rect, people_icons, texture.width())
+    else {
+        return;
+    };
+    draw_texture_ex(
+        texture,
+        destination.x,
+        destination.y,
+        WHITE,
+        DrawTextureParams {
+            source: Some(source),
+            dest_size: Some(vec2(destination.w, destination.h)),
+            ..Default::default()
+        },
+    );
+}
+
+fn draw_condo_family_meter(people: &[Texture2D; 7], rect: Rect) {
+    // The original condo panel depicts the household as individual black
+    // person cels, including the shorter child figure. Reuse the walking
+    // sheets themselves and tint them black so the panel and tower always
+    // agree about which roles make up the family.
+    let sheets = [0_usize, 5, 6];
+    let size = vec2(10.0, 30.0);
+    for (index, sheet) in sheets.into_iter().enumerate() {
+        draw_texture_ex(
+            &people[sheet],
+            rect.x + 8.0 + index as f32 * 13.0,
+            (rect.y + (rect.h - size.y) * 0.5).round(),
+            BLACK,
+            DrawTextureParams {
+                source: Some(Rect::new(0.0, 0.0, 8.0, PERSON_SPRITE_HEIGHT)),
+                dest_size: Some(size),
+                ..Default::default()
+            },
+        );
     }
+}
+
+fn draw_person_status_meter(rect: Rect, fraction: f32, color: Color, segmented: bool) {
+    draw_recessed_field(rect);
+    let inner = Rect::new(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, rect.h - 6.0);
+    let filled_width = (inner.w * fraction.clamp(0.0, 1.0)).round();
+    if filled_width > 0.0 {
+        draw_rectangle(inner.x, inner.y, filled_width, inner.h, color);
+    }
+    if segmented {
+        for segment in 1..3 {
+            let x = (inner.x + inner.w * segment as f32 / 3.0).round();
+            draw_line(x, inner.y, x, inner.y + inner.h, 1.0, CLASSIC_DARK);
+        }
+    }
+}
+
+fn tenant_people_strip_layout(
+    rect: Rect,
+    people_icons: u32,
+    texture_width: f32,
+) -> Option<(Rect, Rect)> {
+    let count = people_icons.min(30);
+    if count == 0 || texture_width <= 0.0 {
+        return None;
+    }
+    let source = Rect::new(0.0, 0.0, (count as f32 * 16.0).min(texture_width), 36.0);
+    let scale = (30.0 / source.h).min((rect.w - 16.0).max(1.0) / source.w);
+    let size = vec2(source.w * scale, source.h * scale);
+    let destination = Rect::new(
+        rect.x + 8.0,
+        (rect.y + (rect.h - size.y) * 0.5).round(),
+        size.x,
+        size.y,
+    );
+    Some((source, destination))
 }
 
 fn draw_menu_checkmark(row: Rect, color: Color) {
@@ -8613,6 +10368,120 @@ fn draw_classic_button(rect: Rect, pressed: bool) {
     );
 }
 
+fn draw_title_screen_panel(rect: Rect, scale: f32) {
+    let edge = scale.max(1.0);
+    let shadow = 4.0 * scale;
+    draw_rectangle(
+        rect.x + shadow,
+        rect.y + shadow,
+        rect.w,
+        rect.h,
+        Color::from_rgba(70, 70, 70, 190),
+    );
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, CLASSIC_FACE);
+    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, edge, CLASSIC_DARK);
+    draw_line(
+        rect.x + edge,
+        rect.y + edge,
+        rect.x + rect.w - edge,
+        rect.y + edge,
+        edge,
+        CLASSIC_LIGHT,
+    );
+    draw_line(
+        rect.x + edge,
+        rect.y + edge,
+        rect.x + edge,
+        rect.y + rect.h - edge,
+        edge,
+        CLASSIC_LIGHT,
+    );
+    draw_line(
+        rect.x + edge,
+        rect.y + rect.h - edge,
+        rect.x + rect.w - edge,
+        rect.y + rect.h - edge,
+        edge,
+        CLASSIC_SHADOW,
+    );
+    draw_line(
+        rect.x + rect.w - edge,
+        rect.y + edge,
+        rect.x + rect.w - edge,
+        rect.y + rect.h - edge,
+        edge,
+        CLASSIC_SHADOW,
+    );
+}
+
+fn draw_title_screen_button(rect: Rect, scale: f32, pressed: bool, focused: bool) {
+    let edge = scale.max(1.0);
+    draw_rectangle(rect.x, rect.y, rect.w, rect.h, CLASSIC_FACE);
+    draw_rectangle_lines(rect.x, rect.y, rect.w, rect.h, edge, CLASSIC_DARK);
+    let (top_left, bottom_right) = if pressed {
+        (CLASSIC_SHADOW, CLASSIC_LIGHT)
+    } else {
+        (CLASSIC_LIGHT, CLASSIC_SHADOW)
+    };
+    draw_line(
+        rect.x + edge,
+        rect.y + edge,
+        rect.x + rect.w - edge,
+        rect.y + edge,
+        edge,
+        top_left,
+    );
+    draw_line(
+        rect.x + edge,
+        rect.y + edge,
+        rect.x + edge,
+        rect.y + rect.h - edge,
+        edge,
+        top_left,
+    );
+    draw_line(
+        rect.x + edge,
+        rect.y + rect.h - edge,
+        rect.x + rect.w - edge,
+        rect.y + rect.h - edge,
+        edge,
+        bottom_right,
+    );
+    draw_line(
+        rect.x + rect.w - edge,
+        rect.y + edge,
+        rect.x + rect.w - edge,
+        rect.y + rect.h - edge,
+        edge,
+        bottom_right,
+    );
+    if focused {
+        draw_title_screen_focus_rect(rect, scale);
+    }
+}
+
+fn draw_title_screen_focus_rect(rect: Rect, scale: f32) {
+    let dot = scale.max(1.0);
+    let step = dot * 2.0;
+    let inset = 4.0 * scale;
+    let left = rect.x + inset;
+    let right = rect.x + rect.w - inset;
+    let top = rect.y + inset;
+    let bottom = rect.y + rect.h - inset;
+    let mut x = left;
+    while x <= right - dot {
+        draw_rectangle(x, top, dot, dot, CLASSIC_DARK);
+        draw_rectangle(x, bottom - dot, dot, dot, CLASSIC_DARK);
+        x += step;
+    }
+    let mut y = top + step;
+    while y <= bottom - dot - step {
+        draw_rectangle(left, y, dot, dot, CLASSIC_DARK);
+        draw_rectangle(right - dot, y, dot, dot, CLASSIC_DARK);
+        y += step;
+    }
+}
+
 fn elevator_panel_rect() -> Rect {
     let width = 280.0;
     let height = 465.0_f32.min(ui_screen_height() - TOPBAR_HEIGHT - 20.0);
@@ -8661,6 +10530,32 @@ fn tenant_info_ok_rect() -> Rect {
     )
 }
 
+fn person_info_rect() -> Rect {
+    let width = 340.0_f32.min(ui_screen_width() - 20.0);
+    let height = 218.0_f32.min(ui_screen_height() - TOPBAR_HEIGHT - 16.0);
+    Rect::new(
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        width,
+        height,
+    )
+}
+
+fn person_info_rename_rect() -> Rect {
+    let panel = person_info_rect();
+    Rect::new(panel.x + 28.0, panel.y + panel.h - 43.0, 90.0, 27.0)
+}
+
+fn person_info_ok_rect() -> Rect {
+    let panel = person_info_rect();
+    Rect::new(
+        panel.x + panel.w - 118.0,
+        panel.y + panel.h - 43.0,
+        90.0,
+        27.0,
+    )
+}
+
 fn finance_ok_rect() -> Rect {
     let panel = finance_panel_rect();
     Rect::new(panel.x + 130.0, panel.y + 326.0, 94.0, 23.0)
@@ -8677,6 +10572,36 @@ fn promotion_dialog_rect() -> Rect {
     )
 }
 
+fn overview_panel_rect() -> Rect {
+    Rect::new(
+        10.0,
+        TOPBAR_HEIGHT + 10.0,
+        OVERVIEW_PANEL_WIDTH,
+        OVERVIEW_PANEL_HEIGHT.min(ui_screen_height() - TOPBAR_HEIGHT - 20.0),
+    )
+}
+
+fn overview_tab_rect(index: usize) -> Rect {
+    let panel = overview_panel_rect();
+    let width = (panel.w - 8.0) / MODE_MENU_LABELS.len() as f32;
+    Rect::new(
+        panel.x + 4.0 + index as f32 * width,
+        panel.y + 25.0,
+        width,
+        23.0,
+    )
+}
+
+fn overview_map_rect() -> Rect {
+    let panel = overview_panel_rect();
+    Rect::new(
+        panel.x + 7.0,
+        panel.y + 51.0,
+        panel.w - 14.0,
+        panel.h - 78.0,
+    )
+}
+
 fn promotion_ok_rect() -> Rect {
     let panel = promotion_dialog_rect();
     // Offset one pixel left to compensate for the classic button's dark
@@ -8684,6 +10609,27 @@ fn promotion_ok_rect() -> Rect {
     Rect::new(
         panel.x + (panel.w - 96.0) * 0.5 - 1.0,
         panel.y + 128.0,
+        96.0,
+        26.0,
+    )
+}
+
+fn vip_dialog_rect() -> Rect {
+    let width = 540.0;
+    let height = 170.0;
+    Rect::new(
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        width,
+        height,
+    )
+}
+
+fn vip_dialog_ok_rect() -> Rect {
+    let panel = vip_dialog_rect();
+    Rect::new(
+        panel.x + (panel.w - 96.0) * 0.5,
+        panel.y + 132.0,
         96.0,
         26.0,
     )
@@ -8710,12 +10656,34 @@ fn fire_security_button_rect() -> Rect {
     Rect::new(panel.x + 322.0, panel.y + 160.0, 190.0, 30.0)
 }
 
+fn bomb_response_dialog_rect() -> Rect {
+    let width = 570.0;
+    let height = 220.0;
+    Rect::new(
+        (ui_screen_width() - width) * 0.5,
+        ((ui_screen_height() - height) * 0.5).max(TOPBAR_HEIGHT + 8.0),
+        width,
+        height,
+    )
+}
+
+fn bomb_pay_button_rect() -> Rect {
+    let panel = bomb_response_dialog_rect();
+    Rect::new(panel.x + 116.0, panel.y + 172.0, 190.0, 30.0)
+}
+
+fn bomb_search_button_rect() -> Rect {
+    let panel = bomb_response_dialog_rect();
+    Rect::new(panel.x + 322.0, panel.y + 172.0, 220.0, 30.0)
+}
+
 const fn promotion_rating_label(star_rating: u8) -> &'static str {
     match star_rating {
         2 => "Two Star Rating!",
         3 => "Three Star Rating!",
         4 => "Four Star Rating!",
         5 => "Five Star Rating!",
+        6 => "TOWER Rating!",
         _ => "New Star Rating!",
     }
 }
@@ -8759,6 +10727,177 @@ fn format_floor(floor: i16) -> String {
     } else {
         floor.to_string()
     }
+}
+
+fn person_role(person: &Person, tower: &Tower) -> &'static str {
+    let explicit = match person.role {
+        PersonRole::Visitor => None,
+        PersonRole::Salesman => Some("Salesman"),
+        PersonRole::Woman => Some("Woman"),
+        PersonRole::Child => Some("Child"),
+        PersonRole::Security => Some("Security"),
+        PersonRole::WomanWithChild => Some("Woman with Kid"),
+        PersonRole::Homebody => Some("Homebody"),
+        PersonRole::Housekeeper => Some("Housekeeper"),
+    };
+    if let Some(role) = explicit {
+        return role;
+    }
+    let home_kind = tower
+        .facilities()
+        .iter()
+        .find(|facility| facility.id == person.home_facility_id)
+        .map(|facility| facility.kind);
+    let destination_kind = tower
+        .facilities()
+        .iter()
+        .find(|facility| facility.id == person.destination_facility_id)
+        .map(|facility| facility.kind);
+    person_role_for_kinds(home_kind, destination_kind)
+}
+
+const fn person_role_for_kinds(
+    home_kind: Option<FacilityKind>,
+    destination_kind: Option<FacilityKind>,
+) -> &'static str {
+    if matches!(home_kind, Some(FacilityKind::Housekeeping)) {
+        return "Housekeeper";
+    }
+    if matches!(home_kind, Some(FacilityKind::Security)) {
+        return "Security Guard";
+    }
+    match destination_kind {
+        Some(FacilityKind::Office) => "Salesman",
+        Some(FacilityKind::Condo) => "Resident",
+        Some(FacilityKind::HotelSingle | FacilityKind::HotelTwin | FacilityKind::HotelSuite) => {
+            "Hotel Guest"
+        }
+        Some(FacilityKind::Restaurant) => "Diner",
+        Some(FacilityKind::FastFood | FacilityKind::Shop) => "Customer",
+        Some(FacilityKind::Cinema) => "Moviegoer",
+        Some(FacilityKind::PartyHall) => "Party Guest",
+        Some(FacilityKind::Medical) => "Patient",
+        Some(FacilityKind::Cathedral) => "Visitor",
+        _ => "Visitor",
+    }
+}
+
+fn person_trip_labels(person: &Person, tower: &Tower) -> (String, String) {
+    if person.is_returning_home() {
+        (
+            person_place_label(person.destination_facility_id, tower),
+            person_place_label(person.home_facility_id, tower),
+        )
+    } else {
+        (
+            person_place_label(person.home_facility_id, tower),
+            person_place_label(person.destination_facility_id, tower),
+        )
+    }
+}
+
+fn person_place_label(facility_id: u64, tower: &Tower) -> String {
+    if facility_id == 0 {
+        return "Outside".to_owned();
+    }
+    tower
+        .facilities()
+        .iter()
+        .find(|facility| facility.id == facility_id)
+        .map_or_else(
+            || "Outside".to_owned(),
+            |facility| {
+                format!(
+                    "{}, Floor {}",
+                    facility.kind.spec().name,
+                    format_floor(facility.position.floor)
+                )
+            },
+        )
+}
+
+fn elevator_compound_label_backplate(x: f32, y: f32, shaft_width: f32) -> Rect {
+    Rect::new(x + (shaft_width - 32.0) * 0.5, y, 32.0, 36.0)
+}
+
+fn person_stress_fraction(person: &Person) -> f32 {
+    person_stress_for(person.mood, person.wait_seconds)
+}
+
+fn person_stress_for(mood: PersonMood, wait_seconds: f32) -> f32 {
+    let wait_stress = (wait_seconds / 30.0).clamp(0.0, 1.0);
+    match mood {
+        PersonMood::Calm => wait_stress.min(0.32),
+        PersonMood::Concerned => wait_stress.max(0.5),
+        PersonMood::Angry => wait_stress.max(0.82),
+    }
+}
+
+fn person_evaluation_fraction(person: &Person) -> f32 {
+    (1.0 - person_stress_fraction(person) * 0.72).clamp(0.2, 1.0)
+}
+
+fn bomb_search_floor_order(tower: &Tower, security_floor: i16) -> Vec<i16> {
+    let floors = tower
+        .floors()
+        .iter()
+        .map(|position| position.floor)
+        .collect::<Vec<_>>();
+    let mut security_floors = tower
+        .facilities()
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Security)
+        .map(|facility| facility.position.floor)
+        .collect::<Vec<_>>();
+    if security_floors.is_empty() {
+        security_floors.push(security_floor);
+    }
+    bomb_search_floor_order_for_origins(floors, security_floors)
+}
+
+fn bomb_search_floor_order_for_origins(
+    mut floors: Vec<i16>,
+    mut security_floors: Vec<i16>,
+) -> Vec<i16> {
+    floors.sort_unstable();
+    floors.dedup();
+    security_floors.sort_unstable();
+    let mut ordered = Vec::with_capacity(floors.len());
+    while !floors.is_empty() {
+        for _ in 0..BOMB_GUARDS_PER_SECURITY_OFFICE {
+            for security_floor in &security_floors {
+                let origin = simtower_core::floor_ordinal(*security_floor);
+                let Some((index, _)) = floors.iter().enumerate().min_by_key(|(_, floor)| {
+                    let ordinal = simtower_core::floor_ordinal(**floor);
+                    (
+                        (ordinal - origin).unsigned_abs(),
+                        std::cmp::Reverse(ordinal),
+                    )
+                }) else {
+                    return ordered;
+                };
+                ordered.push(floors.remove(index));
+            }
+        }
+    }
+    ordered
+}
+
+fn bomb_security_personnel_count(tower: &Tower) -> usize {
+    tower
+        .facilities()
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Security)
+        .count()
+        .saturating_mul(BOMB_GUARDS_PER_SECURITY_OFFICE)
+        .max(1)
+}
+
+fn bomb_search_completed_floor_count(elapsed: f32, personnel: usize, floor_count: usize) -> usize {
+    let completed_waves = (elapsed / BOMB_SEARCH_SECONDS_PER_FLOOR) as usize;
+    completed_waves
+        .saturating_mul(personnel.max(1))
+        .min(floor_count)
 }
 
 struct TenantInfoDetails {
@@ -9001,13 +11140,27 @@ const fn is_elevator_kind(kind: FacilityKind) -> bool {
 }
 
 fn draw_atlas_icon(texture: &Texture2D, column: u8, row: u8, destination: Rect, tint: Color) {
+    draw_atlas_icon_with_padding(texture, column, row, destination, tint, 3.0);
+}
+
+fn draw_atlas_icon_with_padding(
+    texture: &Texture2D,
+    column: u8,
+    row: u8,
+    destination: Rect,
+    tint: Color,
+    padding: f32,
+) {
     draw_texture_ex(
         texture,
-        destination.x + 3.0,
-        destination.y + 3.0,
+        destination.x + padding,
+        destination.y + padding,
         tint,
         DrawTextureParams {
-            dest_size: Some(vec2(destination.w - 6.0, destination.h - 6.0)),
+            dest_size: Some(vec2(
+                destination.w - padding * 2.0,
+                destination.h - padding * 2.0,
+            )),
             source: Some(Rect::new(
                 f32::from(column) * 32.0 * UI_TEXTURE_SCALE,
                 f32::from(row) * 32.0 * UI_TEXTURE_SCALE,
@@ -9116,16 +11269,16 @@ struct OriginalAssets {
     elevator_cars: Texture2D,
     elevator_shaft: Texture2D,
     elevator_numbers: [Texture2D; 6],
-    _tower_logo: Texture2D,
+    tower_logo: Texture2D,
     finance_dialog: Texture2D,
     fire_large: [Texture2D; 4],
     fire_small: Texture2D,
     fire_helicopter: Texture2D,
     fire_alert: Texture2D,
     fire_aftermath: Texture2D,
-    _terrorist_portrait: Texture2D,
+    terrorist_portrait: Texture2D,
     fire_dispatch: Texture2D,
-    _vip_arrival: Texture2D,
+    vip_arrival: Texture2D,
     recycling_fill: [Texture2D; 5],
     recycling_truck: Texture2D,
     facilities: FacilitySprites,
@@ -9237,8 +11390,8 @@ impl OriginalAssets {
             sky: texture_from_bmp(SKY_BMP)?,
             ground: texture_from_bmp(GROUND_BMP)?,
             intro_store: texture_from_bmp(INTRO_STORE_BMP)?,
-            intro_title: texture_from_bmp_with_white_transparency(INTRO_TITLE_BMP)?,
-            intro_maxis: texture_from_bmp_with_white_transparency(INTRO_MAXIS_BMP)?,
+            intro_title: texture_from_bmp(INTRO_TITLE_BMP)?,
+            intro_maxis: texture_from_bmp(INTRO_MAXIS_BMP)?,
             rain: RAIN_BMPS
                 .map(texture_from_bmp)
                 .into_iter()
@@ -9294,7 +11447,7 @@ impl OriginalAssets {
                 texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[4])?,
                 texture_from_elevator_glyph_bmp(ELEVATOR_NUMBER_BMPS[5])?,
             ],
-            _tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
+            tower_logo: texture_from_bmp_with_white_transparency(TOWER_LOGO_BMP)?,
             finance_dialog: texture_from_bmp_for_ui(FINANCE_DIALOG_BMP)?,
             fire_large: FIRE_LARGE_BMPS
                 .map(texture_from_bmp_with_white_transparency)
@@ -9306,9 +11459,9 @@ impl OriginalAssets {
             fire_helicopter: texture_from_bmp_with_white_transparency(FIRE_HELICOPTER_BMP)?,
             fire_alert: texture_from_bmp_with_white_transparency(FIRE_ALERT_BMP)?,
             fire_aftermath: texture_from_bmp(FIRE_AFTERMATH_BMP)?,
-            _terrorist_portrait: texture_from_bmp_with_white_transparency(TERRORIST_PORTRAIT_BMP)?,
+            terrorist_portrait: texture_from_bmp_with_white_transparency(TERRORIST_PORTRAIT_BMP)?,
             fire_dispatch: texture_from_bmp_with_white_transparency(FIRE_DISPATCH_BMP)?,
-            _vip_arrival: texture_from_bmp_with_white_transparency(VIP_ARRIVAL_BMP)?,
+            vip_arrival: texture_from_bmp_with_white_transparency(VIP_ARRIVAL_BMP)?,
             recycling_fill: [
                 texture_from_bmp_with_white_transparency(RECYCLING_LEVEL_BMPS[1])?,
                 texture_from_bmp_with_white_transparency(RECYCLING_LEVEL_BMPS[2])?,
@@ -10054,10 +12207,15 @@ impl OriginalAssets {
         }
 
         if facility.kind == FacilityKind::Parking {
-            let sprite = &self.facilities.parking[usize::from(visual_load > 0)];
+            let sprite = &self.facilities.parking[usize::from(visual_load != 0)];
             let mut source = sprite.source;
-            if visual_load > 0 {
-                source.x = ((facility.id as usize + visual_load) % 14) as f32 * source.w;
+            if visual_load != 0 {
+                let frame = if visual_load == 14 {
+                    0
+                } else {
+                    visual_load.min(13)
+                };
+                source.x = frame as f32 * source.w;
             }
             return (sprite, source);
         }
@@ -10141,6 +12299,8 @@ impl OriginalAssets {
 }
 
 struct NativeSounds {
+    opening_theme: PathBuf,
+    opening_theme_process: RefCell<Option<Child>>,
     construction: PathBuf,
     lobby_segment: PathBuf,
     demolition: PathBuf,
@@ -10148,10 +12308,15 @@ struct NativeSounds {
     payment: PathBuf,
     fire_alert: PathBuf,
     fire_response: PathBuf,
+    bomb_threat: PathBuf,
+    bomb_armed: PathBuf,
+    bomb_explosion: PathBuf,
     elevator_move: PathBuf,
     elevator_open: [PathBuf; 2],
     escalator_move: PathBuf,
     crowd: PathBuf,
+    parking_arrival: PathBuf,
+    parking_departure: PathBuf,
     muted: Cell<bool>,
 }
 
@@ -10160,6 +12325,7 @@ impl NativeSounds {
         let directory =
             std::env::temp_dir().join(format!("opentower-audio-{}", std::process::id()));
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let opening_theme = directory.join("opening-theme-20000.wav");
         let construction = directory.join(format!("construction-{CONSTRUCTION_SOUND_ID}.wav"));
         let lobby_segment = directory.join(format!("lobby-segment-{LOBBY_SEGMENT_SOUND_ID}.wav"));
         let demolition = directory.join(format!("demolition-{DEMOLITION_SOUND_ID}.wav"));
@@ -10167,11 +12333,18 @@ impl NativeSounds {
         let payment = directory.join(format!("payment-{PAYMENT_SOUND_ID}.wav"));
         let fire_alert = directory.join(format!("fire-alert-{FIRE_ALERT_SOUND_ID}.wav"));
         let fire_response = directory.join(format!("fire-response-{FIRE_RESPONSE_SOUND_ID}.wav"));
+        let bomb_threat = directory.join("bomb-threat-10003.wav");
+        let bomb_armed = directory.join("bomb-armed-10000.wav");
+        let bomb_explosion = directory.join("bomb-explosion-10004.wav");
         let elevator_move = directory.join(format!("elevator-move-{ELEVATOR_MOVE_SOUND_ID}.wav"));
         let elevator_open =
             ELEVATOR_OPEN_SOUND_IDS.map(|id| directory.join(format!("elevator-open-{id}.wav")));
         let escalator_move = directory.join("escalator-move.wav");
         let crowd = directory.join(format!("crowd-{CROWD_SOUND_ID}.wav"));
+        let parking_arrival = directory.join("parking-arrival-1704.wav");
+        let parking_departure = directory.join("parking-departure-1705.wav");
+        std::fs::write(&opening_theme, OPENING_THEME_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
         std::fs::write(&construction, CONSTRUCTION_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
         std::fs::write(&lobby_segment, LOBBY_SEGMENT_WAV.bytes()?)
@@ -10181,6 +12354,11 @@ impl NativeSounds {
         std::fs::write(&payment, PAYMENT_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&fire_alert, FIRE_ALERT_WAV.bytes()?).map_err(|error| error.to_string())?;
         std::fs::write(&fire_response, FIRE_RESPONSE_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&bomb_threat, BOMB_THREAT_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&bomb_armed, BOMB_ARMED_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&bomb_explosion, BOMB_EXPLOSION_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
         std::fs::write(&elevator_move, ELEVATOR_MOVE_WAV.bytes()?)
             .map_err(|error| error.to_string())?;
@@ -10196,7 +12374,13 @@ impl NativeSounds {
         let escalator_bytes = attenuate_unsigned_pcm8_wav(ELEVATOR_MOVE_WAV.bytes()?, 0.28);
         std::fs::write(&escalator_move, escalator_bytes).map_err(|error| error.to_string())?;
         std::fs::write(&crowd, CROWD_1_WAV.bytes()?).map_err(|error| error.to_string())?;
+        std::fs::write(&parking_arrival, PARKING_ARRIVAL_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
+        std::fs::write(&parking_departure, PARKING_DEPARTURE_WAV.bytes()?)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
+            opening_theme,
+            opening_theme_process: RefCell::new(None),
             construction,
             lobby_segment,
             demolition,
@@ -10204,10 +12388,15 @@ impl NativeSounds {
             payment,
             fire_alert,
             fire_response,
+            bomb_threat,
+            bomb_armed,
+            bomb_explosion,
             elevator_move,
             elevator_open,
             escalator_move,
             crowd,
+            parking_arrival,
+            parking_departure,
             muted: Cell::new(false),
         })
     }
@@ -10216,10 +12405,35 @@ impl NativeSounds {
         self.muted.get()
     }
 
+    fn set_muted(&self, muted: bool) {
+        self.muted.set(muted);
+        if muted {
+            self.stop_opening_theme();
+        }
+    }
+
     fn toggle_muted(&self) -> bool {
         let muted = !self.muted.get();
         self.muted.set(muted);
+        if muted {
+            self.stop_opening_theme();
+        }
         muted
+    }
+
+    fn play_opening_theme(&self) {
+        self.stop_opening_theme();
+        if self.is_muted() {
+            return;
+        }
+        *self.opening_theme_process.borrow_mut() = spawn_native_sound(&self.opening_theme);
+    }
+
+    fn stop_opening_theme(&self) {
+        if let Some(mut child) = self.opening_theme_process.borrow_mut().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn play_construction(&self, kind: FacilityKind) {
@@ -10274,6 +12488,24 @@ impl NativeSounds {
         play_native_sound_async(self.fire_response.clone());
     }
 
+    fn play_bomb_threat(&self) {
+        if !self.is_muted() {
+            play_native_sound_async(self.bomb_threat.clone());
+        }
+    }
+
+    fn play_bomb_armed(&self) {
+        if !self.is_muted() {
+            play_native_sound_async(self.bomb_armed.clone());
+        }
+    }
+
+    fn play_bomb_explosion(&self) {
+        if !self.is_muted() {
+            play_native_sound_async(self.bomb_explosion.clone());
+        }
+    }
+
     fn play_elevator_move(&self) {
         if self.is_muted() {
             return;
@@ -10300,6 +12532,24 @@ impl NativeSounds {
             return;
         }
         play_native_sound_async(self.crowd.clone());
+    }
+
+    fn play_parking_arrival(&self) {
+        if !self.is_muted() {
+            play_native_sound_async(self.parking_arrival.clone());
+        }
+    }
+
+    fn play_parking_departure(&self) {
+        if !self.is_muted() {
+            play_native_sound_async(self.parking_departure.clone());
+        }
+    }
+}
+
+impl Drop for NativeSounds {
+    fn drop(&mut self) {
+        self.stop_opening_theme();
     }
 }
 
@@ -10334,37 +12584,39 @@ fn attenuate_unsigned_pcm8_wav(bytes: &[u8], gain: f32) -> Vec<u8> {
 }
 
 #[cfg(target_os = "macos")]
-fn play_native_sound(path: PathBuf) {
-    if let Ok(mut child) = Command::new("afplay").arg(path).spawn() {
-        let _ = child.wait();
-    }
+fn spawn_native_sound(path: &Path) -> Option<Child> {
+    Command::new("afplay").arg(path).spawn().ok()
 }
 
 #[cfg(target_os = "windows")]
-fn play_native_sound(path: PathBuf) {
+fn spawn_native_sound(path: &Path) -> Option<Child> {
     let escaped = path.to_string_lossy().replace('\'', "''");
     let script = format!("(New-Object System.Media.SoundPlayer '{escaped}').PlaySync()");
-    if let Ok(mut child) = hidden_windows_command("powershell")
+    hidden_windows_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .spawn()
-    {
-        let _ = child.wait();
-    }
+        .ok()
 }
 
 #[cfg(target_os = "linux")]
-fn play_native_sound(path: PathBuf) {
-    let child = Command::new("paplay")
-        .arg(&path)
+fn spawn_native_sound(path: &Path) -> Option<Child> {
+    Command::new("paplay")
+        .arg(path)
         .spawn()
         .or_else(|_| Command::new("aplay").arg(path).spawn());
-    if let Ok(mut child) = child {
-        let _ = child.wait();
-    }
+    child.ok()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-fn play_native_sound(_path: PathBuf) {}
+fn spawn_native_sound(_path: &Path) -> Option<Child> {
+    None
+}
+
+fn play_native_sound(path: PathBuf) {
+    if let Some(mut child) = spawn_native_sound(&path) {
+        let _ = child.wait();
+    }
+}
 
 fn facility_sprite_from_bmp(kind: FacilityKind, asset: AssetRef) -> Result<Sprite, String> {
     let resources = facility_resource_ids(kind);
@@ -10438,6 +12690,159 @@ fn facility_variant_index(facility: &Facility, variant_count: usize) -> usize {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     ((value ^ (value >> 31)) % variant_count as u64) as usize
+}
+
+fn connected_parking_spaces(facilities: &[Facility]) -> HashSet<u64> {
+    let mut valid_ramps = HashSet::<(u16, i16)>::new();
+    let mut ramps = facilities
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Ramp && facility.position.floor < 0)
+        .collect::<Vec<_>>();
+    // Validate from B1 downward. A lower ramp only works when every level
+    // above it is present in the same ramp column.
+    ramps.sort_by_key(|ramp| std::cmp::Reverse(ramp.position.floor));
+    for ramp in &ramps {
+        let valid = if ramp.position.floor == -1 {
+            facilities.iter().any(|facility| {
+                facility.kind == FacilityKind::Lobby
+                    && facility.position.floor == 1
+                    && horizontal_ranges_touch(
+                        ramp.position.x,
+                        ramp.end_x(),
+                        facility.position.x,
+                        facility.end_x(),
+                    )
+            })
+        } else {
+            valid_ramps.contains(&(ramp.position.x, ramp.position.floor + 1))
+        };
+        if valid {
+            valid_ramps.insert((ramp.position.x, ramp.position.floor));
+        }
+    }
+
+    let parking = facilities
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Parking)
+        .collect::<Vec<_>>();
+    let mut connected = HashSet::new();
+    for ramp in ramps
+        .into_iter()
+        .filter(|ramp| valid_ramps.contains(&(ramp.position.x, ramp.position.floor)))
+    {
+        let mut frontier = vec![(ramp.position.x, ramp.end_x())];
+        loop {
+            let mut changed = false;
+            for space in parking.iter().copied() {
+                if space.position.floor != ramp.position.floor || connected.contains(&space.id) {
+                    continue;
+                }
+                if frontier.iter().any(|&(start, end)| {
+                    horizontal_ranges_touch(start, end, space.position.x, space.end_x())
+                }) {
+                    connected.insert(space.id);
+                    frontier.push((space.position.x, space.end_x()));
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    connected
+}
+
+const fn horizontal_ranges_touch(
+    first_start: u16,
+    first_end: u16,
+    second_start: u16,
+    second_end: u16,
+) -> bool {
+    first_start <= second_end && second_start <= first_end
+}
+
+fn occupied_parking_spaces(
+    tower: &Tower,
+    connected: &HashSet<u64>,
+    minute_of_day: u16,
+) -> HashSet<u64> {
+    let commuter_demand = tower
+        .facilities()
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Office && facility.is_occupied())
+        .map(|facility| facility.kind.population_capacity() as usize)
+        .sum::<usize>()
+        .div_ceil(8);
+    let overnight_demand = tower
+        .facilities()
+        .iter()
+        .filter(|facility| {
+            facility.is_occupied()
+                && matches!(
+                    facility.kind,
+                    FacilityKind::Condo
+                        | FacilityKind::HotelSingle
+                        | FacilityKind::HotelTwin
+                        | FacilityKind::HotelSuite
+                )
+        })
+        .map(|facility| facility.kind.population_capacity() as usize)
+        .sum::<usize>()
+        .div_ceil(8);
+    let mut spaces = tower
+        .facilities()
+        .iter()
+        .filter(|facility| {
+            facility.kind == FacilityKind::Parking && connected.contains(&facility.id)
+        })
+        .collect::<Vec<_>>();
+    spaces.sort_by_key(|facility| facility.id);
+    spaces
+        .into_iter()
+        .enumerate()
+        .filter_map(|(rank, facility)| {
+            parking_space_is_occupied(
+                rank,
+                commuter_demand,
+                overnight_demand,
+                facility.id,
+                minute_of_day,
+            )
+            .then_some(facility.id)
+        })
+        .collect()
+}
+
+fn parking_space_is_occupied(
+    rank: usize,
+    commuter_demand: usize,
+    overnight_demand: usize,
+    facility_id: u64,
+    minute_of_day: u16,
+) -> bool {
+    let commuter_arrival = 7 * 60 + parking_jitter(facility_id, 17, 120);
+    let commuter_departure = 17 * 60 + parking_jitter(facility_id, 41, 150);
+    let overnight_arrival = 16 * 60 + parking_jitter(facility_id, 73, 300);
+    let overnight_departure = 6 * 60 + parking_jitter(facility_id, 101, 240);
+    let commuter_present =
+        rank < commuter_demand && (commuter_arrival..commuter_departure).contains(&minute_of_day);
+    let overnight_present = rank < overnight_demand
+        && (minute_of_day >= overnight_arrival || minute_of_day < overnight_departure);
+    commuter_present || overnight_present
+}
+
+fn parking_jitter(facility_id: u64, salt: u64, span: u16) -> u16 {
+    let mut value = facility_id ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) % u64::from(span)) as u16
+}
+
+fn parking_car_frame(facility: &Facility) -> usize {
+    // Frame zero of bitmap 1705 is the disconnected red X; the remaining
+    // thirteen frames are parked-car variants.
+    1 + facility_variant_index(facility, 13)
 }
 
 fn emergency_events_unlocked(star_rating: u8) -> bool {
@@ -11044,6 +13449,44 @@ mod tests {
         assert_eq!(promotion_rating_label(3), "Three Star Rating!");
         assert_eq!(promotion_rating_label(4), "Four Star Rating!");
         assert_eq!(promotion_rating_label(5), "Five Star Rating!");
+        assert_eq!(promotion_rating_label(6), "TOWER Rating!");
+    }
+
+    #[test]
+    fn bomb_search_expands_outward_from_the_security_floor() {
+        let mut tower = Tower::new(8, 1_000_000);
+        for floor in [1, 2, 3, 4, 5, 6] {
+            tower.place_floor(GridPosition { x: 0, floor }).unwrap();
+        }
+        assert_eq!(bomb_search_floor_order(&tower, 4), vec![4, 5, 3, 6, 2, 1]);
+        assert_eq!(BOMB_GUARDS_PER_SECURITY_OFFICE, 6);
+        assert_eq!(bomb_search_completed_floor_count(0.0, 3, 6), 0);
+        assert_eq!(bomb_search_completed_floor_count(2.49, 3, 6), 0);
+        assert_eq!(bomb_search_completed_floor_count(2.5, 3, 6), 3);
+        assert_eq!(bomb_search_completed_floor_count(5.0, 3, 6), 6);
+        assert_eq!(bomb_search_completed_floor_count(7.5, 3, 6), 6);
+    }
+
+    #[test]
+    fn bomb_search_distributes_guards_from_every_security_office() {
+        assert_eq!(
+            bomb_search_floor_order_for_origins((1..=8).collect(), vec![2, 7]),
+            vec![2, 7, 3, 8, 1, 6, 4, 5]
+        );
+    }
+
+    #[test]
+    fn bomb_dialog_uses_the_same_automatic_dispatch_timeout_as_fire() {
+        assert_eq!(fire_response_timeout_remaining(0.0), 15);
+        assert_eq!(fire_response_timeout_remaining(14.1), 1);
+        assert_eq!(fire_response_timeout_remaining(15.0), 0);
+    }
+
+    #[test]
+    fn overview_map_floor_scale_covers_the_complete_supported_tower_height() {
+        let count =
+            simtower_core::floor_ordinal(MAX_FLOOR) - simtower_core::floor_ordinal(MIN_FLOOR) + 1;
+        assert_eq!(count, 109);
     }
 
     #[test]
@@ -11314,6 +13757,52 @@ mod tests {
     }
 
     #[test]
+    fn individual_people_receive_original_style_role_labels() {
+        assert_eq!(
+            person_role_for_kinds(None, Some(FacilityKind::Office)),
+            "Salesman"
+        );
+        assert_eq!(
+            person_role_for_kinds(None, Some(FacilityKind::HotelSingle)),
+            "Hotel Guest"
+        );
+        assert_eq!(
+            person_role_for_kinds(
+                Some(FacilityKind::Housekeeping),
+                Some(FacilityKind::HotelSuite)
+            ),
+            "Housekeeper"
+        );
+        assert_eq!(
+            person_role_for_kinds(Some(FacilityKind::Security), Some(FacilityKind::Office)),
+            "Security Guard"
+        );
+    }
+
+    #[test]
+    fn individual_person_stress_respects_mood_and_wait_time() {
+        assert_eq!(person_stress_for(PersonMood::Calm, 0.0), 0.0);
+        assert!(person_stress_for(PersonMood::Concerned, 0.0) >= 0.5);
+        assert!(person_stress_for(PersonMood::Angry, 0.0) >= 0.82);
+        assert!(person_stress_for(PersonMood::Angry, 30.0) > 0.99);
+    }
+
+    #[test]
+    fn person_place_labels_include_the_tenant_floor() {
+        let mut tower = Tower::new(32, 2_000_000);
+        for floor in 1..=7 {
+            for x in 0..9 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        let office = tower
+            .place(FacilityKind::Office, GridPosition { x: 0, floor: 7 })
+            .unwrap();
+        assert_eq!(person_place_label(0, &tower), "Outside");
+        assert_eq!(person_place_label(office, &tower), "Office, Floor 7");
+    }
+
+    #[test]
     fn hidden_elevator_display_only_fades_the_shaft_interior() {
         assert_eq!(elevator_display_alpha(true), 1.0);
         assert_eq!(elevator_display_alpha(false), 0.22);
@@ -11341,6 +13830,18 @@ mod tests {
         assert_eq!(rgba[7], 0);
         assert_eq!(rgba[11], 255);
         assert_eq!(rgba[15], 255);
+    }
+
+    #[test]
+    fn compound_elevator_labels_cover_the_shaft_ribs_with_a_centered_panel() {
+        assert_eq!(
+            elevator_compound_label_backplate(100.0, 72.0, 64.0),
+            Rect::new(116.0, 72.0, 32.0, 36.0)
+        );
+        assert_eq!(
+            elevator_compound_label_backplate(100.0, 72.0, 32.0),
+            Rect::new(100.0, 72.0, 32.0, 36.0)
+        );
     }
 
     #[test]
@@ -11441,6 +13942,8 @@ mod tests {
                 && point.y <= first.y + first.h + f32::EPSILON
         }));
         let sounds = NativeSounds {
+            opening_theme: PathBuf::new(),
+            opening_theme_process: RefCell::new(None),
             construction: PathBuf::new(),
             lobby_segment: PathBuf::new(),
             demolition: PathBuf::new(),
@@ -11448,16 +13951,25 @@ mod tests {
             payment: PathBuf::new(),
             fire_alert: PathBuf::new(),
             fire_response: PathBuf::new(),
+            bomb_threat: PathBuf::new(),
+            bomb_armed: PathBuf::new(),
+            bomb_explosion: PathBuf::new(),
             elevator_move: PathBuf::new(),
             elevator_open: [PathBuf::new(), PathBuf::new()],
             escalator_move: PathBuf::new(),
             crowd: PathBuf::new(),
+            parking_arrival: PathBuf::new(),
+            parking_departure: PathBuf::new(),
             muted: Cell::new(false),
         };
         assert!(!sounds.is_muted());
         assert!(sounds.toggle_muted());
         assert!(sounds.is_muted());
         assert!(!sounds.toggle_muted());
+        assert!(!sounds.is_muted());
+        sounds.set_muted(true);
+        assert!(sounds.is_muted());
+        sounds.set_muted(false);
         assert!(!sounds.is_muted());
     }
 
@@ -11513,24 +14025,6 @@ mod tests {
         assert_eq!(weekday_name(5), "Friday");
         assert_eq!(weekday_name(7), "Sunday");
         assert_eq!(weekday_name(8), "Monday");
-    }
-
-    #[test]
-    fn settled_patronage_matches_original_weekday_and_weekend_business_levels() {
-        assert_eq!(
-            settled_commercial_patronage(FacilityKind::FastFood, false),
-            35
-        );
-        assert_eq!(
-            settled_commercial_patronage(FacilityKind::FastFood, true),
-            48
-        );
-        assert_eq!(settled_commercial_patronage(FacilityKind::Shop, false), 25);
-        assert_eq!(settled_commercial_patronage(FacilityKind::Shop, true), 30);
-        assert_eq!(
-            settled_commercial_patronage(FacilityKind::Restaurant, false),
-            35
-        );
     }
 
     #[test]
@@ -11618,6 +14112,59 @@ mod tests {
     }
 
     #[test]
+    fn parking_connectivity_follows_ramps_and_adjacent_spaces() {
+        let facility = |id, kind, x, floor| Facility {
+            id,
+            kind,
+            position: GridPosition { x, floor },
+            occupancy: simtower_core::FacilityOccupancy::NotApplicable,
+            price_level: 1,
+            stories: 1,
+        };
+        let facilities = vec![
+            facility(1, FacilityKind::Lobby, 0, 1),
+            facility(2, FacilityKind::Ramp, 0, -1),
+            facility(3, FacilityKind::Parking, 16, -1),
+            facility(4, FacilityKind::Parking, 20, -1),
+            facility(5, FacilityKind::Parking, 28, -1),
+            facility(6, FacilityKind::Ramp, 0, -2),
+            facility(7, FacilityKind::Parking, 16, -2),
+            facility(8, FacilityKind::Ramp, 40, -2),
+            facility(9, FacilityKind::Parking, 56, -2),
+        ];
+
+        let connected = connected_parking_spaces(&facilities);
+        assert_eq!(connected, HashSet::from([3, 4, 7]));
+    }
+
+    #[test]
+    fn parking_schedule_staggers_commuters_and_overnight_cars() {
+        // Every commuter car is present at noon and gone before the morning
+        // arrival window; overnight cars use the inverse schedule.
+        assert!(parking_space_is_occupied(0, 1, 0, 42, 12 * 60));
+        assert!(!parking_space_is_occupied(0, 1, 0, 42, 5 * 60));
+        assert!(parking_space_is_occupied(0, 0, 1, 42, 2 * 60));
+        assert!(!parking_space_is_occupied(0, 0, 1, 42, 12 * 60));
+        assert!(!parking_space_is_occupied(1, 1, 1, 42, 12 * 60));
+    }
+
+    #[test]
+    fn parked_car_variants_never_select_the_disconnected_x() {
+        let mut parking = Facility {
+            id: 1,
+            kind: FacilityKind::Parking,
+            position: GridPosition { x: 0, floor: -1 },
+            occupancy: simtower_core::FacilityOccupancy::NotApplicable,
+            price_level: 1,
+            stories: 1,
+        };
+        for id in 1..=128 {
+            parking.id = id;
+            assert!((1..=13).contains(&parking_car_frame(&parking)));
+        }
+    }
+
+    #[test]
     fn residential_tenant_panels_show_literal_original_headcounts() {
         let occupied = |kind| Facility {
             id: kind as u64 + 1,
@@ -11649,6 +14196,18 @@ mod tests {
         assert_eq!(FacilityKind::HotelTwin.population_capacity(), 2);
         assert_eq!(FacilityKind::HotelSuite.population_capacity(), 2);
         assert_eq!(proportional_people_icons(24, 48), 15);
+    }
+
+    #[test]
+    fn tenant_people_meter_crops_the_original_black_silhouette_strip() {
+        let rect = Rect::new(10.0, 20.0, 460.0, 39.0);
+        assert!(tenant_people_strip_layout(rect, 0, 640.0).is_none());
+        let (source, destination) = tenant_people_strip_layout(rect, 30, 640.0).unwrap();
+        assert_eq!(source, Rect::new(0.0, 0.0, 480.0, 36.0));
+        assert!(destination.w <= rect.w - 16.0);
+        assert!((destination.w / destination.h - source.w / source.h).abs() < 0.001);
+        assert!(destination.y >= rect.y);
+        assert!(destination.y + destination.h <= rect.y + rect.h);
     }
 
     #[test]
@@ -11705,6 +14264,42 @@ mod tests {
     }
 
     #[test]
+    fn welcome_dialog_offers_the_original_startup_actions() {
+        let viewport = vec2(640.0, 480.0);
+        assert_eq!(
+            WELCOME_ACTIONS.map(|(_, label)| label),
+            ["New Tower", "Load Saved Tower", "Quit"]
+        );
+        let dialog = welcome_dialog_rect(viewport);
+        assert_eq!(dialog, Rect::new(190.0, 182.0, 264.0, 119.0));
+        assert_eq!(
+            welcome_button_rect(viewport, 0),
+            Rect::new(207.0, 192.0, 230.0, 27.0)
+        );
+        assert_eq!(
+            welcome_button_rect(viewport, 1),
+            Rect::new(207.0, 228.0, 230.0, 27.0)
+        );
+        assert_eq!(
+            welcome_button_rect(viewport, 2),
+            Rect::new(281.0, 264.0, 82.0, 27.0)
+        );
+        for (index, (action, _)) in WELCOME_ACTIONS.iter().enumerate() {
+            let button = welcome_button_rect(viewport, index);
+            assert!(dialog.contains(button.center()));
+            assert_eq!(welcome_action_at(viewport, button.center()), Some(*action));
+        }
+        assert_eq!(welcome_action_at(viewport, vec2(0.0, 0.0)), None);
+
+        let widescreen = vec2(1_280.0, 720.0);
+        assert_eq!(title_screen_transform(widescreen), (1.5, vec2(160.0, 0.0)));
+        assert_eq!(
+            welcome_dialog_rect(widescreen),
+            Rect::new(445.0, 273.0, 396.0, 178.5)
+        );
+    }
+
+    #[test]
     fn ux_scale_supports_fractional_choices_and_transforms_only_ui_coordinates() {
         assert_eq!(UxScale::One.factor(), 1.0);
         assert_eq!(UxScale::OneAndQuarter.factor(), 1.25);
@@ -11739,6 +14334,15 @@ mod tests {
             "Existing.SMTOWER"
         );
         assert!(sanitized_save_filename("... ").is_err());
+    }
+
+    #[test]
+    fn scaled_ui_text_rasterizes_at_output_density_without_changing_layout_size() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let (raster_size, font_scale) = ui_text_rasterization(14.0, scale);
+            assert_eq!(raster_size, (14.0 * scale).round() as u16);
+            assert!((f32::from(raster_size) * font_scale - 14.0).abs() < f32::EPSILON);
+        }
     }
 
     #[test]
@@ -11805,12 +14409,21 @@ mod tests {
                 maintenance: 4_000,
                 ..FinanceLedger::default()
             },
-            automatic_finance_reports: false,
+            options: SaveOptions {
+                muted: true,
+                ux_scale: UxScale::OneAndHalf,
+                automatic_finance_reports: false,
+            },
+            legacy_automatic_finance_reports: None,
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
             tenant_names: HashMap::new(),
+            person_names: HashMap::from([(7, "Morgan".to_owned())]),
             tenant_finances: HashMap::new(),
             hotel_guest_stays: HashSet::new(),
+            vip_visit: None,
+            last_vip_attempt_day: 0,
+            bomb_event: None,
         };
         let json = serde_json::to_vec(&save).expect("save should encode");
         let decoded: SaveGame = serde_json::from_slice(&json).expect("save should decode");
@@ -11819,9 +14432,87 @@ mod tests {
         assert_eq!(decoded.traffic, traffic);
         assert_eq!(decoded.last_running_speed, SimulationSpeed::Triple);
         assert_eq!(decoded.finance_ledger.tenant_income, 25_000);
-        assert!(!decoded.automatic_finance_reports);
+        assert_eq!(
+            decoded.person_names.get(&7).map(String::as_str),
+            Some("Morgan")
+        );
+        assert_eq!(
+            decoded.resolved_options(),
+            SaveOptions {
+                muted: true,
+                ux_scale: UxScale::OneAndHalf,
+                automatic_finance_reports: false,
+            }
+        );
+        let root = serde_json::from_slice::<serde_json::Value>(&json).unwrap();
+        assert!(root.get("options").is_some());
+        assert!(root.get("automatic_finance_reports").is_none());
+        let mut future_value = serde_json::to_value(&save).unwrap();
+        let future_options = future_value
+            .get_mut("options")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        future_options.remove("ux_scale");
+        future_options.insert("future_option".to_owned(), serde_json::json!("supported"));
+        let future_decoded: SaveGame = serde_json::from_value(future_value).unwrap();
+        assert_eq!(future_decoded.options.ux_scale, UxScale::One);
+        assert!(future_decoded.options.muted);
         decoded.tower.validate_save_state().unwrap();
         decoded.traffic.validate_save_state(&decoded.tower).unwrap();
+    }
+
+    #[test]
+    fn saves_from_before_endgame_events_remain_loadable() {
+        let tower = Tower::new(32, 2_000_000);
+        let save = SaveGame {
+            format_version: SAVE_FORMAT_VERSION,
+            tower,
+            traffic: TrafficSimulation::new(),
+            camera_x: 0.0,
+            camera_floor: 1.0,
+            last_running_speed: SimulationSpeed::Normal,
+            next_fire_minute: 900,
+            finance_ledger: FinanceLedger::default(),
+            options: SaveOptions::default(),
+            legacy_automatic_finance_reports: None,
+            tenant_variants: HashMap::new(),
+            tenant_variant_bags: HashMap::new(),
+            tenant_names: HashMap::new(),
+            person_names: HashMap::new(),
+            tenant_finances: HashMap::new(),
+            hotel_guest_stays: HashSet::new(),
+            vip_visit: None,
+            last_vip_attempt_day: 0,
+            bomb_event: None,
+        };
+        let mut value = serde_json::to_value(save).unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("options");
+        root.insert(
+            "automatic_finance_reports".to_owned(),
+            serde_json::json!(false),
+        );
+        root.remove("vip_visit");
+        root.remove("last_vip_attempt_day");
+        root.remove("bomb_event");
+        root.remove("person_names");
+        let tower = root.get_mut("tower").unwrap().as_object_mut().unwrap();
+        tower.remove("tower_status_awarded");
+        tower.remove("cathedral_wedding_day");
+        tower.remove("vip_approved");
+        let decoded: SaveGame = serde_json::from_value(value).unwrap();
+        assert!(!decoded.tower.tower_status_awarded());
+        assert!(!decoded.tower.vip_approved());
+        assert!(decoded.vip_visit.is_none());
+        assert!(decoded.bomb_event.is_none());
+        assert_eq!(
+            decoded.resolved_options(),
+            SaveOptions {
+                automatic_finance_reports: false,
+                ..SaveOptions::default()
+            }
+        );
     }
 
     #[test]
@@ -12204,6 +14895,9 @@ mod tests {
             assert_eq!((image.width(), image.height()), (width, 24), "{name}");
         }
 
+        let opening_theme = simtower_formats::inspect_wave(OPENING_THEME_WAV.bytes().unwrap())
+            .expect("opening theme resource must be a valid WAVE file");
+        assert_eq!(opening_theme.channels, 1);
         let sound = simtower_formats::inspect_wave(CONSTRUCTION_WAV.bytes().unwrap())
             .expect("construction sound resource must be a valid WAVE file");
         assert_eq!(sound.channels, 1);
@@ -12259,6 +14953,9 @@ mod tests {
         let scaffolding =
             DibImage::decode_bmp(SCAFFOLD_BMP.bytes().unwrap()).expect("scaffolding must decode");
         assert_eq!((scaffolding.width(), scaffolding.height()), (328, 36));
+        let tenant_people = DibImage::decode_bmp(PEOPLE_SILHOUETTE_BMPS[0].bytes().unwrap())
+            .expect("tenant occupant silhouette strip must decode");
+        assert_eq!((tenant_people.width(), tenant_people.height()), (640, 36));
         let emergency_guards = DibImage::decode_bmp(PEOPLE_SILHOUETTE_BMPS[1].bytes().unwrap())
             .expect("emergency guard strip must decode");
         assert_eq!(
@@ -12394,6 +15091,31 @@ mod tests {
         assert_eq!(person_sprite_sheet(Some(FacilityKind::Cathedral), 2), 4);
         assert_eq!(person_sprite_sheet(Some(FacilityKind::Shop), 2), 5);
         assert_eq!(person_sprite_sheet(Some(FacilityKind::Recycling), 2), 6);
+        assert_eq!(
+            traveler_sprite_sheet(
+                PersonRole::Housekeeper,
+                Some(FacilityKind::Housekeeping),
+                Some(FacilityKind::HotelSingle),
+                2,
+            ),
+            1,
+            "housekeeping staff keep their dedicated sprite while visiting hotel rooms"
+        );
+        assert_eq!(
+            traveler_sprite_sheet(PersonRole::Child, None, Some(FacilityKind::FastFood), 2),
+            6,
+            "children keep the original child walking sheet at every destination"
+        );
+        assert_eq!(
+            traveler_sprite_sheet(
+                PersonRole::WomanWithChild,
+                Some(FacilityKind::Condo),
+                Some(FacilityKind::Shop),
+                2,
+            ),
+            5,
+            "mothers use the original woman/customer walking artwork"
+        );
     }
 
     #[test]
@@ -12432,12 +15154,13 @@ mod tests {
 
     #[test]
     fn escalator_rider_art_tracks_progress_in_both_directions() {
-        assert_eq!(escalator_frame_for_position(3, 3, 2.0), 0);
-        assert_eq!(escalator_frame_for_position(3, 3, 2.5), 4);
-        assert_eq!(escalator_frame_for_position(3, 3, 3.0), 7);
-        assert_eq!(escalator_frame_for_position(3, 4, 3.0), 0);
-        assert_eq!(escalator_frame_for_position(3, 4, 2.5), 4);
-        assert_eq!(escalator_frame_for_position(3, 4, 2.0), 7);
+        assert_eq!(escalator_frame_for_position(3, 3, 2.0, 1), 0);
+        assert_eq!(escalator_frame_for_position(3, 3, 2.5, 1), 4);
+        assert_eq!(escalator_frame_for_position(3, 3, 3.0, 1), 7);
+        assert_eq!(escalator_frame_for_position(3, 4, 3.0, 1), 0);
+        assert_eq!(escalator_frame_for_position(3, 4, 2.5, 1), 4);
+        assert_eq!(escalator_frame_for_position(3, 4, 2.0, 1), 7);
+        assert_eq!(escalator_frame_for_position(1, 1, 1.0, 2), 4);
     }
 
     #[test]

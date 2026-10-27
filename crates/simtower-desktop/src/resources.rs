@@ -389,10 +389,17 @@ pub(crate) const DEMOLITION_WAV: AssetRef = sound_asset!(7003);
 pub(crate) const PAYMENT_WAV: AssetRef = sound_asset!(10013);
 pub(crate) const FIRE_ALERT_WAV: AssetRef = sound_asset!(10006);
 pub(crate) const FIRE_RESPONSE_WAV: AssetRef = sound_asset!(10009);
+pub(crate) const BOMB_THREAT_WAV: AssetRef = sound_asset!(10003);
+pub(crate) const BOMB_ARMED_WAV: AssetRef = sound_asset!(10000);
+pub(crate) const BOMB_EXPLOSION_WAV: AssetRef = sound_asset!(10004);
 pub(crate) const ELEVATOR_MOVE_WAV: AssetRef = sound_asset!(6000);
 pub(crate) const ELEVATOR_OPEN_1_WAV: AssetRef = sound_asset!(6001);
 pub(crate) const ELEVATOR_OPEN_2_WAV: AssetRef = sound_asset!(6002);
 pub(crate) const CROWD_1_WAV: AssetRef = sound_asset!(8000);
+pub(crate) const PARKING_ARRIVAL_WAV: AssetRef = sound_asset!(1704);
+pub(crate) const PARKING_DEPARTURE_WAV: AssetRef = sound_asset!(1705);
+/// Original title-screen theme.
+pub(crate) const OPENING_THEME_WAV: AssetRef = sound_asset!(20000);
 #[cfg(feature = "bundled-resources")]
 pub(crate) const SIMTOWER_ICON_BMP: AssetRef = icon_asset!(1);
 

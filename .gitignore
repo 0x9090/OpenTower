@@ -1,29 +1,83 @@
 /target/
 .DS_Store
-/.ghidra-profile/
 /.mcp.json
 
-# Reverse-engineering inputs and local tooling are intentionally not published.
+# Original game media and extracted binaries are copyrighted inputs. Public
+# builds must obtain these resources from the player's own SimTower.exe.
 /SimTower ISO/
+/*SimTower*.iso
+/*SimTower*.img
+/disk-images/
+/original-media/
+/isos/
+/roms/
+*.[Ii][Ss][Oo]
+*.[Ii][Mm][Gg]
+*.[Bb][Ii][Nn]
+*.[Cc][Cc][Dd]
+*.[Cc][Uu][Ee]
+*.[Mm][Dd][Ff]
+*.[Mm][Dd][Ss]
+*.[Nn][Rr][Gg]
+*.[Ss][Uu][Bb]
+*.[Tt][Oo][Aa][Ss][Tt]
+*.[Dd][Mm][Gg]
+*.[Ee][Xx][Ee]
+*.[Dd][Ll][Ll]
+*.[Cc][Oo][Mm]
+*.[Ss][Cc][Rr]
+*.[Hh][Ll][Pp]
+*.[Mm][Ss][Tt]
+
+# Reverse-engineering inputs, databases, caches, and local tool installations
+# are intentionally not part of the Rust rewrite.
 /analysis/
+/decompilation/
+/disassembly/
+/reverse-engineering/
+/reversing/
+/.ghidra-profile/
+/.ghidra*/
 /ghidra-mcp/
+/ghidra/
 /ghidra_*/
+/ghidra-*/
+/ida/
+/ida-*/
+/idapro/
+/binary-ninja/
+/binaryninja/
+/cutter/
+/radare2/
+/rizin/
+/hopper/
 /third_party/
 /tools/
 /assets/reference/
 
-# Never track source binaries, disc images, Ghidra databases, or local secrets.
-*.[Ee][Xx][Ee]
-*.[Ii][Ss][Oo]
-*.[Ii][Mm][Gg]
-*.[Cc][Cc][Dd]
-*.[Cc][Uu][Ee]
-*.[Ss][Uu][Bb]
-*.[Hh][Ll][Pp]
-*.[Mm][Ss][Tt]
+# Ghidra projects and exports.
 *.gzf
 *.gpr
 *.rep
+*.gdt
+*.dbDir
+
+# IDA, Binary Ninja, radare2/rizin, Cutter, Hopper, and debugger databases.
+*.id0
+*.id1
+*.id2
+*.idb
+*.i64
+*.nam
+*.til
+*.bndb
+*.r2
+*.rzdb
+*.cutter
+*.hop
+*.dmp
+
+# Local credentials and machine-specific configuration.
 .env
 .env.*
 *.pem

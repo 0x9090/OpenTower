@@ -2,7 +2,8 @@
 
 OpenTower brings the classic SimTower experience to modern Windows, macOS,
 and Linux computers. Build upward and underground, attract tenants, manage
-elevator traffic, and grow a one-star building into a five-star tower.
+elevator traffic, earn five stars, and complete the Cathedral wedding to reach
+the final TOWER rating.
 
 OpenTower is a work in progress. Save files and game balance may change while
 the remaining original mechanics are completed.
@@ -70,6 +71,18 @@ displays.
 The speaker button on the top bar mutes or restores game audio. Saved towers
 are stored in the `SimTower` folder in your user home directory.
 
+Use the mode dropdown beside Menu to open Evaluation, Rent, and Hotel views.
+These pause the simulation and show a clickable whole-tower overview. In
+Evaluation view, blue tenants are doing well, yellow tenants are average, and
+red tenants need attention. Rent, elevator stress, transportation access,
+noise, recycling capacity, and customer traffic all affect the result.
+
+At higher ratings, VIP visits and emergencies become part of tower management.
+A VIP must complete a favorable hotel-suite visit before four stars can be
+awarded. Fire and bomb events temporarily return the game to 1x speed; after
+the emergency, the previous speed is restored. Security can search for a bomb,
+or its $300,000 ransom can be paid immediately.
+
 ## Sky lobbies and elevator transfers
 
 People may change elevators once during a trip. A sky lobby therefore needs to
@@ -77,6 +90,13 @@ be a single uninterrupted painted run touching both elevator shafts. Merely
 building empty floor between the shafts does not connect them. Local elevators
 serve the nearby floors; express elevators provide the long-distance trip from
 the ground lobby to the appropriate sky lobby.
+
+## Reaching TOWER status
+
+After earning five stars, grow the population to 15,000 and construct the one
+Cathedral allowed on floor 100. The wedding is held on Sunday from 10:00 to
+14:00. When it finishes, the five-star display changes to the original TOWER
+rank. Cathedral placement on any other floor is rejected.
 
 ## Build from source
 
