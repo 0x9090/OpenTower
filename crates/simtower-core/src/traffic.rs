@@ -241,6 +241,10 @@ pub struct TrafficSimulation {
     /// economy merely because all visible-agent slots are occupied.
     #[serde(default)]
     commercial_patronage: HashMap<u64, u32>,
+    /// Edge-triggered status-bar notification for an office parking request
+    /// that could not reserve a connected free space.
+    #[serde(default)]
+    parking_demand_warning: bool,
     #[serde(default)]
     last_resident_dispatch_bucket: u64,
     #[serde(default)]
@@ -266,6 +270,7 @@ impl Default for TrafficSimulation {
             patronage_day: 0,
             scheduled_trip_days: HashMap::new(),
             commercial_patronage: HashMap::new(),
+            parking_demand_warning: false,
             last_resident_dispatch_bucket: 0,
             scheduled_home_cursor: 0,
             next_person_id: 1,
@@ -282,6 +287,10 @@ impl TrafficSimulation {
 
     pub fn people(&self) -> &[Person] {
         &self.people
+    }
+
+    pub fn take_parking_demand_warning(&mut self) -> bool {
+        std::mem::take(&mut self.parking_demand_warning)
     }
 
     pub fn elevators(&self) -> &[ElevatorShaft] {
@@ -830,7 +839,7 @@ impl TrafficSimulation {
         }
 
         if topology_changed {
-            self.connected_parking = connected_parking_facility_ids(tower.facilities());
+            self.connected_parking = connected_parking_spaces(tower.facilities());
         }
 
         if topology_changed && mode == TopologySync::Full {
@@ -1135,15 +1144,15 @@ impl TrafficSimulation {
         // Every simulated person has a complete entrance-to-exit lifecycle.
         // Nobody materializes in an office, residence, hotel room, or business.
         let destination_kind = destination.kind;
-        let destination = endpoint(destination);
+        let destination_endpoint = endpoint(destination);
         let (origin, route) =
-            self.arrival_origin(tower, destination_kind, destination, lobby_route, seed);
+            self.arrival_origin(tower, destination, destination_endpoint, lobby_route, seed);
 
         let mut person = Person {
             id: self.next_person_id,
             role: outside_visitor_role(destination_kind, self.next_person_id),
             home_facility_id: origin.facility_id,
-            destination_facility_id: destination.facility_id,
+            destination_facility_id: destination_endpoint.facility_id,
             x: origin.x,
             floor_position: f32::from(floor_ordinal(origin.floor)),
             current_floor: origin.floor,
@@ -1151,7 +1160,7 @@ impl TrafficSimulation {
             activity: PersonActivity::Walking,
             wait_seconds: 0.0,
             origin,
-            destination,
+            destination: destination_endpoint,
             route,
             going_home: false,
             walking_from_transport: route == TravelMode::SameFloor,
@@ -1167,25 +1176,36 @@ impl TrafficSimulation {
     }
 
     fn arrival_origin(
-        &self,
+        &mut self,
         tower: &Tower,
-        destination_kind: FacilityKind,
+        destination_facility: &Facility,
         destination: Endpoint,
         lobby_route: TravelMode,
         seed: u64,
     ) -> (Endpoint, TravelMode) {
-        let parking_trip = matches!(
-            destination_kind,
-            FacilityKind::Office | FacilityKind::HotelSuite
-        ) && tower.star_rating() >= 3
-            && (destination_kind == FacilityKind::HotelSuite || seed.is_multiple_of(3));
-        if parking_trip
-            && let Some((origin, route, _)) = tower
+        let parking_required =
+            tower.star_rating() >= 3 && tenant_requests_parking(destination_facility);
+        let parking_already_reserved = self.people.iter().any(|person| {
+            person.destination_facility_id == destination.facility_id
+                && self.connected_parking.contains(&person.home_facility_id)
+        });
+        if parking_required && !parking_already_reserved {
+            let reserved = self
+                .people
+                .iter()
+                .filter_map(|person| {
+                    self.connected_parking
+                        .contains(&person.home_facility_id)
+                        .then_some(person.home_facility_id)
+                })
+                .collect::<HashSet<_>>();
+            let available = tower
                 .facilities()
                 .iter()
                 .filter(|facility| {
                     facility.kind == FacilityKind::Parking
                         && self.connected_parking.contains(&facility.id)
+                        && !reserved.contains(&facility.id)
                 })
                 .filter_map(|facility| {
                     let origin = endpoint(facility);
@@ -1196,11 +1216,16 @@ impl TrafficSimulation {
                         tower.facilities(),
                         tower.floors(),
                     )
-                    .map(|(route, score)| (origin, route, score))
+                    .map(|(route, _)| (origin, route))
                 })
-                .min_by(|left, right| left.2.total_cmp(&right.2))
-        {
-            return (origin, route);
+                .collect::<Vec<_>>();
+            if !available.is_empty() {
+                let (origin, route) = available[seed as usize % available.len()];
+                return (origin, route);
+            }
+            if destination_facility.kind == FacilityKind::Office {
+                self.parking_demand_warning = true;
+            }
         }
 
         if seed.is_multiple_of(2)
@@ -2116,7 +2141,10 @@ fn tower_topology_signature(tower: &Tower) -> u64 {
     mix64(signature ^ infrastructure_count)
 }
 
-fn connected_parking_facility_ids(facilities: &[Facility]) -> HashSet<u64> {
+/// Returns parking spaces reachable from a valid ramp stack. The original
+/// coverage pass may bridge at most three empty floor-tool units and stops at
+/// the first non-parking object in either direction.
+pub fn connected_parking_spaces(facilities: &[Facility]) -> HashSet<u64> {
     let mut valid_ramps = HashSet::<(u16, i16)>::new();
     let mut ramps = facilities
         .iter()
@@ -2143,36 +2171,61 @@ fn connected_parking_facility_ids(facilities: &[Facility]) -> HashSet<u64> {
         }
     }
 
-    let parking = facilities
-        .iter()
-        .filter(|facility| facility.kind == FacilityKind::Parking)
-        .collect::<Vec<_>>();
     let mut connected = HashSet::new();
     for ramp in ramps
         .into_iter()
         .filter(|ramp| valid_ramps.contains(&(ramp.position.x, ramp.position.floor)))
     {
-        let mut frontier = vec![(ramp.position.x, ramp.end_x())];
-        loop {
-            let mut changed = false;
-            for space in parking.iter().copied() {
-                if space.position.floor != ramp.position.floor || connected.contains(&space.id) {
-                    continue;
-                }
-                if frontier.iter().any(|&(start, end)| {
-                    horizontal_ranges_touch(start, end, space.position.x, space.end_x())
-                }) {
-                    connected.insert(space.id);
-                    frontier.push((space.position.x, space.end_x()));
-                    changed = true;
-                }
-            }
-            if !changed {
+        let mut right = facilities
+            .iter()
+            .filter(|facility| {
+                facility.position.floor == ramp.position.floor
+                    && facility.position.x >= ramp.end_x()
+            })
+            .collect::<Vec<_>>();
+        right.sort_by_key(|facility| facility.position.x);
+        let mut edge = ramp.end_x();
+        for facility in right {
+            if facility.position.x.saturating_sub(edge) > 3
+                || facility.kind != FacilityKind::Parking
+            {
                 break;
             }
+            connected.insert(facility.id);
+            edge = facility.end_x();
+        }
+
+        let mut left = facilities
+            .iter()
+            .filter(|facility| {
+                facility.position.floor == ramp.position.floor
+                    && facility.end_x() <= ramp.position.x
+            })
+            .collect::<Vec<_>>();
+        left.sort_by_key(|facility| std::cmp::Reverse(facility.end_x()));
+        let mut edge = ramp.position.x;
+        for facility in left {
+            if edge.saturating_sub(facility.end_x()) > 3 || facility.kind != FacilityKind::Parking {
+                break;
+            }
+            connected.insert(facility.id);
+            edge = facility.position.x;
         }
     }
     connected
+}
+
+fn tenant_requests_parking(facility: &Facility) -> bool {
+    match facility.kind {
+        FacilityKind::HotelSuite => true,
+        FacilityKind::Office => {
+            // The original office gate checks (logical floor + office column)
+            // modulo four. Its logical ground-floor index is ten.
+            let logical_floor = i32::from(floor_ordinal(facility.position.floor)) + 10;
+            (logical_floor + i32::from(facility.position.x)).rem_euclid(4) == 1
+        }
+        _ => false,
+    }
 }
 
 const fn horizontal_ranges_touch(
@@ -2937,6 +2990,123 @@ mod tests {
         assert_eq!(traffic.elevators[0].served_floors, vec![1, 2]);
         assert_eq!(traffic.elevators[0].cars.len(), 1);
         assert_eq!(traffic.elevators[0].cars[0].home_floor, 1);
+    }
+
+    #[test]
+    fn parking_coverage_crosses_only_three_empty_units_and_stops_at_objects() {
+        let facilities = vec![
+            test_facility(1, FacilityKind::Lobby, 0, 1),
+            test_facility(2, FacilityKind::Ramp, 0, -1),
+            test_facility(3, FacilityKind::Parking, 19, -1),
+            test_facility(4, FacilityKind::Parking, 26, -1),
+            test_facility(5, FacilityKind::Office, 31, -1),
+            test_facility(6, FacilityKind::Parking, 41, -1),
+        ];
+
+        assert_eq!(connected_parking_spaces(&facilities), HashSet::from([3, 4]));
+    }
+
+    #[test]
+    fn parking_requests_follow_the_original_office_column_and_suite_rules() {
+        assert!(tenant_requests_parking(&test_facility(
+            1,
+            FacilityKind::Office,
+            3,
+            1
+        )));
+        assert!(!tenant_requests_parking(&test_facility(
+            2,
+            FacilityKind::Office,
+            4,
+            1
+        )));
+        assert!(tenant_requests_parking(&test_facility(
+            3,
+            FacilityKind::HotelSuite,
+            4,
+            20
+        )));
+        assert!(!tenant_requests_parking(&test_facility(
+            4,
+            FacilityKind::HotelTwin,
+            4,
+            20
+        )));
+    }
+
+    #[test]
+    fn a_parking_space_is_reserved_by_one_driver_until_that_trip_ends() {
+        let mut tower = Tower::new(64, 10_000_000);
+        for floor in [-1, 1] {
+            for x in 0..64 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        tower
+            .place(FacilityKind::Lobby, GridPosition { x: 0, floor: 1 })
+            .unwrap();
+        let office_id = tower
+            .place(FacilityKind::Office, GridPosition { x: 3, floor: 1 })
+            .unwrap();
+        tower
+            .place(FacilityKind::Ramp, GridPosition { x: 0, floor: -1 })
+            .unwrap();
+        let parking_id = tower
+            .place(FacilityKind::Parking, GridPosition { x: 16, floor: -1 })
+            .unwrap();
+        tower
+            .place(FacilityKind::Stairs, GridPosition { x: 20, floor: -1 })
+            .unwrap();
+        // This test exercises the parking request path directly; final tower
+        // status keeps the normal three-star gate open without manufacturing
+        // hundreds of unrelated occupants.
+        tower.tower_status_awarded = true;
+
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let office = tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.id == office_id)
+            .unwrap();
+        let destination = endpoint(office);
+        let lobby_route = *traffic.routes_from_lobby.get(&office_id).unwrap();
+        let (origin, route) = traffic.arrival_origin(&tower, office, destination, lobby_route, 17);
+        assert_eq!(origin.facility_id, parking_id);
+
+        traffic.people.push(Person {
+            id: 1,
+            role: PersonRole::Salesman,
+            home_facility_id: parking_id,
+            destination_facility_id: office_id,
+            x: origin.x,
+            floor_position: f32::from(floor_ordinal(origin.floor)),
+            current_floor: origin.floor,
+            mood: PersonMood::Calm,
+            activity: PersonActivity::Walking,
+            wait_seconds: 0.0,
+            origin,
+            destination,
+            route,
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: 0.0,
+            visit_duration: 1.0,
+            stair_progress: 0.0,
+            route_leg: 0,
+        });
+
+        let (second_origin, _) =
+            traffic.arrival_origin(&tower, office, destination, lobby_route, 18);
+        assert_eq!(second_origin.facility_id, 0);
+
+        traffic.people.clear();
+        traffic.connected_parking.clear();
+        let (unserved_origin, _) =
+            traffic.arrival_origin(&tower, office, destination, lobby_route, 19);
+        assert_eq!(unserved_origin.facility_id, 0);
+        assert!(traffic.take_parking_demand_warning());
+        assert!(!traffic.take_parking_demand_warning());
     }
 
     #[test]

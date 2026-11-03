@@ -9,18 +9,20 @@ use simtower_core::{
     Clock, ElevatorDirection, ElevatorMode, FLOOR_CONSTRUCTION_COST, Facility, FacilityKind,
     GridPosition, IncomeEvent, MAX_ELEVATOR_QUEUE_PER_FLOOR, MAX_FLOOR, MIN_FLOOR, Person,
     PersonActivity, PersonMood, PersonRole, PlacementError, SimulationSpeed, Tower,
-    TowerStatusProgress, TrafficSimulation, elevator_car_cost, elevator_landing_is_valid,
-    facility_is_open_at, is_weekend, vertical_walkway_story_span, vertical_walkway_story_span_at,
+    TowerStatusProgress, TrafficSimulation, connected_parking_spaces, elevator_car_cost,
+    elevator_landing_is_valid, facility_is_open_at, is_weekend, vertical_walkway_story_span,
+    vertical_walkway_story_span_at,
 };
 use simtower_formats::DibImage;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
-    env, fs,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::{env, fs};
 
 mod resources;
 use resources::*;
@@ -52,7 +54,14 @@ const UI_TEXTURE_SCALE: f32 = 4.0;
 const SAVE_FORMAT_VERSION: u32 = 1;
 const SAVE_EXTENSION: &str = "smtower";
 const DEFAULT_SAVE_NAME: &str = "Tower";
+#[cfg(not(target_arch = "wasm32"))]
 const UX_SCALE_SETTINGS_FILE: &str = "OpenTower.ux-scale";
+#[cfg(any(target_arch = "wasm32", test))]
+const BROWSER_SAVE_PREFIX: &str = "opentower.save.";
+#[cfg(target_arch = "wasm32")]
+const BROWSER_LAST_SAVE_KEY: &str = "opentower.last-save";
+#[cfg(target_arch = "wasm32")]
+const BROWSER_UX_SCALE_KEY: &str = "opentower.ux-scale";
 const INTRO_MAXIS_SECONDS: f32 = 1.5;
 const INTRO_TITLE_SECONDS: f32 = 1.5;
 const INTRO_TOTAL_SECONDS: f32 = INTRO_MAXIS_SECONDS + INTRO_TITLE_SECONDS;
@@ -442,6 +451,8 @@ struct SaveGame {
     last_vip_attempt_day: u32,
     #[serde(default)]
     bomb_event: Option<BombEventState>,
+    #[serde(default)]
+    recycling_state: RecyclingState,
 }
 
 impl SaveGame {
@@ -493,12 +504,200 @@ impl Default for ParkingState {
     }
 }
 
+const RECYCLING_MIDDAY_RESET_MINUTE: u16 = 17 * 60;
+const RECYCLING_TIER_TWO_CHECK_MINUTE: u16 = 21 * 60;
+const RECYCLING_FINAL_CHECK_MINUTE: u16 = 5 * 60 + 58;
+const RECYCLING_PICKUP_END_MINUTE: u16 = 7 * 60 + 24;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecyclingState {
+    #[serde(default)]
+    duty_tiers: HashMap<u64, u8>,
+    #[serde(default)]
+    adequate: bool,
+    #[serde(default)]
+    pickup_centers: HashSet<u64>,
+    #[serde(default)]
+    initialized: bool,
+}
+
+impl Default for RecyclingState {
+    fn default() -> Self {
+        Self {
+            duty_tiers: HashMap::new(),
+            adequate: false,
+            pickup_centers: HashSet::new(),
+            initialized: false,
+        }
+    }
+}
+
+impl RecyclingState {
+    fn tier(&self, facility_id: u64) -> usize {
+        usize::from(
+            self.duty_tiers
+                .get(&facility_id)
+                .copied()
+                .unwrap_or(0)
+                .min(5),
+        )
+    }
+
+    fn advance(
+        &mut self,
+        previous: u64,
+        current: u64,
+        population: u32,
+        star_rating: u8,
+        center_ids: &[u64],
+    ) -> Option<&'static str> {
+        let live = center_ids.iter().copied().collect::<HashSet<_>>();
+        self.duty_tiers.retain(|id, _| live.contains(id));
+        self.pickup_centers.retain(|id| live.contains(id));
+        if !self.initialized {
+            self.initialize_for_minute(
+                (current % (24 * 60)) as u16,
+                population,
+                star_rating,
+                center_ids,
+            );
+            self.initialized = true;
+        }
+        if current <= previous || star_rating <= 2 {
+            return None;
+        }
+
+        let mut notification = None;
+        for absolute_minute in previous + 1..=current {
+            let minute = (absolute_minute % (24 * 60)) as u16;
+            match minute {
+                RECYCLING_MIDDAY_RESET_MINUTE => {
+                    self.adequate = false;
+                    self.pickup_centers.clear();
+                    if center_ids.is_empty() {
+                        notification = Some("A Recycling Center is demanded");
+                    } else {
+                        for id in center_ids {
+                            let tier = self.duty_tiers.entry(*id).or_default();
+                            if *tier != 5 {
+                                *tier = 0;
+                            }
+                        }
+                    }
+                }
+                RECYCLING_TIER_TWO_CHECK_MINUTE => {
+                    notification = self.apply_checkpoint(2, population, center_ids);
+                }
+                RECYCLING_FINAL_CHECK_MINUTE => {
+                    notification = self.apply_checkpoint(5, population, center_ids);
+                    self.pickup_centers.clear();
+                    if self.adequate {
+                        self.pickup_centers.extend(center_ids.iter().copied());
+                    }
+                }
+                RECYCLING_PICKUP_END_MINUTE => {
+                    for id in &self.pickup_centers {
+                        if live.contains(id) {
+                            self.duty_tiers.insert(*id, 0);
+                        }
+                    }
+                    self.pickup_centers.clear();
+                }
+                _ => {}
+            }
+        }
+        notification
+    }
+
+    fn initialize_for_minute(
+        &mut self,
+        minute: u16,
+        population: u32,
+        star_rating: u8,
+        center_ids: &[u64],
+    ) {
+        if star_rating <= 2 || center_ids.is_empty() {
+            self.adequate = false;
+            self.pickup_centers.clear();
+            return;
+        }
+        if (RECYCLING_FINAL_CHECK_MINUTE..RECYCLING_PICKUP_END_MINUTE).contains(&minute) {
+            self.apply_checkpoint(5, population, center_ids);
+            self.pickup_centers.clear();
+            if self.adequate {
+                self.pickup_centers.extend(center_ids.iter().copied());
+            }
+        } else if (RECYCLING_PICKUP_END_MINUTE..RECYCLING_MIDDAY_RESET_MINUTE).contains(&minute) {
+            self.adequate = recycling_required_tier(population, center_ids.len()) <= 5;
+            self.pickup_centers.clear();
+        } else if (RECYCLING_MIDDAY_RESET_MINUTE..RECYCLING_TIER_TWO_CHECK_MINUTE).contains(&minute)
+        {
+            self.adequate = false;
+            self.pickup_centers.clear();
+        } else {
+            self.apply_checkpoint(2, population, center_ids);
+            self.pickup_centers.clear();
+        }
+    }
+
+    fn apply_checkpoint(
+        &mut self,
+        checkpoint_tier: u8,
+        population: u32,
+        center_ids: &[u64],
+    ) -> Option<&'static str> {
+        if center_ids.is_empty() {
+            self.adequate = false;
+            return Some("A Recycling Center is demanded");
+        }
+        let required = recycling_required_tier(population, center_ids.len());
+        self.adequate = required <= checkpoint_tier;
+        let applied = if self.adequate {
+            required
+        } else {
+            checkpoint_tier
+        };
+        for id in center_ids {
+            let tier = self.duty_tiers.entry(*id).or_default();
+            if self.adequate || *tier != 5 {
+                *tier = applied.min(5);
+            }
+        }
+        (checkpoint_tier == 5 && !self.adequate).then_some("Recycling centers are full")
+    }
+}
+
+fn recycling_required_tier(population: u32, center_count: usize) -> u8 {
+    if center_count == 0 {
+        return 6;
+    }
+    match population as usize / center_count {
+        0..=499 => 1,
+        500..=999 => 2,
+        1_000..=1_499 => 3,
+        1_500..=1_999 => 4,
+        2_000..=2_499 => 5,
+        _ => 6,
+    }
+}
+
 struct SaveNameDialog {
     name: String,
     error: Option<String>,
-    overwrite_path: Option<PathBuf>,
+    overwrite_name: Option<String>,
     replace_default_on_input: bool,
     key_repeat: Option<TextKeyRepeat>,
+}
+
+struct SavedGameLocation {
+    filename: String,
+    description: String,
+}
+
+struct StoredSaveGame {
+    filename: String,
+    description: String,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -535,7 +734,7 @@ impl SaveNameDialog {
         Self {
             name: name.to_owned(),
             error: None,
-            overwrite_path: None,
+            overwrite_name: None,
             replace_default_on_input: true,
             key_repeat: None,
         }
@@ -1475,6 +1674,7 @@ struct App {
     elevator_panel: Option<ElevatorPanelState>,
     simulation_sounds: SimulationSoundState,
     parking_state: ParkingState,
+    recycling_state: RecyclingState,
     visual_people_x: HashMap<u64, f32>,
     tenant_variants: HashMap<u64, usize>,
     tenant_variant_bags: HashMap<FacilityKind, TenantVariantBag>,
@@ -1545,6 +1745,7 @@ impl App {
             elevator_panel: None,
             simulation_sounds: SimulationSoundState::default(),
             parking_state: ParkingState::default(),
+            recycling_state: RecyclingState::default(),
             visual_people_x: HashMap::new(),
             tenant_variants: HashMap::new(),
             tenant_variant_bags: HashMap::new(),
@@ -1608,6 +1809,7 @@ impl App {
         self.elevator_panel = None;
         self.simulation_sounds = SimulationSoundState::default();
         self.parking_state = ParkingState::default();
+        self.recycling_state = RecyclingState::default();
         self.visual_people_x.clear();
         self.tenant_variants.clear();
         self.tenant_variant_bags.clear();
@@ -1921,7 +2123,7 @@ impl App {
         let confirming_overwrite = self
             .save_name_dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.overwrite_path.is_some());
+            .is_some_and(|dialog| dialog.overwrite_name.is_some());
         if confirming_overwrite {
             let mut confirm = is_key_pressed(KeyCode::Enter);
             let mut decline = is_key_pressed(KeyCode::Escape);
@@ -1932,7 +2134,7 @@ impl App {
             }
             if decline {
                 if let Some(dialog) = &mut self.save_name_dialog {
-                    dialog.overwrite_path = None;
+                    dialog.overwrite_name = None;
                     dialog.error = Some("Existing save kept; enter a different name".to_owned());
                     dialog.replace_default_on_input = true;
                 }
@@ -1948,14 +2150,14 @@ impl App {
                 .map(|dialog| dialog.name.clone())
                 .unwrap_or_default();
             match self.save_named(&name) {
-                Ok(path) => {
-                    self.current_save_name = save_default_name_for_path(&path);
+                Ok(location) => {
+                    self.current_save_name = save_default_name_for_filename(&location.filename);
                     self.save_name_dialog = None;
-                    self.status = format!("Replaced save game at {}", path.display());
+                    self.status = format!("Replaced save game in {}", location.description);
                 }
                 Err(error) => {
                     if let Some(dialog) = &mut self.save_name_dialog {
-                        dialog.overwrite_path = None;
+                        dialog.overwrite_name = None;
                         dialog.error = Some(error);
                     }
                 }
@@ -2001,13 +2203,13 @@ impl App {
             .as_ref()
             .map(|dialog| dialog.name.clone())
             .unwrap_or_default();
-        match save_game_path(&name) {
-            Ok(path) if path.exists() => {
+        match existing_save_filename(&name) {
+            Ok(Some(filename)) => {
                 if let Some(dialog) = &mut self.save_name_dialog {
-                    dialog.overwrite_path = Some(path.clone());
+                    dialog.overwrite_name = Some(filename.clone());
                     dialog.error = None;
                 }
-                self.status = format!("{} already exists; confirm replacement", path.display());
+                self.status = format!("{filename} already exists; confirm replacement");
                 return;
             }
             Err(error) => {
@@ -2016,13 +2218,13 @@ impl App {
                 }
                 return;
             }
-            Ok(_) => {}
+            Ok(None) => {}
         }
         match self.save_named(&name) {
-            Ok(path) => {
-                self.current_save_name = save_default_name_for_path(&path);
+            Ok(location) => {
+                self.current_save_name = save_default_name_for_filename(&location.filename);
                 self.save_name_dialog = None;
-                self.status = format!("Saved game to {}", path.display());
+                self.status = format!("Saved game to {}", location.description);
             }
             Err(error) => {
                 if let Some(dialog) = &mut self.save_name_dialog {
@@ -2032,8 +2234,8 @@ impl App {
         }
     }
 
-    fn save_named(&self, name: &str) -> Result<PathBuf, String> {
-        let path = save_game_path(name)?;
+    fn save_named(&self, name: &str) -> Result<SavedGameLocation, String> {
+        let filename = sanitized_save_filename(name)?;
         let save = SaveGame {
             format_version: SAVE_FORMAT_VERSION,
             tower: self.tower.clone(),
@@ -2058,33 +2260,25 @@ impl App {
             vip_visit: self.vip_visit,
             last_vip_attempt_day: self.last_vip_attempt_day,
             bomb_event: self.bomb_event,
+            recycling_state: self.recycling_state.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&save)
             .map_err(|error| format!("Could not encode the save game: {error}"))?;
-        let directory = path
-            .parent()
-            .ok_or_else(|| "Save path does not have a parent folder".to_owned())?;
-        fs::create_dir_all(directory)
-            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
-        fs::write(&path, bytes)
-            .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
-        Ok(path)
+        write_save_game(&filename, &bytes)
     }
 
     fn load_from_picker(&mut self) {
-        match choose_save_game_file() {
-            Ok(Some(path)) => match self.load_from_path(&path) {
-                Ok(()) => self.status = format!("Loaded game from {}", path.display()),
+        match read_save_game_from_picker() {
+            Ok(Some(stored)) => match self.load_from_bytes(&stored.bytes, &stored.filename) {
+                Ok(()) => self.status = format!("Loaded game from {}", stored.description),
                 Err(error) => self.status = format!("Load failed: {error}"),
             },
-            Ok(None) => self.status = "Load cancelled".to_owned(),
+            Ok(None) => self.status = no_saved_game_message().to_owned(),
             Err(error) => self.status = format!("Could not open file picker: {error}"),
         }
     }
 
-    fn load_from_path(&mut self, path: &Path) -> Result<(), String> {
-        let bytes = fs::read(path)
-            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    fn load_from_bytes(&mut self, bytes: &[u8], filename: &str) -> Result<(), String> {
         let mut save: SaveGame = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Invalid save-game file: {error}"))?;
         if save.format_version != SAVE_FORMAT_VERSION {
@@ -2148,6 +2342,7 @@ impl App {
         self.vip_dialog = None;
         self.vip_dialog_resume_speed = None;
         self.bomb_event = save.bomb_event;
+        self.recycling_state = save.recycling_state;
         self.tenant_panel = None;
         self.tenant_panel_resume_speed = None;
         self.person_panel = None;
@@ -2165,7 +2360,7 @@ impl App {
         self.welcome_dialog_open = false;
         self.welcome_selection = 0;
         self.assets.sounds.stop_opening_theme();
-        self.current_save_name = save_default_name_for_path(path);
+        self.current_save_name = save_default_name_for_filename(filename);
         self.sync_tenant_variants();
         Ok(())
     }
@@ -2219,7 +2414,7 @@ impl App {
         let save_name_entry_active = self
             .save_name_dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.overwrite_path.is_none());
+            .is_some_and(|dialog| dialog.overwrite_name.is_none());
         let tenant_name_entry_active = self
             .tenant_panel
             .as_ref()
@@ -2376,7 +2571,11 @@ impl App {
         self.complete_housekeeping_visits();
         self.capture_hotel_guest_stays();
         self.refresh_tower_metrics();
+        self.update_recycling_state(previous_absolute_minute, self.tower.clock.absolute_minute());
         self.update_parking_state();
+        if self.traffic.take_parking_demand_warning() {
+            self.status = "Office workers demand Parking".to_owned();
+        }
         let tower_status = self
             .tower
             .update_tower_status_for_population(self.cached_population);
@@ -3324,14 +3523,14 @@ impl App {
 
     fn update_parking_state(&mut self) {
         let now = self.tower.clock.absolute_minute();
-        if !self.parking_state.layout_dirty && self.parking_state.last_absolute_minute == now {
-            return;
-        }
         let layout_changed = self.parking_state.layout_dirty;
         let initialized = self.parking_state.last_absolute_minute != u64::MAX;
-        let connected = connected_parking_spaces(self.tower.facilities());
-        let occupied =
-            occupied_parking_spaces(&self.tower, &connected, self.tower.clock.minute_of_day);
+        let connected = if layout_changed {
+            connected_parking_spaces(self.tower.facilities())
+        } else {
+            self.parking_state.connected.clone()
+        };
+        let occupied = occupied_parking_spaces(&self.tower, &self.traffic, &connected);
         if initialized && !layout_changed {
             let arrivals = occupied
                 .iter()
@@ -3353,6 +3552,25 @@ impl App {
         self.parking_state.occupied = occupied;
         self.parking_state.last_absolute_minute = now;
         self.parking_state.layout_dirty = false;
+    }
+
+    fn update_recycling_state(&mut self, previous: u64, current: u64) {
+        let center_ids = self
+            .tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Recycling)
+            .map(|facility| facility.id)
+            .collect::<Vec<_>>();
+        if let Some(notification) = self.recycling_state.advance(
+            previous,
+            current,
+            self.cached_population,
+            self.cached_star_rating,
+            &center_ids,
+        ) {
+            self.status = notification.to_owned();
+        }
     }
 
     fn refresh_tower_metrics(&mut self) {
@@ -6333,16 +6551,7 @@ impl App {
                 .filter(|person| person.mood != PersonMood::Calm)
                 .count()
                 .min(2),
-            FacilityKind::Recycling => {
-                let centers = self
-                    .tower
-                    .facilities()
-                    .iter()
-                    .filter(|other| other.kind == FacilityKind::Recycling)
-                    .count()
-                    .max(1);
-                (self.population() as usize / (centers * 350)).min(5)
-            }
+            FacilityKind::Recycling => self.recycling_state.tier(facility.id),
             FacilityKind::Ramp => {
                 let connected_parking = self.tower.facilities().iter().filter(|other| {
                     other.kind == FacilityKind::Parking
@@ -6386,7 +6595,7 @@ impl App {
                     },
                 );
             }
-            if level >= 4 && (5 * 60..7 * 60).contains(&self.tower.clock.minute_of_day) {
+            if self.recycling_state.pickup_centers.contains(&facility.id) {
                 draw_texture_ex(
                     &self.assets.recycling_truck,
                     x,
@@ -8294,11 +8503,7 @@ impl App {
         draw_classic_panel(rect);
         draw_rectangle(rect.x + 3.0, rect.y + 3.0, rect.w - 6.0, 24.0, TITLE_BLUE);
         draw_text("Save Tower", rect.x + 10.0, rect.y + 20.0, 15.0, WHITE);
-        if let Some(path) = &dialog.overwrite_path {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Tower.smtower");
+        if let Some(filename) = &dialog.overwrite_name {
             draw_text(
                 format!("{filename} already exists."),
                 rect.x + 20.0,
@@ -8360,9 +8565,8 @@ impl App {
         }
         if let Some(error) = &dialog.error {
             draw_text(error, rect.x + 14.0, rect.y + 105.0, 12.0, RED);
-        } else if let Ok(directory) = save_game_directory() {
-            let folder = format!("Folder: {}", directory.display());
-            draw_text(&folder, rect.x + 14.0, rect.y + 105.0, 11.0, DARKGRAY);
+        } else if let Some(storage) = save_storage_label() {
+            draw_text(&storage, rect.x + 14.0, rect.y + 105.0, 11.0, DARKGRAY);
         }
         let save = save_dialog_save_rect();
         let cancel = save_dialog_cancel_rect();
@@ -9624,6 +9828,7 @@ fn save_dialog_cancel_rect() -> Rect {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_game_directory() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let home = env::var_os("USERPROFILE").or_else(|| {
@@ -9640,10 +9845,12 @@ fn save_game_directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not determine the current user's home folder".to_owned())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn ux_scale_preference_path() -> Result<PathBuf, String> {
     Ok(save_game_directory()?.join(UX_SCALE_SETTINGS_FILE))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_ux_scale_preference() -> UxScale {
     ux_scale_preference_path()
         .ok()
@@ -9652,6 +9859,16 @@ fn load_ux_scale_preference() -> UxScale {
         .unwrap_or(UxScale::One)
 }
 
+#[cfg(target_arch = "wasm32")]
+fn load_ux_scale_preference() -> UxScale {
+    browser_storage::get(BROWSER_UX_SCALE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| UxScale::from_preference(&value))
+        .unwrap_or(UxScale::One)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn save_ux_scale_preference(scale: UxScale) -> Result<(), String> {
     let path = ux_scale_preference_path()?;
     let directory = path
@@ -9661,6 +9878,11 @@ fn save_ux_scale_preference(scale: UxScale) -> Result<(), String> {
         .map_err(|error| format!("could not create settings folder: {error}"))?;
     fs::write(&path, scale.preference_value())
         .map_err(|error| format!("could not save UX scale preference: {error}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_ux_scale_preference(scale: UxScale) -> Result<(), String> {
+    browser_storage::set(BROWSER_UX_SCALE_KEY, scale.preference_value())
 }
 
 fn sanitized_save_filename(name: &str) -> Result<String, String> {
@@ -9688,8 +9910,8 @@ fn sanitized_save_filename(name: &str) -> Result<String, String> {
     }
 }
 
-fn save_game_path(name: &str) -> Result<PathBuf, String> {
-    Ok(save_game_directory()?.join(sanitized_save_filename(name)?))
+fn save_default_name_for_filename(filename: &str) -> String {
+    save_default_name_for_path(Path::new(filename))
 }
 
 fn save_default_name_for_path(path: &Path) -> String {
@@ -9698,6 +9920,139 @@ fn save_default_name_for_path(path: &Path) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(DEFAULT_SAVE_NAME)
         .to_owned()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn browser_save_key(filename: &str) -> String {
+    format!("{BROWSER_SAVE_PREFIX}{filename}")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn existing_save_filename(name: &str) -> Result<Option<String>, String> {
+    let filename = sanitized_save_filename(name)?;
+    let path = save_game_directory()?.join(&filename);
+    Ok(path.exists().then_some(filename))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn existing_save_filename(name: &str) -> Result<Option<String>, String> {
+    let filename = sanitized_save_filename(name)?;
+    browser_storage::contains(&browser_save_key(&filename)).map(|exists| exists.then_some(filename))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_save_game(filename: &str, bytes: &[u8]) -> Result<SavedGameLocation, String> {
+    let path = save_game_directory()?.join(filename);
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Save path does not have a parent folder".to_owned())?;
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    fs::write(&path, bytes)
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+    Ok(SavedGameLocation {
+        filename: filename.to_owned(),
+        description: path.display().to_string(),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn write_save_game(filename: &str, bytes: &[u8]) -> Result<SavedGameLocation, String> {
+    let json =
+        std::str::from_utf8(bytes).map_err(|_| "Save data was not valid UTF-8 JSON".to_owned())?;
+    browser_storage::set(&browser_save_key(filename), json)?;
+    browser_storage::set(BROWSER_LAST_SAVE_KEY, filename)?;
+    Ok(SavedGameLocation {
+        filename: filename.to_owned(),
+        description: format!("this browser ({filename})"),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_storage_label() -> Option<String> {
+    save_game_directory()
+        .ok()
+        .map(|directory| format!("Folder: {}", directory.display()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_storage_label() -> Option<String> {
+    Some("Storage: this browser".to_owned())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn no_saved_game_message() -> &'static str {
+    "Load cancelled"
+}
+
+#[cfg(target_arch = "wasm32")]
+fn no_saved_game_message() -> &'static str {
+    "No saved tower is stored in this browser"
+}
+
+#[cfg(target_arch = "wasm32")]
+mod browser_storage {
+    #[link(wasm_import_module = "env")]
+    unsafe extern "C" {
+        fn opentower_storage_value_len(key: *const u8, key_len: usize) -> i32;
+        fn opentower_storage_read(
+            key: *const u8,
+            key_len: usize,
+            output: *mut u8,
+            output_len: usize,
+        ) -> i32;
+        fn opentower_storage_write(
+            key: *const u8,
+            key_len: usize,
+            value: *const u8,
+            value_len: usize,
+        ) -> i32;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn opentower_storage_crate_version() -> u32 {
+        1
+    }
+
+    pub fn contains(key: &str) -> Result<bool, String> {
+        let length = unsafe { opentower_storage_value_len(key.as_ptr(), key.len()) };
+        match length {
+            -1 => Ok(false),
+            value if value >= 0 => Ok(true),
+            _ => Err("Browser storage is unavailable".to_owned()),
+        }
+    }
+
+    pub fn get(key: &str) -> Result<Option<String>, String> {
+        let length = unsafe { opentower_storage_value_len(key.as_ptr(), key.len()) };
+        if length == -1 {
+            return Ok(None);
+        }
+        if length < 0 {
+            return Err("Browser storage is unavailable".to_owned());
+        }
+        let mut bytes = vec![0_u8; length as usize];
+        let read = unsafe {
+            opentower_storage_read(key.as_ptr(), key.len(), bytes.as_mut_ptr(), bytes.len())
+        };
+        if read != length {
+            return Err("Browser storage changed while it was being read".to_owned());
+        }
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| "Browser storage returned invalid UTF-8".to_owned())
+    }
+
+    pub fn set(key: &str, value: &str) -> Result<(), String> {
+        let written = unsafe {
+            opentower_storage_write(key.as_ptr(), key.len(), value.as_ptr(), value.len())
+        };
+        if written == 1 {
+            Ok(())
+        } else {
+            Err("Browser storage is unavailable or full".to_owned())
+        }
+    }
 }
 
 fn discard_queued_text_input() {
@@ -9769,11 +10124,53 @@ fn key_for_text_character(character: char) -> Option<KeyCode> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn prepared_save_game_directory() -> Result<PathBuf, String> {
     let directory = save_game_directory()?;
     fs::create_dir_all(&directory)
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
     Ok(directory)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_save_game_from_picker() -> Result<Option<StoredSaveGame>, String> {
+    let Some(path) = choose_save_game_file()? else {
+        return Ok(None);
+    };
+    let bytes =
+        fs::read(&path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Tower.smtower")
+        .to_owned();
+    Ok(Some(StoredSaveGame {
+        filename,
+        description: path.display().to_string(),
+        bytes,
+    }))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_save_game_from_picker() -> Result<Option<StoredSaveGame>, String> {
+    let default_filename = sanitized_save_filename(DEFAULT_SAVE_NAME)?;
+    let latest = browser_storage::get(BROWSER_LAST_SAVE_KEY)?;
+    let mut filenames = latest.into_iter().collect::<Vec<_>>();
+    if !filenames.iter().any(|name| name == &default_filename) {
+        filenames.push(default_filename);
+    }
+    for filename in filenames {
+        let Some(json) = browser_storage::get(&browser_save_key(&filename))? else {
+            continue;
+        };
+        return Ok(Some(StoredSaveGame {
+            description: format!("this browser ({filename})"),
+            filename,
+            bytes: json.into_bytes(),
+        }));
+    }
+    Ok(None)
 }
 
 #[cfg(target_os = "macos")]
@@ -9850,7 +10247,10 @@ fn choose_save_game_file() -> Result<Option<PathBuf>, String> {
     Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+))]
 fn choose_save_game_file() -> Result<Option<PathBuf>, String> {
     Err("native file selection is not implemented for this platform".to_owned())
 }
@@ -10104,11 +10504,22 @@ fn tenant_people_strip_layout(
     people_icons: u32,
     texture_width: f32,
 ) -> Option<(Rect, Rect)> {
+    // Resource 1128 is a 36-pixel-high strip, but the silhouettes occupy only
+    // its bottom 20 pixels. Scaling the whole bitmap made the people look half
+    // height in the tenant panel (and especially tiny when only one person was
+    // present). Crop away the unused rows before fitting the strip.
+    const SILHOUETTE_TOP: f32 = 16.0;
+    const SILHOUETTE_HEIGHT: f32 = 20.0;
     let count = people_icons.min(30);
     if count == 0 || texture_width <= 0.0 {
         return None;
     }
-    let source = Rect::new(0.0, 0.0, (count as f32 * 16.0).min(texture_width), 36.0);
+    let source = Rect::new(
+        0.0,
+        SILHOUETTE_TOP,
+        (count as f32 * 16.0).min(texture_width),
+        SILHOUETTE_HEIGHT,
+    );
     let scale = (30.0 / source.h).min((rect.w - 16.0).max(1.0) / source.w);
     let size = vec2(source.w * scale, source.h * scale);
     let destination = Rect::new(
@@ -12692,151 +13103,28 @@ fn facility_variant_index(facility: &Facility, variant_count: usize) -> usize {
     ((value ^ (value >> 31)) % variant_count as u64) as usize
 }
 
-fn connected_parking_spaces(facilities: &[Facility]) -> HashSet<u64> {
-    let mut valid_ramps = HashSet::<(u16, i16)>::new();
-    let mut ramps = facilities
-        .iter()
-        .filter(|facility| facility.kind == FacilityKind::Ramp && facility.position.floor < 0)
-        .collect::<Vec<_>>();
-    // Validate from B1 downward. A lower ramp only works when every level
-    // above it is present in the same ramp column.
-    ramps.sort_by_key(|ramp| std::cmp::Reverse(ramp.position.floor));
-    for ramp in &ramps {
-        let valid = if ramp.position.floor == -1 {
-            facilities.iter().any(|facility| {
-                facility.kind == FacilityKind::Lobby
-                    && facility.position.floor == 1
-                    && horizontal_ranges_touch(
-                        ramp.position.x,
-                        ramp.end_x(),
-                        facility.position.x,
-                        facility.end_x(),
-                    )
-            })
-        } else {
-            valid_ramps.contains(&(ramp.position.x, ramp.position.floor + 1))
-        };
-        if valid {
-            valid_ramps.insert((ramp.position.x, ramp.position.floor));
-        }
-    }
-
-    let parking = facilities
-        .iter()
-        .filter(|facility| facility.kind == FacilityKind::Parking)
-        .collect::<Vec<_>>();
-    let mut connected = HashSet::new();
-    for ramp in ramps
-        .into_iter()
-        .filter(|ramp| valid_ramps.contains(&(ramp.position.x, ramp.position.floor)))
-    {
-        let mut frontier = vec![(ramp.position.x, ramp.end_x())];
-        loop {
-            let mut changed = false;
-            for space in parking.iter().copied() {
-                if space.position.floor != ramp.position.floor || connected.contains(&space.id) {
-                    continue;
-                }
-                if frontier.iter().any(|&(start, end)| {
-                    horizontal_ranges_touch(start, end, space.position.x, space.end_x())
-                }) {
-                    connected.insert(space.id);
-                    frontier.push((space.position.x, space.end_x()));
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
-    connected
-}
-
-const fn horizontal_ranges_touch(
-    first_start: u16,
-    first_end: u16,
-    second_start: u16,
-    second_end: u16,
-) -> bool {
-    first_start <= second_end && second_start <= first_end
-}
-
 fn occupied_parking_spaces(
     tower: &Tower,
+    traffic: &TrafficSimulation,
     connected: &HashSet<u64>,
-    minute_of_day: u16,
 ) -> HashSet<u64> {
-    let commuter_demand = tower
-        .facilities()
-        .iter()
-        .filter(|facility| facility.kind == FacilityKind::Office && facility.is_occupied())
-        .map(|facility| facility.kind.population_capacity() as usize)
-        .sum::<usize>()
-        .div_ceil(8);
-    let overnight_demand = tower
-        .facilities()
-        .iter()
-        .filter(|facility| {
-            facility.is_occupied()
-                && matches!(
-                    facility.kind,
-                    FacilityKind::Condo
-                        | FacilityKind::HotelSingle
-                        | FacilityKind::HotelTwin
-                        | FacilityKind::HotelSuite
-                )
-        })
-        .map(|facility| facility.kind.population_capacity() as usize)
-        .sum::<usize>()
-        .div_ceil(8);
-    let mut spaces = tower
+    let parking_ids = tower
         .facilities()
         .iter()
         .filter(|facility| {
             facility.kind == FacilityKind::Parking && connected.contains(&facility.id)
         })
-        .collect::<Vec<_>>();
-    spaces.sort_by_key(|facility| facility.id);
-    spaces
-        .into_iter()
-        .enumerate()
-        .filter_map(|(rank, facility)| {
-            parking_space_is_occupied(
-                rank,
-                commuter_demand,
-                overnight_demand,
-                facility.id,
-                minute_of_day,
-            )
-            .then_some(facility.id)
+        .map(|facility| facility.id)
+        .collect::<HashSet<_>>();
+    traffic
+        .people()
+        .iter()
+        .filter_map(|person| {
+            parking_ids
+                .contains(&person.home_facility_id)
+                .then_some(person.home_facility_id)
         })
         .collect()
-}
-
-fn parking_space_is_occupied(
-    rank: usize,
-    commuter_demand: usize,
-    overnight_demand: usize,
-    facility_id: u64,
-    minute_of_day: u16,
-) -> bool {
-    let commuter_arrival = 7 * 60 + parking_jitter(facility_id, 17, 120);
-    let commuter_departure = 17 * 60 + parking_jitter(facility_id, 41, 150);
-    let overnight_arrival = 16 * 60 + parking_jitter(facility_id, 73, 300);
-    let overnight_departure = 6 * 60 + parking_jitter(facility_id, 101, 240);
-    let commuter_present =
-        rank < commuter_demand && (commuter_arrival..commuter_departure).contains(&minute_of_day);
-    let overnight_present = rank < overnight_demand
-        && (minute_of_day >= overnight_arrival || minute_of_day < overnight_departure);
-    commuter_present || overnight_present
-}
-
-fn parking_jitter(facility_id: u64, salt: u64, span: u16) -> u16 {
-    let mut value = facility_id ^ salt.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((value ^ (value >> 31)) % u64::from(span)) as u16
 }
 
 fn parking_car_frame(facility: &Facility) -> usize {
@@ -14138,14 +14426,82 @@ mod tests {
     }
 
     #[test]
-    fn parking_schedule_staggers_commuters_and_overnight_cars() {
-        // Every commuter car is present at noon and gone before the morning
-        // arrival window; overnight cars use the inverse schedule.
-        assert!(parking_space_is_occupied(0, 1, 0, 42, 12 * 60));
-        assert!(!parking_space_is_occupied(0, 1, 0, 42, 5 * 60));
-        assert!(parking_space_is_occupied(0, 0, 1, 42, 2 * 60));
-        assert!(!parking_space_is_occupied(0, 0, 1, 42, 12 * 60));
-        assert!(!parking_space_is_occupied(1, 1, 1, 42, 12 * 60));
+    fn newly_built_parking_stays_empty_until_a_driver_reserves_it() {
+        let mut tower = Tower::new(64, 10_000_000);
+        for floor in [-1, 1] {
+            for x in 0..64 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        tower
+            .place(FacilityKind::Lobby, GridPosition { x: 0, floor: 1 })
+            .unwrap();
+        tower
+            .place(FacilityKind::Ramp, GridPosition { x: 0, floor: -1 })
+            .unwrap();
+        let parking_id = tower
+            .place(FacilityKind::Parking, GridPosition { x: 16, floor: -1 })
+            .unwrap();
+        let connected = connected_parking_spaces(tower.facilities());
+        assert!(connected.contains(&parking_id));
+
+        let traffic = TrafficSimulation::new();
+        assert!(occupied_parking_spaces(&tower, &traffic, &connected).is_empty());
+    }
+
+    #[test]
+    fn recycling_tiers_follow_the_original_per_center_thresholds() {
+        assert_eq!(recycling_required_tier(499, 1), 1);
+        assert_eq!(recycling_required_tier(500, 1), 2);
+        assert_eq!(recycling_required_tier(1_499, 1), 3);
+        assert_eq!(recycling_required_tier(1_500, 1), 4);
+        assert_eq!(recycling_required_tier(2_499, 1), 5);
+        assert_eq!(recycling_required_tier(2_500, 1), 6);
+        assert_eq!(recycling_required_tier(4_999, 2), 5);
+        assert_eq!(recycling_required_tier(5_000, 2), 6);
+    }
+
+    #[test]
+    fn recycling_schedule_fills_then_runs_the_morning_pickup() {
+        let center_ids = [41];
+        let mut state = RecyclingState::default();
+
+        state.advance(16 * 60 + 59, 17 * 60, 1_200, 3, &center_ids);
+        assert_eq!(state.tier(41), 0);
+        assert!(!state.adequate);
+
+        state.advance(20 * 60 + 59, 21 * 60, 1_200, 3, &center_ids);
+        assert_eq!(state.tier(41), 2);
+        assert!(!state.adequate);
+
+        let final_check = 24 * 60 + u64::from(RECYCLING_FINAL_CHECK_MINUTE);
+        state.advance(final_check - 1, final_check, 1_200, 3, &center_ids);
+        assert_eq!(state.tier(41), 3);
+        assert!(state.adequate);
+        assert!(state.pickup_centers.contains(&41));
+
+        let pickup_end = 24 * 60 + u64::from(RECYCLING_PICKUP_END_MINUTE);
+        state.advance(pickup_end - 1, pickup_end, 1_200, 3, &center_ids);
+        assert_eq!(state.tier(41), 0);
+        assert!(state.pickup_centers.is_empty());
+    }
+
+    #[test]
+    fn over_capacity_recycling_stays_full_and_cannot_receive_pickup() {
+        let center_ids = [7];
+        let mut state = RecyclingState::default();
+        let notification = state.advance(
+            u64::from(RECYCLING_FINAL_CHECK_MINUTE - 1),
+            u64::from(RECYCLING_FINAL_CHECK_MINUTE),
+            2_500,
+            3,
+            &center_ids,
+        );
+
+        assert_eq!(notification, Some("Recycling centers are full"));
+        assert_eq!(state.tier(7), 5);
+        assert!(!state.adequate);
+        assert!(state.pickup_centers.is_empty());
     }
 
     #[test]
@@ -14202,8 +14558,15 @@ mod tests {
     fn tenant_people_meter_crops_the_original_black_silhouette_strip() {
         let rect = Rect::new(10.0, 20.0, 460.0, 39.0);
         assert!(tenant_people_strip_layout(rect, 0, 640.0).is_none());
+
+        let (single_source, single_destination) =
+            tenant_people_strip_layout(rect, 1, 640.0).unwrap();
+        assert_eq!(single_source, Rect::new(0.0, 16.0, 16.0, 20.0));
+        assert_eq!(single_destination.h, 30.0);
+        assert_eq!(single_destination.w, 24.0);
+
         let (source, destination) = tenant_people_strip_layout(rect, 30, 640.0).unwrap();
-        assert_eq!(source, Rect::new(0.0, 0.0, 480.0, 36.0));
+        assert_eq!(source, Rect::new(0.0, 16.0, 480.0, 20.0));
         assert!(destination.w <= rect.w - 16.0);
         assert!((destination.w / destination.h - source.w / source.h).abs() < 0.001);
         assert!(destination.y >= rect.y);
@@ -14334,6 +14697,10 @@ mod tests {
             "Existing.SMTOWER"
         );
         assert!(sanitized_save_filename("... ").is_err());
+        assert_eq!(
+            browser_save_key("Tower.smtower"),
+            "opentower.save.Tower.smtower"
+        );
     }
 
     #[test]
@@ -14424,6 +14791,12 @@ mod tests {
             vip_visit: None,
             last_vip_attempt_day: 0,
             bomb_event: None,
+            recycling_state: RecyclingState {
+                duty_tiers: HashMap::from([(7, 3)]),
+                adequate: true,
+                pickup_centers: HashSet::from([7]),
+                initialized: true,
+            },
         };
         let json = serde_json::to_vec(&save).expect("save should encode");
         let decoded: SaveGame = serde_json::from_slice(&json).expect("save should decode");
@@ -14432,6 +14805,8 @@ mod tests {
         assert_eq!(decoded.traffic, traffic);
         assert_eq!(decoded.last_running_speed, SimulationSpeed::Triple);
         assert_eq!(decoded.finance_ledger.tenant_income, 25_000);
+        assert_eq!(decoded.recycling_state.duty_tiers.get(&7), Some(&3));
+        assert!(decoded.recycling_state.pickup_centers.contains(&7));
         assert_eq!(
             decoded.person_names.get(&7).map(String::as_str),
             Some("Morgan")
@@ -14485,6 +14860,7 @@ mod tests {
             vip_visit: None,
             last_vip_attempt_day: 0,
             bomb_event: None,
+            recycling_state: RecyclingState::default(),
         };
         let mut value = serde_json::to_value(save).unwrap();
         let root = value.as_object_mut().unwrap();
@@ -14494,6 +14870,7 @@ mod tests {
             serde_json::json!(false),
         );
         root.remove("vip_visit");
+        root.remove("recycling_state");
         root.remove("last_vip_attempt_day");
         root.remove("bomb_event");
         root.remove("person_names");

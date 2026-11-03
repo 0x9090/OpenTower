@@ -13,10 +13,10 @@ pub use traffic::{
     ABANDON_ELEVATOR_WAIT_SECONDS, ANGRY_WAIT_SECONDS, CONCERNED_WAIT_SECONDS, ELEVATOR_CAPACITY,
     EXPRESS_ELEVATOR_CAPACITY, ElevatorCar, ElevatorDirection, ElevatorMode, ElevatorSchedule,
     ElevatorShaft, MAX_ELEVATOR_CARS, MAX_ELEVATOR_QUEUE_PER_FLOOR, MAX_SIMULATED_PEOPLE, Person,
-    PersonActivity, PersonMood, PersonRole, TrafficSimulation, elevator_capacity,
-    elevator_landing_is_valid, facility_is_open, facility_is_open_at, floor_from_ordinal,
-    floor_ordinal, is_weekend, schedule_index, schedule_period, vertical_walkway_story_span,
-    vertical_walkway_story_span_at,
+    PersonActivity, PersonMood, PersonRole, TrafficSimulation, connected_parking_spaces,
+    elevator_capacity, elevator_landing_is_valid, facility_is_open, facility_is_open_at,
+    floor_from_ordinal, floor_ordinal, is_weekend, schedule_index, schedule_period,
+    vertical_walkway_story_span, vertical_walkway_story_span_at,
 };
 
 pub const MIN_FLOOR: i16 = -9;
@@ -967,6 +967,27 @@ impl Tower {
         if kind == FacilityKind::Cathedral && position.floor != MAX_FLOOR {
             return Err(PlacementError::CathedralOnlyOnTopFloor);
         }
+        if kind == FacilityKind::Recycling && position.floor >= 1 {
+            return Err(PlacementError::RecyclingUndergroundOnly);
+        }
+        if kind == FacilityKind::Recycling {
+            let recycling_centers = self
+                .facilities
+                .iter()
+                .filter(|facility| facility.kind == FacilityKind::Recycling)
+                .collect::<Vec<_>>();
+            if !recycling_centers.is_empty()
+                && !recycling_centers.iter().any(|facility| {
+                    facility.position.floor == position.floor
+                        && (facility.end_x() == position.x
+                            || position.x + spec.width == facility.position.x
+                            || (position.x < facility.end_x()
+                                && position.x + spec.width > facility.position.x))
+                })
+            {
+                return Err(PlacementError::RecyclingCentersMustBeAdjacent);
+            }
+        }
         self.check_facility_limit(kind, position)?;
         if (position.x..position.x + spec.width).any(|x| {
             !self.has_floor(GridPosition {
@@ -1550,6 +1571,8 @@ pub enum PlacementError {
     Occupied,
     FacilityLimitReached { label: &'static str, limit: usize },
     SingleRampColumn,
+    RecyclingUndergroundOnly,
+    RecyclingCentersMustBeAdjacent,
 }
 
 impl fmt::Display for PlacementError {
@@ -1602,6 +1625,15 @@ impl fmt::Display for PlacementError {
             }
             Self::SingleRampColumn => {
                 write!(f, "parking ramps must remain in one vertical column")
+            }
+            Self::RecyclingUndergroundOnly => {
+                write!(f, "recycling centers must be placed underground")
+            }
+            Self::RecyclingCentersMustBeAdjacent => {
+                write!(
+                    f,
+                    "additional recycling centers must touch an existing center"
+                )
             }
         }
     }
@@ -2223,6 +2255,31 @@ mod tests {
         assert_eq!(discovery.amount, 200_000);
         assert_eq!(tower.cash(), before - 100_000 + 200_000);
         assert!(tower.take_secret_discovery().is_none());
+    }
+
+    #[test]
+    fn recycling_centers_are_underground_and_form_one_adjacent_group() {
+        let mut tower = Tower::new(96, 3_000_000);
+        for floor in [-2, 1] {
+            for x in 0..80 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+
+        assert_eq!(
+            tower.place(FacilityKind::Recycling, GridPosition { x: 0, floor: 1 }),
+            Err(PlacementError::RecyclingUndergroundOnly)
+        );
+        tower
+            .place(FacilityKind::Recycling, GridPosition { x: 0, floor: -2 })
+            .unwrap();
+        assert_eq!(
+            tower.place(FacilityKind::Recycling, GridPosition { x: 55, floor: -2 }),
+            Err(PlacementError::RecyclingCentersMustBeAdjacent)
+        );
+        tower
+            .place(FacilityKind::Recycling, GridPosition { x: 25, floor: -2 })
+            .unwrap();
     }
 
     #[test]

@@ -1,7 +1,12 @@
 #[cfg(not(feature = "bundled-resources"))]
 use simtower_formats::{DibImage, NeFile, trim_wave};
+#[cfg(all(
+    not(feature = "bundled-resources"),
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+use std::process::Command;
 #[cfg(not(feature = "bundled-resources"))]
-use std::{collections::HashMap, env, fs, path::PathBuf, process::Command, sync::OnceLock};
+use std::{collections::HashMap, env, fs, path::PathBuf, sync::OnceLock};
 
 #[cfg(all(not(feature = "bundled-resources"), target_os = "windows"))]
 fn hidden_windows_command(program: &str) -> Command {
@@ -588,7 +593,10 @@ fn choose_original_executable() -> Result<Option<PathBuf>, String> {
     Err("set SIMTOWER_EXE or pass --simtower-exe with the path to SimTower.exe".to_owned())
 }
 
-#[cfg(not(feature = "bundled-resources"))]
+#[cfg(all(
+    not(feature = "bundled-resources"),
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
 fn selected_path(stdout: &[u8]) -> Result<Option<PathBuf>, String> {
     let path = String::from_utf8(stdout.to_vec())
         .map_err(|_| "file picker returned a non-UTF-8 path".to_owned())?;
