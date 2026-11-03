@@ -337,14 +337,14 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simtower-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "simtower-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "macroquad",
  "objc-rs",
@@ -356,11 +356,11 @@ dependencies = [
 
 [[package]]
 name = "simtower-formats"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "simtower-inspect"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "simtower-formats",
 ]
