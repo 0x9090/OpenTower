@@ -13014,8 +13014,8 @@ fn spawn_native_sound(path: &Path) -> Option<Child> {
     Command::new("paplay")
         .arg(path)
         .spawn()
-        .or_else(|_| Command::new("aplay").arg(path).spawn());
-    child.ok()
+        .or_else(|_| Command::new("aplay").arg(path).spawn())
+        .ok()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
