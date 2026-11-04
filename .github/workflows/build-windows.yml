@@ -1,0 +1,96 @@
+name: Build Windows EXE
+
+on:
+  repository_dispatch:
+    types:
+      - opentower-release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Windows x86-64 EXE
+    runs-on: windows-latest
+    env:
+      RELEASE_SHA: ${{ github.event.client_payload.release_sha }}
+      RELEASE_TAG: ${{ github.event.client_payload.tag }}
+
+    steps:
+      - name: Validate release request
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Invalid release tag: $env:RELEASE_TAG"
+          }
+          if ($env:RELEASE_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw "Invalid release commit: $env:RELEASE_SHA"
+          }
+
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.client_payload.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taggedSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          if ($taggedSha -ne $env:RELEASE_SHA) {
+            throw "$env:RELEASE_TAG points to $taggedSha, not $env:RELEASE_SHA"
+          }
+
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - name: Build Windows EXE
+        run: cargo build --locked --release --package simtower-desktop --no-default-features
+
+      - name: Prepare Windows EXE and checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'OpenTower-windows-x86_64.exe'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item 'target/release/simtower.exe' "dist/$binary"
+          $bytes = [IO.File]::ReadAllBytes("dist/$binary")
+          if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+            throw "$binary is not a Windows PE executable"
+          }
+          $hash = (Get-FileHash "dist/$binary" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            "dist/$binary.sha256",
+            "$hash  $binary`n",
+            [Text.Encoding]::ASCII
+          )
+
+      - name: Upload Windows workflow assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release-assets-${{ github.event.client_payload.tag }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Add Windows assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release upload $env:RELEASE_TAG `
+            'dist/OpenTower-windows-x86_64.exe' `
+            'dist/OpenTower-windows-x86_64.exe.sha256' `
+            --clobber `
+            --repo $env:GITHUB_REPOSITORY

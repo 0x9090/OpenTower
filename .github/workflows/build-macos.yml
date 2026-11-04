@@ -1,0 +1,112 @@
+name: Build macOS DMG
+
+on:
+  repository_dispatch:
+    types:
+      - opentower-release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-${{ github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build universal macOS DMG
+    runs-on: macos-latest
+    env:
+      RELEASE_SHA: ${{ github.event.client_payload.release_sha }}
+      RELEASE_TAG: ${{ github.event.client_payload.tag }}
+
+    steps:
+      - name: Validate release request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Check out release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.client_payload.release_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tagged_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [[ "$tagged_sha" != "$RELEASE_SHA" ]]; then
+            echo "$RELEASE_TAG points to $tagged_sha, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+
+      - name: Install stable Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build universal macOS binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --package simtower-desktop --no-default-features \
+            --target aarch64-apple-darwin
+          cargo build --locked --release --package simtower-desktop --no-default-features \
+            --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/simtower \
+            target/x86_64-apple-darwin/release/simtower \
+            -output target/release/simtower-universal
+          chmod +x target/release/simtower-universal
+          lipo -info target/release/simtower-universal | grep -q 'x86_64 arm64\|arm64 x86_64'
+
+      - name: Create macOS DMG and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="OpenTower-macos-universal.dmg"
+          staging="$RUNNER_TEMP/OpenTower-dmg"
+          mkdir -p "$staging" dist
+          scripts/create-macos-app.sh \
+            target/release/simtower-universal \
+            "$staging/OpenTower.app"
+          hdiutil create \
+            -volname OpenTower \
+            -srcfolder "$staging" \
+            -ov \
+            -format UDZO \
+            "dist/$image"
+          hdiutil verify "dist/$image"
+          (
+            cd dist
+            shasum -a 256 "$image" > "$image.sha256"
+            shasum -a 256 -c "$image.sha256"
+          )
+
+      - name: Upload macOS workflow assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-release-assets-${{ github.event.client_payload.tag }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Add macOS assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            dist/OpenTower-macos-universal.dmg \
+            dist/OpenTower-macos-universal.dmg.sha256 \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
