@@ -1359,6 +1359,12 @@ enum ToolMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FacilityInspectorKind {
+    Facility,
+    Elevator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DemolitionTarget {
     Facility(u64),
     Floor(GridPosition),
@@ -1871,7 +1877,7 @@ impl App {
             .tower
             .facilities()
             .iter()
-            .find(|facility| facility.id == facility_id && facility.kind.has_tenant_occupancy())
+            .find(|facility| facility.id == facility_id)
             .map(|facility| {
                 (
                     facility.kind,
@@ -1981,20 +1987,26 @@ impl App {
                     .as_ref()
                     .map(|panel| panel.facility_id)
                     .unwrap_or_default();
-                let is_cinema = self.tower.facilities().iter().any(|facility| {
-                    facility.id == facility_id && facility.kind == FacilityKind::Cinema
-                });
-                if is_cinema {
+                let kind = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .find(|facility| facility.id == facility_id)
+                    .map(|facility| facility.kind);
+                if kind == Some(FacilityKind::Cinema) {
                     if self.traffic.change_cinema_program(facility_id) {
                         self.status = "The cinema is now showing a new movie".to_owned();
                     }
-                } else if self
-                    .tenant_panel
-                    .as_ref()
-                    .is_some_and(|panel| panel.renaming)
+                } else if kind.is_some_and(FacilityKind::has_tenant_occupancy)
+                    && self
+                        .tenant_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.renaming)
                 {
                     self.commit_tenant_rename();
-                } else if let Some(panel) = &mut self.tenant_panel {
+                } else if kind.is_some_and(FacilityKind::has_tenant_occupancy)
+                    && let Some(panel) = &mut self.tenant_panel
+                {
                     panel.renaming = true;
                 }
             }
@@ -4050,16 +4062,22 @@ impl App {
                 let selected = self
                     .facility_at_screen_point(point)
                     .map(|facility| (facility.id, facility.kind, facility.position));
-                if selected.is_some_and(|(_, kind, position)| {
-                    is_elevator_kind(kind) && self.open_elevator_controls_for(kind, position.x)
-                }) {
-                    return;
-                }
-                if let Some((id, kind, _)) = selected
-                    && kind.has_tenant_occupancy()
-                {
-                    self.open_tenant_panel(id);
-                    return;
+                if let Some((id, kind, facility_position)) = selected {
+                    match facility_inspector_kind(kind) {
+                        FacilityInspectorKind::Elevator
+                            if self.open_elevator_controls_for(kind, facility_position.x) =>
+                        {
+                            return;
+                        }
+                        FacilityInspectorKind::Elevator | FacilityInspectorKind::Facility => {
+                            // Elevators normally use their more detailed control panel. If a
+                            // newly loaded or repaired shaft has not synchronized yet, the
+                            // general facility window remains a safe fallback instead of making
+                            // the object unclickable.
+                            self.open_tenant_panel(id);
+                            return;
+                        }
+                    }
                 }
                 self.status = selected.map_or_else(
                     || {
@@ -5987,6 +6005,297 @@ impl App {
         draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 19.0, 14, BLACK);
     }
 
+    fn facility_panel_details(
+        &self,
+        facility: &Facility,
+        patronage: u32,
+        current_inside: u32,
+        previous_profit: i64,
+    ) -> TenantInfoDetails {
+        if facility.kind.has_tenant_occupancy() {
+            return tenant_info_details(facility, patronage, current_inside, previous_profit);
+        }
+
+        let no_people = 0;
+        let no_progress = (0, 0);
+        let details = match facility.kind {
+            FacilityKind::Lobby => (
+                [
+                    (
+                        "Type",
+                        if facility.position.floor == 1 {
+                            "Ground lobby"
+                        } else {
+                            "Sky lobby"
+                        }
+                        .to_owned(),
+                    ),
+                    ("Stories", facility.stories.to_string()),
+                ],
+                no_progress,
+                no_people,
+            ),
+            FacilityKind::Metro => (
+                [
+                    ("Status", "Operating".to_owned()),
+                    (
+                        "Passengers",
+                        patronage.saturating_add(current_inside).to_string(),
+                    ),
+                ],
+                no_progress,
+                proportional_people_icons(patronage.saturating_add(current_inside), 120),
+            ),
+            FacilityKind::Parking => {
+                let occupied = self.parking_state.occupied.contains(&facility.id);
+                let connected = self.parking_state.connected.contains(&facility.id);
+                (
+                    [
+                        (
+                            "Status",
+                            if occupied { "Occupied" } else { "Available" }.to_owned(),
+                        ),
+                        (
+                            "Road access",
+                            if connected {
+                                "Connected"
+                            } else {
+                                "Disconnected"
+                            }
+                            .to_owned(),
+                        ),
+                    ],
+                    (u32::from(occupied), 1),
+                    no_people,
+                )
+            }
+            FacilityKind::Medical => {
+                let open = facility_is_open_at(facility.kind, self.tower.clock);
+                (
+                    [
+                        ("Status", if open { "Open" } else { "Closed" }.to_owned()),
+                        ("Patients", current_inside.to_string()),
+                    ],
+                    no_progress,
+                    current_inside.min(30),
+                )
+            }
+            FacilityKind::Security => {
+                let responding = self.fire_event.is_some() || self.bomb_event.is_some();
+                (
+                    [
+                        ("Personnel", BOMB_GUARDS_PER_SECURITY_OFFICE.to_string()),
+                        (
+                            "Status",
+                            if responding { "Responding" } else { "Ready" }.to_owned(),
+                        ),
+                    ],
+                    (
+                        BOMB_GUARDS_PER_SECURITY_OFFICE as u32,
+                        BOMB_GUARDS_PER_SECURITY_OFFICE as u32,
+                    ),
+                    BOMB_GUARDS_PER_SECURITY_OFFICE as u32,
+                )
+            }
+            FacilityKind::Recycling => {
+                let tier = self.recycling_state.tier(facility.id) as u32;
+                let pickup = self.recycling_state.pickup_centers.contains(&facility.id);
+                (
+                    [
+                        ("Load", format!("{tier} / 5")),
+                        (
+                            "Pickup",
+                            if pickup {
+                                "In progress"
+                            } else {
+                                "Not scheduled"
+                            }
+                            .to_owned(),
+                        ),
+                    ],
+                    (tier, 5),
+                    no_people,
+                )
+            }
+            FacilityKind::Stairs | FacilityKind::Escalator => {
+                let stories = vertical_walkway_story_span(facility, self.tower.facilities());
+                let top_floor = walkway_top_floor(facility.position.floor, stories);
+                (
+                    [
+                        (
+                            "Serves",
+                            format!(
+                                "{} to {}",
+                                format_floor(facility.position.floor),
+                                format_floor(top_floor)
+                            ),
+                        ),
+                        ("Status", "Operating".to_owned()),
+                    ],
+                    no_progress,
+                    current_inside.min(30),
+                )
+            }
+            FacilityKind::Housekeeping => {
+                let waiting = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .filter(|other| other.is_hotel_dirty())
+                    .count();
+                (
+                    [
+                        ("Personnel", "6".to_owned()),
+                        ("Rooms waiting", waiting.to_string()),
+                    ],
+                    (6, 6),
+                    6,
+                )
+            }
+            FacilityKind::Ramp => (
+                [
+                    ("Status", "Open".to_owned()),
+                    (
+                        "Spaces served",
+                        self.parking_state.connected.len().to_string(),
+                    ),
+                ],
+                no_progress,
+                no_people,
+            ),
+            FacilityKind::Cathedral => {
+                let status = if self.tower.tower_status_awarded() {
+                    "Tower status awarded"
+                } else if self.tower.cathedral_wedding_active() {
+                    "Wedding in progress"
+                } else {
+                    "Awaiting ceremony"
+                };
+                (
+                    [
+                        ("Status", status.to_owned()),
+                        ("Floor", format_floor(facility.position.floor)),
+                    ],
+                    no_progress,
+                    current_inside.min(30),
+                )
+            }
+            FacilityKind::Elevator
+            | FacilityKind::ServiceElevator
+            | FacilityKind::ExpressElevator => (
+                [
+                    ("Status", "Shaft controls unavailable".to_owned()),
+                    ("Floor", format_floor(facility.position.floor)),
+                ],
+                no_progress,
+                no_people,
+            ),
+            FacilityKind::Office
+            | FacilityKind::Condo
+            | FacilityKind::HotelSingle
+            | FacilityKind::HotelTwin
+            | FacilityKind::HotelSuite
+            | FacilityKind::Restaurant
+            | FacilityKind::FastFood
+            | FacilityKind::Shop
+            | FacilityKind::Cinema
+            | FacilityKind::PartyHall => unreachable!("tenant details returned above"),
+        };
+
+        TenantInfoDetails {
+            fields: details.0,
+            progress_value: details.1.0,
+            progress_max: details.1.1,
+            people_icons: details.2,
+        }
+    }
+
+    fn facility_panel_evaluation(
+        &self,
+        facility: &Facility,
+        reachable: bool,
+        patronage: u32,
+        current_inside: u32,
+    ) -> String {
+        if facility.kind.has_tenant_occupancy() {
+            return tenant_evaluation(facility, reachable, patronage, current_inside).to_owned();
+        }
+
+        match facility.kind {
+            FacilityKind::Lobby if facility.position.floor == 1 => {
+                "Ground-floor public entrance".to_owned()
+            }
+            FacilityKind::Lobby => "Sky lobby for elevator transfers".to_owned(),
+            FacilityKind::Metro => "Connected to the city transit network".to_owned(),
+            FacilityKind::Parking if self.parking_state.connected.contains(&facility.id) => {
+                "Parking space has road access".to_owned()
+            }
+            FacilityKind::Parking => "No connected parking ramp".to_owned(),
+            FacilityKind::Medical => if facility_is_open_at(facility.kind, self.tower.clock) {
+                "Medical center is accepting patients"
+            } else {
+                "Medical center is closed"
+            }
+            .to_owned(),
+            FacilityKind::Security => if self.fire_event.is_some() || self.bomb_event.is_some() {
+                "Security personnel are responding to an emergency"
+            } else {
+                "Security personnel are ready for emergencies"
+            }
+            .to_owned(),
+            FacilityKind::Recycling
+                if self.recycling_state.pickup_centers.contains(&facility.id) =>
+            {
+                "Municipal pickup is in progress".to_owned()
+            }
+            FacilityKind::Recycling if self.recycling_state.adequate => {
+                "Recycling capacity meets current demand".to_owned()
+            }
+            FacilityKind::Recycling => "Recycling capacity is below current demand".to_owned(),
+            FacilityKind::Stairs => "Emergency stairs connect the displayed floors".to_owned(),
+            FacilityKind::Escalator => "Escalator is carrying visitors between floors".to_owned(),
+            FacilityKind::Housekeeping => {
+                let waiting = self
+                    .tower
+                    .facilities()
+                    .iter()
+                    .filter(|other| other.is_hotel_dirty())
+                    .count();
+                if waiting == 0 {
+                    "All hotel rooms are clean".to_owned()
+                } else {
+                    format!(
+                        "{waiting} hotel room{} waiting for service",
+                        if waiting == 1 { " is" } else { "s are" }
+                    )
+                }
+            }
+            FacilityKind::Ramp => "Parking ramp connects spaces to the street".to_owned(),
+            FacilityKind::Cathedral if self.tower.tower_status_awarded() => {
+                "The cathedral ceremony awarded Tower status".to_owned()
+            }
+            FacilityKind::Cathedral if self.tower.cathedral_wedding_active() => {
+                "A cathedral wedding is in progress".to_owned()
+            }
+            FacilityKind::Cathedral => "Cathedral is awaiting the final ceremony".to_owned(),
+            FacilityKind::Elevator
+            | FacilityKind::ServiceElevator
+            | FacilityKind::ExpressElevator => {
+                "Use the elevator control window for this shaft".to_owned()
+            }
+            FacilityKind::Office
+            | FacilityKind::Condo
+            | FacilityKind::HotelSingle
+            | FacilityKind::HotelTwin
+            | FacilityKind::HotelSuite
+            | FacilityKind::Restaurant
+            | FacilityKind::FastFood
+            | FacilityKind::Shop
+            | FacilityKind::Cinema
+            | FacilityKind::PartyHall => unreachable!("tenant evaluation returned above"),
+        }
+    }
+
     fn draw_tenant_panel(&self) {
         let Some(panel_state) = &self.tenant_panel else {
             return;
@@ -6078,7 +6387,8 @@ impl App {
             .tenant_finances
             .get(&facility.id)
             .map_or(0, |state| state.previous_profit);
-        let details = tenant_info_details(facility, patronage, current_inside, previous_profit);
+        let details =
+            self.facility_panel_details(facility, patronage, current_inside, previous_profit);
         let field_x = panel.x + 222.0;
         let field_w = panel.w - 247.0;
         for (index, (label, value)) in details.fields.iter().enumerate() {
@@ -6113,19 +6423,28 @@ impl App {
         draw_recessed_field(people_box);
         if facility.kind == FacilityKind::Condo && details.people_icons > 0 {
             draw_condo_family_meter(&self.assets.people, people_box);
-        } else {
+        } else if details.people_icons > 0 {
             draw_tenant_people_meter(
                 &self.assets.people_silhouette[0],
                 people_box,
                 details.people_icons,
             );
+        } else {
+            draw_centered_text(
+                facility_panel_category(facility.kind),
+                people_box.x + people_box.w * 0.5,
+                people_box.y + 24.0,
+                15,
+                CLASSIC_DARK,
+            );
         }
 
         let evaluation_box = Rect::new(panel.x + 14.0, panel.y + 231.0, panel.w - 28.0, 55.0);
         draw_recessed_field(evaluation_box);
-        let evaluation = tenant_evaluation(facility, reachable, patronage, current_inside);
+        let evaluation =
+            self.facility_panel_evaluation(facility, reachable, patronage, current_inside);
         draw_fitted_text(
-            evaluation,
+            &evaluation,
             evaluation_box.x + 8.0,
             evaluation_box.y + 22.0,
             evaluation_box.w - 16.0,
@@ -6133,21 +6452,23 @@ impl App {
             BLACK,
         );
 
-        let rename = tenant_info_rename_rect();
-        draw_classic_button(rename, false);
-        draw_centered_text(
-            if panel_state.renaming {
-                "Save name"
-            } else if facility.kind == FacilityKind::Cinema {
-                "Change movie"
-            } else {
-                "Rename"
-            },
-            rename.x + rename.w * 0.5,
-            rename.y + 20.0,
-            15,
-            BLACK,
-        );
+        if facility.kind.has_tenant_occupancy() {
+            let rename = tenant_info_rename_rect();
+            draw_classic_button(rename, false);
+            draw_centered_text(
+                if panel_state.renaming {
+                    "Save name"
+                } else if facility.kind == FacilityKind::Cinema {
+                    "Change movie"
+                } else {
+                    "Rename"
+                },
+                rename.x + rename.w * 0.5,
+                rename.y + 20.0,
+                15,
+                BLACK,
+            );
+        }
         let ok = tenant_info_ok_rect();
         draw_classic_button(ok, false);
         draw_centered_text("OK", ok.x + ok.w * 0.5, ok.y + 20.0, 15, BLACK);
@@ -8951,6 +9272,13 @@ fn floor_below(floor: i16) -> i16 {
     if floor == 1 { -1 } else { floor - 1 }
 }
 
+fn walkway_top_floor(mut floor: i16, stories: u16) -> i16 {
+    for _ in 1..stories {
+        floor = floor_above(floor);
+    }
+    floor
+}
+
 fn world_floor_at_y(ground_y: f32, screen_y: f32) -> i16 {
     let height_above_ground = (ground_y - screen_y) / FLOOR_HEIGHT;
     if height_above_ground >= 0.0 {
@@ -11507,6 +11835,33 @@ fn default_tenant_name(kind: FacilityKind, variant: Option<usize>) -> &'static s
     }
 }
 
+const fn facility_panel_category(kind: FacilityKind) -> &'static str {
+    match kind {
+        FacilityKind::Lobby => "Public lobby",
+        FacilityKind::Office
+        | FacilityKind::Condo
+        | FacilityKind::HotelSingle
+        | FacilityKind::HotelTwin
+        | FacilityKind::HotelSuite
+        | FacilityKind::Restaurant
+        | FacilityKind::FastFood
+        | FacilityKind::Shop
+        | FacilityKind::Cinema
+        | FacilityKind::PartyHall => "Tenant",
+        FacilityKind::Metro => "Public transportation",
+        FacilityKind::Parking | FacilityKind::Ramp => "Parking facility",
+        FacilityKind::Medical
+        | FacilityKind::Security
+        | FacilityKind::Recycling
+        | FacilityKind::Housekeeping => "Tower service",
+        FacilityKind::Stairs | FacilityKind::Escalator => "Vertical transportation",
+        FacilityKind::Elevator | FacilityKind::ServiceElevator | FacilityKind::ExpressElevator => {
+            "Elevator shaft"
+        }
+        FacilityKind::Cathedral => "Special facility",
+    }
+}
+
 fn with_alpha(mut color: Color, alpha: f32) -> Color {
     color.a *= alpha.clamp(0.0, 1.0);
     color
@@ -11548,6 +11903,38 @@ const fn is_elevator_kind(kind: FacilityKind) -> bool {
         kind,
         FacilityKind::Elevator | FacilityKind::ServiceElevator | FacilityKind::ExpressElevator
     )
+}
+
+/// Chooses the click-in window for every placeable facility. Keeping this as
+/// an exhaustive match means adding a new `FacilityKind` cannot silently leave
+/// it without an inspector.
+const fn facility_inspector_kind(kind: FacilityKind) -> FacilityInspectorKind {
+    match kind {
+        FacilityKind::Elevator | FacilityKind::ServiceElevator | FacilityKind::ExpressElevator => {
+            FacilityInspectorKind::Elevator
+        }
+        FacilityKind::Lobby
+        | FacilityKind::Office
+        | FacilityKind::Condo
+        | FacilityKind::HotelSingle
+        | FacilityKind::HotelTwin
+        | FacilityKind::HotelSuite
+        | FacilityKind::Restaurant
+        | FacilityKind::FastFood
+        | FacilityKind::Shop
+        | FacilityKind::Cinema
+        | FacilityKind::PartyHall
+        | FacilityKind::Metro
+        | FacilityKind::Parking
+        | FacilityKind::Medical
+        | FacilityKind::Security
+        | FacilityKind::Recycling
+        | FacilityKind::Stairs
+        | FacilityKind::Escalator
+        | FacilityKind::Housekeeping
+        | FacilityKind::Ramp
+        | FacilityKind::Cathedral => FacilityInspectorKind::Facility,
+    }
 }
 
 fn draw_atlas_icon(texture: &Texture2D, column: u8, row: u8, destination: Rect, tint: Color) {
@@ -14397,6 +14784,32 @@ mod tests {
             tenant_evaluation(&facility, true, 0, 0),
             "Very few customers"
         );
+    }
+
+    #[test]
+    fn every_placeable_facility_has_a_click_in_inspector() {
+        let mut facility_panels = 0;
+        let mut elevator_panels = 0;
+        for kind in FacilityKind::ALL {
+            assert!(!facility_panel_category(kind).is_empty());
+            match facility_inspector_kind(kind) {
+                FacilityInspectorKind::Facility => facility_panels += 1,
+                FacilityInspectorKind::Elevator => elevator_panels += 1,
+            }
+        }
+
+        assert_eq!(facility_panels, FacilityKind::ALL.len() - 3);
+        assert_eq!(elevator_panels, 3);
+        for kind in [
+            FacilityKind::Elevator,
+            FacilityKind::ServiceElevator,
+            FacilityKind::ExpressElevator,
+        ] {
+            assert_eq!(
+                facility_inspector_kind(kind),
+                FacilityInspectorKind::Elevator
+            );
+        }
     }
 
     #[test]
