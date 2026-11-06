@@ -2060,14 +2060,71 @@ fn route_from_first_floor_lobby(
     facilities: &[Facility],
     floors: &[GridPosition],
 ) -> Option<TravelMode> {
-    facilities
+    let lobbies = facilities
         .iter()
         .filter(|facility| facility.kind == FacilityKind::Lobby && facility.position.floor == 1)
-        .filter_map(|lobby| {
+        .collect::<Vec<_>>();
+    let candidates = lobby_origin_candidates(&lobbies, destination, elevators, facilities);
+    lobbies
+        .iter()
+        .zip(candidates)
+        .filter(|(_, candidate)| *candidate)
+        .filter_map(|(lobby, _)| {
             choose_route_scored(endpoint(lobby), destination, elevators, facilities, floors)
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(route, _)| route)
+}
+
+/// Marks the first-floor lobby slices that can start the best route to `destination`.
+///
+/// A route's score depends on its starting slice only through `|slice - X|`, where X is the
+/// route's first horizontal target (the destination on the same floor, a stair or escalator
+/// column, or a shaft centre). Feasibility depends on the slice only through its contiguous
+/// lobby component and the floor between slice and X. Within a component, the slices nearest
+/// X therefore score best, and they are feasible whenever any slice of that component is.
+/// Searching from just those slices (ties kept, original order kept) returns the same route
+/// as searching from every slice, including tie-breaks. A wide lobby is one facility per
+/// column, so this replaces one route search per column with a handful per destination.
+fn lobby_origin_candidates(
+    lobbies: &[&Facility],
+    destination: Endpoint,
+    elevators: &[ElevatorShaft],
+    facilities: &[Facility],
+) -> Vec<bool> {
+    let mut anchors = vec![destination.x];
+    anchors.extend(
+        connected_vertical_walkways(1, destination.floor, facilities)
+            .into_iter()
+            .map(|(_, x)| x),
+    );
+    anchors.extend(elevators.iter().map(shaft_center));
+
+    let components = lobby_components(1, facilities);
+    let component_of = |lobby: &Facility| {
+        components
+            .iter()
+            .position(|&(start, end)| start <= lobby.position.x && lobby.position.x < end)
+    };
+    let membership = lobbies
+        .iter()
+        .map(|lobby| component_of(lobby))
+        .collect::<Vec<_>>();
+    // A slice outside every component cannot occur, but searching it keeps the result exact.
+    let mut candidates = membership.iter().map(Option::is_none).collect::<Vec<_>>();
+    for component in 0..components.len() {
+        for &anchor in &anchors {
+            let distance = |index: usize| (endpoint(lobbies[index]).x - anchor).abs();
+            let members = (0..lobbies.len()).filter(|&index| membership[index] == Some(component));
+            let Some(nearest) = members.clone().map(distance).min_by(f32::total_cmp) else {
+                continue;
+            };
+            for index in members.filter(|&index| distance(index) == nearest) {
+                candidates[index] = true;
+            }
+        }
+    }
+    candidates
 }
 
 fn route_uses_removed_walkway(
@@ -2420,7 +2477,24 @@ fn horizontal_floor_path(floor: i16, from_x: f32, to_x: f32, floors: &[GridPosit
     }
     let start = from_x.min(to_x).floor().max(0.0) as u16;
     let end = from_x.max(to_x).floor().max(0.0) as u16;
-    (start..=end).all(|x| floors.contains(&GridPosition { x, floor }))
+    // One pass marking covered columns, instead of a linear `contains` scan per column. Every
+    // route search walks this check several times; on a large tower the per-column scans of
+    // thousands of floor cells made a full route rebuild take seconds.
+    let mut uncovered = usize::from(end - start) + 1;
+    let mut covered = vec![false; uncovered];
+    for cell in floors {
+        if cell.floor == floor && (start..=end).contains(&cell.x) {
+            let column = &mut covered[usize::from(cell.x - start)];
+            if !*column {
+                *column = true;
+                uncovered -= 1;
+                if uncovered == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn shaft_distance(shaft: &ElevatorShaft, origin: Endpoint, destination: Endpoint) -> f32 {
@@ -3177,6 +3251,97 @@ mod tests {
             traffic.routes_from_lobby.get(&office_id),
             Some(TravelMode::Elevator { .. })
         ));
+    }
+
+    /// The original lobby-route search: one full route search from every first-floor slice.
+    fn route_from_first_floor_lobby_exhaustive(
+        destination: Endpoint,
+        elevators: &[ElevatorShaft],
+        facilities: &[Facility],
+        floors: &[GridPosition],
+    ) -> Option<TravelMode> {
+        facilities
+            .iter()
+            .filter(|facility| facility.kind == FacilityKind::Lobby && facility.position.floor == 1)
+            .filter_map(|lobby| {
+                choose_route_scored(endpoint(lobby), destination, elevators, facilities, floors)
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(route, _)| route)
+    }
+
+    #[test]
+    fn lobby_origin_pruning_matches_the_exhaustive_search() {
+        let mut tower = Tower::new(100, 100_000_000);
+        place_floor_run(&mut tower, 6, 100);
+        // Two separate lobby stretches, so components and gaps both matter.
+        for x in (6..28).chain(34..60) {
+            tower
+                .place(FacilityKind::Lobby, GridPosition { x, floor: 1 })
+                .unwrap();
+        }
+        for floor in 1..=6 {
+            for x in [2, 30] {
+                tower
+                    .place(FacilityKind::Elevator, GridPosition { x, floor })
+                    .unwrap();
+            }
+        }
+        for floor in 1..=4 {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 90, floor })
+                .unwrap();
+        }
+        for floor in 1..=2 {
+            tower
+                .place(FacilityKind::Stairs, GridPosition { x: 72, floor })
+                .unwrap();
+        }
+        tower
+            .place(FacilityKind::Escalator, GridPosition { x: 80, floor: 1 })
+            .unwrap();
+        tower
+            .place(FacilityKind::Shop, GridPosition { x: 60, floor: 1 })
+            .unwrap();
+        for floor in 2..=6 {
+            for x in [8, 20, 36, 48, 60] {
+                tower
+                    .place(FacilityKind::Office, GridPosition { x, floor })
+                    .unwrap();
+            }
+        }
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+
+        let mut routes = Vec::new();
+        for facility in tower
+            .facilities()
+            .iter()
+            .filter(|facility| facility.kind.has_tenant_occupancy())
+        {
+            let destination = endpoint(facility);
+            let args = (&traffic.elevators, tower.facilities(), tower.floors());
+            let pruned = route_from_first_floor_lobby(destination, args.0, args.1, args.2);
+            let exhaustive =
+                route_from_first_floor_lobby_exhaustive(destination, args.0, args.1, args.2);
+            assert_eq!(pruned, exhaustive, "destination {facility:?}");
+            routes.push(pruned);
+        }
+        // The tower must exercise stairs, the same-floor shop and more than one shaft.
+        assert!(routes.contains(&Some(TravelMode::SameFloor)));
+        assert!(
+            routes
+                .iter()
+                .any(|route| matches!(route, Some(TravelMode::Stairs { .. })))
+        );
+        let shafts = routes
+            .iter()
+            .filter_map(|route| match route {
+                Some(TravelMode::Elevator { shaft_id, .. }) => Some(*shaft_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert!(shafts.len() > 1, "routes: {routes:?}");
     }
 
     #[test]
