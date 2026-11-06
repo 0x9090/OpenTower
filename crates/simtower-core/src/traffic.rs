@@ -1925,6 +1925,12 @@ fn assign_waiting_calls(
         }
     }
 
+    // A full car cannot board anyone, so it must never own a hall call. Otherwise a full car
+    // stopped on the caller's floor keeps re-selecting that floor as its next stop and never
+    // departs, and because a matching moving car outranks idle cars, no other car is sent.
+    let capacity = elevator_capacity(shaft.kind);
+    let has_room = |car: &ElevatorCar| car.passengers.len() < capacity;
+
     waiting_floors
         .into_iter()
         .filter_map(|floor| {
@@ -1956,7 +1962,7 @@ fn assign_waiting_calls(
                 .cars
                 .iter()
                 .enumerate()
-                .filter(|(_, car)| car.target_floor == Some(floor))
+                .filter(|(_, car)| car.target_floor == Some(floor) && has_room(car))
                 .min_by(|left, right| {
                     (left.1.floor_position - floor_position)
                         .abs()
@@ -1969,7 +1975,8 @@ fn assign_waiting_calls(
                 .iter()
                 .enumerate()
                 .filter(|(_, car)| {
-                    car.direction == desired_direction
+                    has_room(car)
+                        && car.direction == desired_direction
                         && match desired_direction {
                             ElevatorDirection::Up => car.floor_position <= floor_position,
                             ElevatorDirection::Down => car.floor_position >= floor_position,
@@ -1987,7 +1994,7 @@ fn assign_waiting_calls(
                 .cars
                 .iter()
                 .enumerate()
-                .filter(|(_, car)| car.direction == ElevatorDirection::Idle)
+                .filter(|(_, car)| car.direction == ElevatorDirection::Idle && has_room(car))
                 .min_by(|left, right| {
                     (left.1.floor_position - floor_position)
                         .abs()
@@ -1998,6 +2005,7 @@ fn assign_waiting_calls(
                 .cars
                 .iter()
                 .enumerate()
+                .filter(|(_, car)| has_room(car))
                 .min_by(|left, right| {
                     (left.1.floor_position - floor_position)
                         .abs()
@@ -3906,6 +3914,80 @@ mod tests {
 
         let assignments = assign_waiting_calls(&traffic.elevators[0], &traffic.people, 5);
         assert_eq!(assignments, vec![(1, 1)]);
+    }
+
+    /// Waiting on floor 2 to go down, with a full car stopped on floor 2 heading down and an
+    /// empty idle car below. The full car used to win the call and re-stop on floor 2 forever.
+    fn full_car_at_caller_floor(add_idle_car: bool) -> (Tower, TrafficSimulation) {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let shaft_id = traffic.elevators[0].id;
+        if add_idle_car {
+            assert!(traffic.add_elevator_car(&tower, shaft_id, 2));
+        }
+        assert!(traffic.spawn_person(&tower));
+
+        let person = &mut traffic.people[0];
+        person.current_floor = 2;
+        person.floor_position = f32::from(floor_ordinal(2));
+        person.destination.floor = 1;
+        person.route = TravelMode::Elevator {
+            shaft_id,
+            x: f32::from(traffic.elevators[0].x),
+        };
+        person.activity = PersonActivity::WaitingForElevator { shaft_id };
+
+        let capacity = elevator_capacity(traffic.elevators[0].kind) as u64;
+        let cars = &mut traffic.elevators[0].cars;
+        cars[0].floor_position = f32::from(floor_ordinal(2));
+        cars[0].direction = ElevatorDirection::Down;
+        cars[0].target_floor = None;
+        cars[0].passengers = (10_000..10_000 + capacity).collect();
+        if add_idle_car {
+            // Park the idle car at its own home on floor 1, so only a dispatched hall call
+            // (not a trip home) can bring it to the caller's floor.
+            cars[1].home_floor = 1;
+            cars[1].floor_position = f32::from(floor_ordinal(1));
+            cars[1].direction = ElevatorDirection::Idle;
+            cars[1].target_floor = None;
+        }
+        (tower, traffic)
+    }
+
+    #[test]
+    fn a_full_car_never_takes_a_hall_call_from_a_car_with_room() {
+        let (_, traffic) = full_car_at_caller_floor(true);
+        let assignments = assign_waiting_calls(&traffic.elevators[0], &traffic.people, 5);
+        assert_eq!(assignments, vec![(2, 1)]);
+    }
+
+    #[test]
+    fn a_hall_call_stays_unassigned_while_every_car_is_full() {
+        let (_, traffic) = full_car_at_caller_floor(false);
+        let assignments = assign_waiting_calls(&traffic.elevators[0], &traffic.people, 5);
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn a_full_car_departs_and_an_idle_car_collects_the_waiting_person() {
+        let (tower, mut traffic) = full_car_at_caller_floor(true);
+        let shaft_id = traffic.elevators[0].id;
+        for _ in 0..40 {
+            advance_shaft(
+                &mut traffic.elevators[0],
+                &mut traffic.people,
+                tower.facilities(),
+                tower.clock,
+                0.25,
+            );
+        }
+        assert!(traffic.elevators[0].cars[0].floor_position < f32::from(floor_ordinal(2)) - 0.5);
+        // Picked up by the idle car; within ten seconds it may already have been delivered.
+        assert!(!matches!(
+            traffic.people[0].activity,
+            PersonActivity::WaitingForElevator { shaft_id: waiting } if waiting == shaft_id
+        ));
     }
 
     #[test]
