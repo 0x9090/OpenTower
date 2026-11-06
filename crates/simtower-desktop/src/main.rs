@@ -3868,7 +3868,7 @@ impl App {
             return;
         }
         if self.tool != ToolMode::Demolish
-            && let Some((kind, x, floor, direction)) = self.elevator_extension_at(point)
+            && let Some((kind, x, floor, direction)) = self.active_elevator_extension_at(point)
         {
             match self.tower.place(kind, GridPosition { x, floor }) {
                 Ok(_) => {
@@ -5073,6 +5073,17 @@ impl App {
         .to_owned();
     }
 
+    /// The shaft-end handle under `point` that a click would act on. On a bare cell the floor
+    /// tool builds floor instead: extending the shaft there would fail for lack of floor.
+    fn active_elevator_extension_at(&self, point: Vec2) -> Option<(FacilityKind, u16, i16, i8)> {
+        let extension = self.elevator_extension_at(point)?;
+        let cell = GridPosition {
+            x: self.grid_position(point).x,
+            floor: extension.2,
+        };
+        (!floor_tool_builds_at(self.tool, &self.tower, cell)).then_some(extension)
+    }
+
     fn elevator_extension_at(&self, point: Vec2) -> Option<(FacilityKind, u16, i16, i8)> {
         for shaft in self.traffic.elevators() {
             let top = *shaft.served_floors.last()?;
@@ -5170,7 +5181,7 @@ impl App {
             && self.intro_remaining <= 0.0
             && !demolition_cursor
             && !self.point_is_ui(mouse))
-        .then(|| self.elevator_extension_at(mouse))
+        .then(|| self.active_elevator_extension_at(mouse))
         .flatten();
         window::show_mouse(resize_handle.is_none() && !demolition_cursor && !inspect_cursor);
         self.draw_world_background();
@@ -9306,6 +9317,11 @@ fn city_tile_layout(view_width: f32, camera_x: f32, tile_width: f32) -> Vec<(f32
         tile_index += 1;
     }
     layout
+}
+
+/// True when a click with `tool` on `cell` should build structural floor there.
+fn floor_tool_builds_at(tool: ToolMode, tower: &Tower, cell: GridPosition) -> bool {
+    tool == ToolMode::Floor && !tower.has_floor(cell)
 }
 
 fn dragged_columns(previous: u16, current: u16) -> Vec<u16> {
@@ -14155,6 +14171,43 @@ mod tests {
         assert_eq!(fire_response_timeout_remaining(0.0), 15);
         assert_eq!(fire_response_timeout_remaining(14.1), 1);
         assert_eq!(fire_response_timeout_remaining(15.0), 0);
+    }
+
+    #[test]
+    fn the_floor_tool_builds_on_bare_cells_beside_a_shaft_end() {
+        let mut tower = Tower::new(16, 10_000_000);
+        for floor in 1..=2 {
+            for x in 0..16 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        for floor in 1..=2 {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 4, floor })
+                .unwrap();
+        }
+        // Floor 3 is the empty storey above the shaft's machinery.
+        let above_shaft = GridPosition { x: 5, floor: 3 };
+        assert!(floor_tool_builds_at(ToolMode::Floor, &tower, above_shaft));
+        assert!(!floor_tool_builds_at(
+            ToolMode::Build(FacilityKind::Office),
+            &tower,
+            above_shaft
+        ));
+        assert!(!floor_tool_builds_at(
+            ToolMode::Inspect,
+            &tower,
+            above_shaft
+        ));
+
+        // Once the storey has floor, a click there extends the shaft again.
+        for x in 4..8 {
+            tower.place_floor(GridPosition { x, floor: 3 }).unwrap();
+        }
+        assert!(!floor_tool_builds_at(ToolMode::Floor, &tower, above_shaft));
+        tower
+            .place(FacilityKind::Elevator, GridPosition { x: 4, floor: 3 })
+            .unwrap();
     }
 
     #[test]
