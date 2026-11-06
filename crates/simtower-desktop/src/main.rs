@@ -4808,7 +4808,11 @@ impl App {
                 .unwrap_or(person.x);
             let x = match person.activity {
                 PersonActivity::WaitingForElevator { shaft_id } => self
-                    .elevator_queue_draw_x(shaft_id, *queue_ranks.get(&person.id).unwrap_or(&0))
+                    .elevator_queue_draw_x(
+                        shaft_id,
+                        person.current_floor,
+                        *queue_ranks.get(&person.id).unwrap_or(&0),
+                    )
                     .unwrap_or((visual_x - self.camera_x) * CELL_WIDTH - 4.0),
                 _ => (visual_x - self.camera_x) * CELL_WIDTH - 4.0,
             };
@@ -7556,7 +7560,11 @@ impl App {
                 .unwrap_or(person.x);
             let x = match person.activity {
                 PersonActivity::WaitingForElevator { shaft_id } => self
-                    .elevator_queue_draw_x(shaft_id, *queue_ranks.get(&person.id).unwrap_or(&0))
+                    .elevator_queue_draw_x(
+                        shaft_id,
+                        person.current_floor,
+                        *queue_ranks.get(&person.id).unwrap_or(&0),
+                    )
                     .unwrap_or((visual_x - self.camera_x) * CELL_WIDTH - 4.0),
                 _ => (visual_x - self.camera_x) * CELL_WIDTH - 4.0,
             };
@@ -7621,7 +7629,7 @@ impl App {
         }
     }
 
-    fn elevator_queue_draw_x(&self, shaft_id: u64, rank: usize) -> Option<f32> {
+    fn elevator_queue_draw_x(&self, shaft_id: u64, floor: i16, rank: usize) -> Option<f32> {
         let shaft = self
             .traffic
             .elevators()
@@ -7630,14 +7638,8 @@ impl App {
         let rank = rank.min(MAX_ELEVATOR_QUEUE_PER_FLOOR.saturating_sub(1));
         let shaft_left = (f32::from(shaft.x) - self.camera_x) * CELL_WIDTH;
         let shaft_right = shaft_left + f32::from(shaft.kind.spec().width) * CELL_WIDTH;
-        let left_cells = usize::from(shaft.x);
-        let right_cells = usize::from(
-            self.tower
-                .width()
-                .saturating_sub(shaft.x + shaft.kind.spec().width),
-        );
         Some(
-            if left_cells >= right_cells.min(MAX_ELEVATOR_QUEUE_PER_FLOOR) {
+            if elevator_queue_extends_left(&self.tower, shaft.x, shaft.kind.spec().width, floor) {
                 shaft_left - (rank as f32 + 1.0) * CELL_WIDTH
             } else {
                 shaft_right + rank as f32 * CELL_WIDTH
@@ -10581,6 +10583,23 @@ fn choose_save_game_file() -> Result<Option<PathBuf>, String> {
 ))]
 fn choose_save_game_file() -> Result<Option<PathBuf>, String> {
     Err("native file selection is not implemented for this platform".to_owned())
+}
+
+/// Whether a shaft's hall queue should extend to its left on `floor`. Compares the standing room
+/// on that floor rather than the distance to the map edge, so a shaft flush against the
+/// building's wall queues its riders inside the building instead of in midair beside it.
+fn elevator_queue_extends_left(tower: &Tower, shaft_x: u16, shaft_width: u16, floor: i16) -> bool {
+    let has_floor = |x: u16| tower.has_floor(GridPosition { x, floor });
+    let left_cells = (0..shaft_x)
+        .rev()
+        .take_while(|&x| has_floor(x))
+        .take(MAX_ELEVATOR_QUEUE_PER_FLOOR)
+        .count();
+    let right_cells = (shaft_x.saturating_add(shaft_width)..tower.width())
+        .take_while(|&x| has_floor(x))
+        .take(MAX_ELEVATOR_QUEUE_PER_FLOOR)
+        .count();
+    left_cells >= right_cells.min(MAX_ELEVATOR_QUEUE_PER_FLOOR)
 }
 
 fn palette_rect() -> Rect {
@@ -14047,6 +14066,20 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hall_queues_extend_toward_standing_room_on_their_own_floor() {
+        let mut tower = Tower::new(64, 10_000_000);
+        for x in 20..40 {
+            tower.place_floor(GridPosition { x, floor: 1 }).unwrap();
+        }
+        // Flush with the building's left wall: open map to the left, floor to the right.
+        assert!(!elevator_queue_extends_left(&tower, 20, 4, 1));
+        // Flush with the right wall: queue leftward, inside the building.
+        assert!(elevator_queue_extends_left(&tower, 36, 4, 1));
+        // Room on both sides keeps the original left-first preference.
+        assert!(elevator_queue_extends_left(&tower, 28, 4, 1));
+    }
 
     #[test]
     fn every_implemented_facility_is_reachable_from_a_submenu() {
