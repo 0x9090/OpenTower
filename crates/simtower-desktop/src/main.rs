@@ -2598,9 +2598,7 @@ impl App {
         }
         self.update_vip_visit();
         if self.tower.vip_approved() && self.cached_population >= 5_000 {
-            self.cached_star_rating = self
-                .tower
-                .star_rating_for_population(self.cached_population);
+            self.cached_star_rating = self.tower.record_star_rating(self.cached_population);
         }
         if let Some((year, quarter)) = closed_quarter {
             let vacancies = self.apply_quarterly_evaluation();
@@ -3615,9 +3613,7 @@ impl App {
             *total = total.saturating_add(population);
         }
         self.cached_population = totals.values().copied().sum();
-        self.cached_star_rating = self
-            .tower
-            .star_rating_for_population(self.cached_population);
+        self.cached_star_rating = self.tower.record_star_rating(self.cached_population);
         self.cached_population_by_kind = totals;
     }
 
@@ -15291,9 +15287,11 @@ mod tests {
         tower.remove("tower_status_awarded");
         tower.remove("cathedral_wedding_day");
         tower.remove("vip_approved");
+        tower.remove("highest_star_rating");
         let decoded: SaveGame = serde_json::from_value(value).unwrap();
         assert!(!decoded.tower.tower_status_awarded());
         assert!(!decoded.tower.vip_approved());
+        assert_eq!(decoded.tower.star_rating_for_population(0), 1);
         assert!(decoded.vip_visit.is_none());
         assert!(decoded.bomb_event.is_none());
         assert_eq!(

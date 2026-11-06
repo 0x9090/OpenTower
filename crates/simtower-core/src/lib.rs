@@ -356,6 +356,10 @@ pub struct Tower {
     cathedral_wedding_day: Option<u32>,
     #[serde(default)]
     vip_approved: bool,
+    /// Highest grade recorded by [`Tower::record_star_rating`]; 0 until the first record,
+    /// including in saves written before grades were kept.
+    #[serde(default)]
+    highest_star_rating: u8,
     pub clock: Clock,
 }
 
@@ -384,6 +388,7 @@ impl Tower {
             tower_status_awarded: false,
             cathedral_wedding_day: None,
             vip_approved: false,
+            highest_star_rating: 0,
             clock: Clock::default(),
         }
     }
@@ -510,6 +515,9 @@ impl Tower {
         }
         if self.clock.day == 0 || self.clock.minute_of_day >= 24 * 60 {
             return Err("tower clock is invalid".to_owned());
+        }
+        if self.highest_star_rating > 6 {
+            return Err("tower star rating is invalid".to_owned());
         }
         let mut floor_cells = HashSet::new();
         for floor in &self.floors {
@@ -839,8 +847,22 @@ impl Tower {
     /// Calculates the tower grade from an externally observed population.
     /// The desktop simulation uses this for commercial spaces, whose
     /// population is their actual patron count rather than their maximum
-    /// capacity.
+    /// capacity. The result never falls below the highest recorded grade.
     pub fn star_rating_for_population(&self, population: u32) -> u8 {
+        self.qualifying_star_rating(population)
+            .max(self.highest_star_rating)
+    }
+
+    /// Records the grade `population` qualifies for and returns the tower's grade. The
+    /// original only ever advances its star count, so a tower keeps a grade after its
+    /// population dips back under the threshold, for example when hotel guests check out.
+    pub fn record_star_rating(&mut self, population: u32) -> u8 {
+        self.highest_star_rating = self.star_rating_for_population(population);
+        self.highest_star_rating
+    }
+
+    /// The grade the current facilities and `population` qualify for, ignoring past grades.
+    fn qualifying_star_rating(&self, population: u32) -> u8 {
         if self.tower_status_awarded {
             return 6;
         }
@@ -2010,6 +2032,37 @@ mod tests {
         assert_eq!(tower.star_rating(), 2);
         add_rating_facility(&mut tower, FacilityKind::Security, 22);
         assert_eq!(tower.star_rating(), 3);
+    }
+
+    #[test]
+    fn a_recorded_star_rating_survives_a_population_dip() {
+        let mut tower = Tower::new(256, 100_000_000);
+        for id in 1..=21 {
+            add_rating_facility(&mut tower, FacilityKind::FastFood, id);
+        }
+        add_rating_facility(&mut tower, FacilityKind::Security, 22);
+        assert_eq!(tower.star_rating_for_population(400), 2);
+        assert_eq!(tower.record_star_rating(1_008), 3);
+
+        assert_eq!(tower.record_star_rating(400), 3);
+        assert_eq!(tower.star_rating_for_population(0), 3);
+        tower
+            .facilities
+            .retain(|facility| facility.kind != FacilityKind::Security);
+        assert_eq!(
+            tower.star_rating(),
+            3,
+            "losing a gate facility keeps the grade"
+        );
+    }
+
+    #[test]
+    fn saves_reject_a_recorded_star_rating_above_tower_status() {
+        let mut tower = Tower::new(32, 1_000_000);
+        tower.highest_star_rating = 6;
+        assert!(tower.validate_save_state().is_ok());
+        tower.highest_star_rating = 7;
+        assert!(tower.validate_save_state().is_err());
     }
 
     #[test]
