@@ -791,6 +791,7 @@ impl TrafficSimulation {
             }
 
             let mut synchronized = Vec::with_capacity(groups.len());
+            let mut renumbered = HashMap::new();
             for (kind, x, id, mut served_floors) in groups {
                 served_floors.sort_by_key(|floor| floor_ordinal(*floor));
                 if let Some(mut existing) = self
@@ -799,6 +800,9 @@ impl TrafficSimulation {
                     .find(|shaft| shaft.kind == kind && shaft.x == x)
                     .cloned()
                 {
+                    if existing.id != id {
+                        renumbered.insert(existing.id, id);
+                    }
                     existing.id = id;
                     existing.served_floors = served_floors;
                     let landing_floors = landing_floors(
@@ -836,6 +840,7 @@ impl TrafficSimulation {
                 }
             }
             self.elevators = synchronized;
+            settle_people_after_shaft_changes(&mut self.elevators, &mut self.people, &renumbered);
         }
 
         if topology_changed {
@@ -1020,6 +1025,7 @@ impl TrafficSimulation {
                 .entry(person.destination_facility_id)
                 .or_default() += 1;
         }
+        abandon_unservable_elevator_waits(&mut self.people, &self.elevators);
         enforce_elevator_queue_limits(&mut self.people);
         self.arrived_facilities.extend(
             self.people
@@ -1737,13 +1743,152 @@ fn enforce_elevator_queue_limits(people: &mut [Person]) {
         if person.wait_seconds >= ABANDON_ELEVATOR_WAIT_SECONDS
             || *queue_length >= MAX_ELEVATOR_QUEUE_PER_FLOOR
         {
-            person.activity = PersonActivity::LeavingElevatorQueue;
-            person.mood = PersonMood::Angry;
-            person.visit_remaining = QUEUE_ABANDON_WALK_SECONDS;
+            abandon_trip(person);
             continue;
         }
         *queue_length += 1;
     }
+}
+
+fn abandon_trip(person: &mut Person) {
+    person.activity = PersonActivity::LeavingElevatorQueue;
+    person.mood = PersonMood::Angry;
+    person.visit_remaining = QUEUE_ABANDON_WALK_SECONDS;
+}
+
+/// True when `shaft` still spans both ends of an elevator leg.
+fn shaft_spans(shaft: &ElevatorShaft, from: i16, to: i16) -> bool {
+    shaft.served_floors.contains(&from) && shaft.served_floors.contains(&to)
+}
+
+/// Gives up waits the shaft can no longer complete: the shaft is gone, or it no longer spans
+/// the waiting floor or the floor this leg goes to. Without this, a waiter left on a floor
+/// removed from a shortened shaft keeps calling cars into the empty part of the shaft.
+fn abandon_unservable_elevator_waits(people: &mut [Person], elevators: &[ElevatorShaft]) {
+    for person in people {
+        let PersonActivity::WaitingForElevator { shaft_id } = person.activity else {
+            continue;
+        };
+        let servable = elevators
+            .iter()
+            .find(|shaft| shaft.id == shaft_id)
+            .is_some_and(|shaft| {
+                shaft_spans(shaft, person.current_floor, desired_elevator_floor(person))
+            });
+        if !servable {
+            abandon_trip(person);
+        }
+    }
+}
+
+/// Brings travellers and cars back in line with freshly rebuilt shafts. A shaft takes the id
+/// of its lowest segment, so demolishing that segment renumbers it; demolishing others can
+/// shorten or remove it. The original finalizes the route of every traveller using a removed
+/// span, so a trip the shafts can no longer complete is abandoned rather than left riding, or
+/// calling cars, beyond the shaft. People never refer to a shaft that no longer exists, which
+/// save validation rejects.
+fn settle_people_after_shaft_changes(
+    elevators: &mut [ElevatorShaft],
+    people: &mut [Person],
+    renumbered: &HashMap<u64, u64>,
+) {
+    if !renumbered.is_empty() {
+        for person in people.iter_mut() {
+            renumber_person_shafts(person, renumbered);
+        }
+    }
+    for shaft in elevators.iter_mut() {
+        settle_cars_in_shaft(shaft, people);
+    }
+    for person in people.iter_mut() {
+        if let PersonActivity::RidingElevator { shaft_id } = person.activity
+            && !elevators.iter().any(|shaft| shaft.id == shaft_id)
+        {
+            let floor = floor_from_ordinal(person.floor_position.round() as i16);
+            step_off_and_abandon(person, floor, person.x);
+        }
+    }
+    abandon_unservable_elevator_waits(people, elevators);
+}
+
+fn renumber_person_shafts(person: &mut Person, renumbered: &HashMap<u64, u64>) {
+    let renumber = |id: &mut u64| {
+        if let Some(&new_id) = renumbered.get(id) {
+            *id = new_id;
+        }
+    };
+    match &mut person.activity {
+        PersonActivity::WaitingForElevator { shaft_id }
+        | PersonActivity::RidingElevator { shaft_id } => renumber(shaft_id),
+        _ => {}
+    }
+    match &mut person.route {
+        TravelMode::Elevator { shaft_id, .. } => renumber(shaft_id),
+        TravelMode::ElevatorTransfer {
+            first_id,
+            second_id,
+            ..
+        } => {
+            renumber(first_id);
+            renumber(second_id);
+        }
+        TravelMode::SameFloor | TravelMode::Stairs { .. } => {}
+    }
+}
+
+/// Pulls cars, with their riders, back inside the shaft's span and drops off, at the landing
+/// nearest the car, riders whose floor the shaft no longer reaches.
+fn settle_cars_in_shaft(shaft: &mut ElevatorShaft, people: &mut [Person]) {
+    let (Some(&bottom), Some(&top)) = (shaft.served_floors.first(), shaft.served_floors.last())
+    else {
+        return;
+    };
+    let lowest = f32::from(floor_ordinal(bottom));
+    let highest = f32::from(floor_ordinal(top));
+    let shaft_id = shaft.id;
+    let shaft_x = f32::from(shaft.x) + 2.0;
+    let served_floors = &shaft.served_floors;
+    for car in &mut shaft.cars {
+        car.floor_position = car.floor_position.clamp(lowest, highest);
+        if car
+            .target_floor
+            .is_some_and(|floor| !served_floors.contains(&floor))
+        {
+            car.target_floor = None;
+        }
+        let distance = |floor: &i16| (f32::from(floor_ordinal(*floor)) - car.floor_position).abs();
+        let Some(nearest) = served_floors
+            .iter()
+            .copied()
+            .min_by(|left, right| distance(left).total_cmp(&distance(right)))
+        else {
+            continue;
+        };
+        car.passengers.retain(|&id| {
+            let Some(person) = people.iter_mut().find(|person| {
+                person.id == id
+                    && matches!(
+                        person.activity,
+                        PersonActivity::RidingElevator { shaft_id: riding } if riding == shaft_id
+                    )
+            }) else {
+                return true;
+            };
+            if served_floors.contains(&desired_elevator_floor(person)) {
+                person.floor_position = car.floor_position;
+                return true;
+            }
+            step_off_and_abandon(person, nearest, shaft_x);
+            false
+        });
+    }
+}
+
+fn step_off_and_abandon(person: &mut Person, floor: i16, x: f32) {
+    person.current_floor = floor;
+    person.floor_position = f32::from(floor_ordinal(floor));
+    person.x = x;
+    abandon_trip(person);
 }
 
 fn advance_shaft(
@@ -3268,6 +3413,237 @@ mod tests {
         assert!(!traffic.routes_from_lobby.contains_key(&far_office));
         assert!(traffic.reachable_facilities.contains(&near_office));
         assert!(!traffic.reachable_facilities.contains(&far_office));
+    }
+
+    /// An elevator at x 8 over floors `1..=floors` with an office on every upper floor, synced.
+    /// Returns the shaft's segment ids from the bottom up.
+    fn shaft_with_offices(floors: i16) -> (Tower, TrafficSimulation, Vec<u64>) {
+        let mut tower = Tower::new(32, 100_000_000);
+        place_floor_run(&mut tower, floors, 32);
+        let segments = (1..=floors)
+            .map(|floor| {
+                tower
+                    .place(FacilityKind::Elevator, GridPosition { x: 8, floor })
+                    .unwrap()
+            })
+            .collect();
+        for floor in 2..=floors {
+            tower
+                .place(FacilityKind::Office, GridPosition { x: 16, floor })
+                .unwrap();
+        }
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        (tower, traffic, segments)
+    }
+
+    /// A visitor on `current_floor` using the first shaft to reach the office on `office_floor`.
+    fn shaft_traveller(
+        tower: &Tower,
+        traffic: &TrafficSimulation,
+        id: u64,
+        current_floor: i16,
+        office_floor: i16,
+        activity: PersonActivity,
+    ) -> Person {
+        let shaft = &traffic.elevators[0];
+        let office = tower
+            .facilities()
+            .iter()
+            .find(|facility| {
+                facility.kind == FacilityKind::Office && facility.position.floor == office_floor
+            })
+            .unwrap();
+        Person {
+            id,
+            role: PersonRole::Visitor,
+            home_facility_id: 0,
+            destination_facility_id: office.id,
+            x: shaft_center(shaft),
+            floor_position: f32::from(floor_ordinal(current_floor)),
+            current_floor,
+            mood: PersonMood::Calm,
+            activity,
+            wait_seconds: 0.0,
+            origin: Endpoint {
+                facility_id: 0,
+                x: 2.0,
+                floor: 1,
+            },
+            destination: endpoint(office),
+            route: TravelMode::Elevator {
+                shaft_id: shaft.id,
+                x: shaft_center(shaft),
+            },
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: 0.0,
+            visit_duration: 1.0,
+            stair_progress: 0.0,
+            route_leg: 0,
+        }
+    }
+
+    fn activity_of(traffic: &TrafficSimulation, id: u64) -> PersonActivity {
+        traffic
+            .people
+            .iter()
+            .find(|person| person.id == id)
+            .unwrap()
+            .activity
+    }
+
+    #[test]
+    fn shortening_a_shaft_abandons_trips_it_can_no_longer_complete() {
+        let (mut tower, mut traffic, segments) = shaft_with_offices(6);
+        let shaft_id = traffic.elevators[0].id;
+        let riding = PersonActivity::RidingElevator { shaft_id };
+        let waiting = PersonActivity::WaitingForElevator { shaft_id };
+        let rider_to_top = shaft_traveller(&tower, &traffic, 1, 1, 6, riding);
+        let mut waiting_on_top = shaft_traveller(&tower, &traffic, 2, 6, 6, waiting);
+        waiting_on_top.going_home = true;
+        let waiting_for_top = shaft_traveller(&tower, &traffic, 3, 2, 6, waiting);
+        let waiting_for_served = shaft_traveller(&tower, &traffic, 4, 2, 4, waiting);
+        // Inside the top office; their trip home starts after the shaft is cut.
+        let mut visiting_top = shaft_traveller(&tower, &traffic, 5, 6, 6, PersonActivity::Visiting);
+        visiting_top.visit_remaining = 1.0;
+        traffic.people.extend([
+            rider_to_top,
+            waiting_on_top,
+            waiting_for_top,
+            waiting_for_served,
+            visiting_top,
+        ]);
+        let car = &mut traffic.elevators[0].cars[0];
+        car.floor_position = 4.5;
+        car.direction = ElevatorDirection::Up;
+        car.target_floor = Some(6);
+        car.passengers.push(1);
+
+        for &id in segments.iter().rev().take(2) {
+            let removed = tower.demolish(id).unwrap();
+            traffic.sync_with_tower_after_removal(&tower, &removed);
+        }
+
+        let top = f32::from(floor_ordinal(4));
+        let shaft = &traffic.elevators[0];
+        assert_eq!(shaft.served_floors, vec![1, 2, 3, 4]);
+        assert_eq!(shaft.cars[0].floor_position, top);
+        assert!(shaft.cars[0].passengers.is_empty());
+        for id in [1, 2, 3] {
+            assert_eq!(
+                activity_of(&traffic, id),
+                PersonActivity::LeavingElevatorQueue,
+                "person {id}"
+            );
+        }
+        assert_eq!(activity_of(&traffic, 4), waiting);
+        // Floor 6 went first, so the rider stepped off at what was then the top landing.
+        let rider = traffic.people.iter().find(|person| person.id == 1).unwrap();
+        assert_eq!(rider.current_floor, 5);
+        assert_eq!(rider.floor_position, f32::from(floor_ordinal(5)));
+        assert!(traffic.validate_save_state(&tower).is_ok());
+
+        for _ in 0..200 {
+            traffic.advance_after_sync(&tower, 0.1);
+            assert!(
+                traffic.elevators[0]
+                    .cars
+                    .iter()
+                    .all(|car| car.floor_position <= top)
+            );
+        }
+    }
+
+    #[test]
+    fn demolishing_a_shafts_lowest_segment_keeps_its_travellers_on_the_renumbered_shaft() {
+        let (mut tower, mut traffic, segments) = shaft_with_offices(4);
+        let old_id = traffic.elevators[0].id;
+        assert_eq!(old_id, segments[0]);
+        let rider = shaft_traveller(
+            &tower,
+            &traffic,
+            1,
+            2,
+            4,
+            PersonActivity::RidingElevator { shaft_id: old_id },
+        );
+        let waiter = shaft_traveller(
+            &tower,
+            &traffic,
+            2,
+            2,
+            3,
+            PersonActivity::WaitingForElevator { shaft_id: old_id },
+        );
+        traffic.people.extend([rider, waiter]);
+        let car = &mut traffic.elevators[0].cars[0];
+        car.floor_position = f32::from(floor_ordinal(2));
+        car.passengers.push(1);
+
+        let removed = tower.demolish(segments[0]).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        let new_id = traffic.elevators[0].id;
+        assert_ne!(new_id, old_id);
+        assert_eq!(
+            activity_of(&traffic, 1),
+            PersonActivity::RidingElevator { shaft_id: new_id }
+        );
+        assert_eq!(
+            activity_of(&traffic, 2),
+            PersonActivity::WaitingForElevator { shaft_id: new_id }
+        );
+        assert!(traffic.people.iter().all(|person| matches!(
+            person.route,
+            TravelMode::Elevator { shaft_id, .. } if shaft_id == new_id
+        )));
+        assert_eq!(traffic.elevators[0].cars[0].passengers, vec![1]);
+        assert!(traffic.validate_save_state(&tower).is_ok());
+    }
+
+    #[test]
+    fn demolishing_a_whole_shaft_leaves_nobody_riding_or_waiting_for_it() {
+        let (mut tower, mut traffic, segments) = shaft_with_offices(3);
+        let shaft_id = traffic.elevators[0].id;
+        let rider = shaft_traveller(
+            &tower,
+            &traffic,
+            1,
+            1,
+            3,
+            PersonActivity::RidingElevator { shaft_id },
+        );
+        let waiter = shaft_traveller(
+            &tower,
+            &traffic,
+            2,
+            3,
+            3,
+            PersonActivity::WaitingForElevator { shaft_id },
+        );
+        traffic.people.extend([rider, waiter]);
+        let car = &mut traffic.elevators[0].cars[0];
+        car.floor_position = 1.4;
+        car.passengers.push(1);
+
+        // Bottom up, so the rider's floor stays served until the shaft is gone.
+        for &id in &segments {
+            let removed = tower.demolish(id).unwrap();
+            traffic.sync_with_tower_after_removal(&tower, &removed);
+        }
+
+        assert!(traffic.elevators.is_empty());
+        for person in &traffic.people {
+            assert_eq!(person.activity, PersonActivity::LeavingElevatorQueue);
+        }
+        let rider = traffic.people.iter().find(|person| person.id == 1).unwrap();
+        assert_eq!(
+            rider.current_floor, 3,
+            "the rider steps off where the car was"
+        );
+        assert_eq!(rider.floor_position, f32::from(floor_ordinal(3)));
+        assert!(traffic.validate_save_state(&tower).is_ok());
     }
 
     #[test]
